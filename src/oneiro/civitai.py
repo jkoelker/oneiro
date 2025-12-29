@@ -505,9 +505,7 @@ class CivitaiClient:
         if query:
             params["query"] = query
         if types:
-            params["types"] = ",".join(
-                t.value if isinstance(t, ModelType) else t for t in types
-            )
+            params["types"] = ",".join(t.value if isinstance(t, ModelType) else t for t in types)
         if base_models:
             params["baseModels"] = ",".join(
                 b.value if isinstance(b, BaseModel) else b for b in base_models
@@ -597,9 +595,7 @@ class CivitaiClient:
 
                 if response.status_code == 206:
                     # Partial content - resuming
-                    total_size = start_byte + int(
-                        response.headers.get("content-length", 0)
-                    )
+                    total_size = start_byte + int(response.headers.get("content-length", 0))
                 elif response.status_code == 200:
                     # Full download
                     total_size = int(response.headers.get("content-length", 0))
@@ -631,9 +627,7 @@ class CivitaiClient:
             actual_hash = await self._compute_hash(temp_file)
             if actual_hash.lower() != expected_hash.lower():
                 temp_file.unlink()
-                raise CivitaiError(
-                    f"Hash mismatch: expected {expected_hash}, got {actual_hash}"
-                )
+                raise CivitaiError(f"Hash mismatch: expected {expected_hash}, got {actual_hash}")
             print("Hash verified successfully")
 
         # Move to final destination
