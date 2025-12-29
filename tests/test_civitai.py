@@ -337,6 +337,24 @@ class TestCivitaiClientInit:
         client = CivitaiClient(cache_dir=tmp_path / "custom")
         assert client.cache_dir == tmp_path / "custom"
 
+    def test_init_with_cache_dir_env_var(self, tmp_path, monkeypatch):
+        """Client reads cache_dir from CIVITAI_CACHE_DIR environment variable."""
+        monkeypatch.setenv("CIVITAI_CACHE_DIR", str(tmp_path / "env-cache"))
+        client = CivitaiClient()
+        assert client.cache_dir == tmp_path / "env-cache"
+
+    def test_init_cache_dir_argument_takes_precedence(self, tmp_path, monkeypatch):
+        """Explicit cache_dir argument takes precedence over env var."""
+        monkeypatch.setenv("CIVITAI_CACHE_DIR", str(tmp_path / "env-cache"))
+        client = CivitaiClient(cache_dir=tmp_path / "explicit-cache")
+        assert client.cache_dir == tmp_path / "explicit-cache"
+
+    def test_init_cache_dir_expands_user(self, monkeypatch):
+        """Client expands ~ in cache_dir paths."""
+        monkeypatch.setenv("CIVITAI_CACHE_DIR", "~/my-cache")
+        client = CivitaiClient()
+        assert client.cache_dir == Path.home() / "my-cache"
+
     def test_from_config(self, tmp_path, monkeypatch):
         """Client can be created from Config object."""
         monkeypatch.setenv("MY_API_KEY", "config-key")

@@ -310,7 +310,13 @@ class CivitaiClient:
         verify_hashes: bool = True,
     ):
         self.api_key = api_key or os.environ.get("CIVITAI_API_KEY")
-        self.cache_dir = Path(cache_dir) if cache_dir else self.DEFAULT_CACHE_DIR
+        # Support cache_dir from argument, env var, or default
+        if cache_dir:
+            self.cache_dir = Path(cache_dir).expanduser()
+        elif env_cache_dir := os.environ.get("CIVITAI_CACHE_DIR"):
+            self.cache_dir = Path(env_cache_dir).expanduser()
+        else:
+            self.cache_dir = self.DEFAULT_CACHE_DIR
         self.timeout = timeout
         self.download_timeout = download_timeout
         self.verify_hashes = verify_hashes
