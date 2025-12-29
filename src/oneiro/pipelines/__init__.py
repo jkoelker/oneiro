@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any
 from PIL import Image
 
 from oneiro.pipelines.base import BasePipeline, GenerationResult
+from oneiro.pipelines.flux1 import Flux1PipelineWrapper
 from oneiro.pipelines.flux2 import Flux2PipelineWrapper
 from oneiro.pipelines.qwen import QwenPipelineWrapper
 from oneiro.pipelines.zimage import ZImagePipelineWrapper
@@ -18,6 +19,7 @@ __all__ = [
     "BasePipeline",
     "GenerationResult",
     "PipelineManager",
+    "Flux1PipelineWrapper",
     "Flux2PipelineWrapper",
     "QwenPipelineWrapper",
     "ZImagePipelineWrapper",
@@ -29,6 +31,7 @@ class PipelineManager:
 
     PIPELINE_TYPES: dict[str, type[BasePipeline]] = {
         "zimage": ZImagePipelineWrapper,
+        "flux1": Flux1PipelineWrapper,
         "flux2": Flux2PipelineWrapper,
         "qwen": QwenPipelineWrapper,
     }
