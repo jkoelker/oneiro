@@ -1,14 +1,19 @@
-"""FLUX.2 pipeline wrapper with CPU offloading."""
+"""FLUX.2 pipeline wrapper with CPU offloading and LoRA support."""
 
 from typing import Any
 
 import torch
 
 from oneiro.pipelines.base import BasePipeline, GenerationResult
+from oneiro.pipelines.lora import LoraLoaderMixin, parse_loras_from_model_config
 
 
-class Flux2PipelineWrapper(BasePipeline):
-    """Wrapper for FLUX.2 with CPU offloading for text encoder."""
+class Flux2PipelineWrapper(LoraLoaderMixin, BasePipeline):
+    """Wrapper for FLUX.2 with CPU offloading and multi-LoRA support."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._init_lora_state()
 
     def load(self, model_config: dict[str, Any]) -> None:
         """Load FLUX.2 model with components on CPU for memory efficiency."""
@@ -51,6 +56,11 @@ class Flux2PipelineWrapper(BasePipeline):
 
         if cpu_offload:
             self.pipe.enable_model_cpu_offload()
+
+        loras = parse_loras_from_model_config(model_config)
+        if loras:
+            print(f"  Loading {len(loras)} LoRA(s)...")
+            self.load_loras_sync(loras)
 
         print(f"FLUX.2 loaded from {repo}")
 

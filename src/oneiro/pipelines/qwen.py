@@ -7,10 +7,15 @@ from typing import Any
 import torch
 
 from oneiro.pipelines.base import BasePipeline, GenerationResult
+from oneiro.pipelines.lora import LoraLoaderMixin, parse_loras_from_model_config
 
 
-class QwenPipelineWrapper(BasePipeline):
-    """Wrapper for Qwen-Image with LoRA and GGUF support."""
+class QwenPipelineWrapper(LoraLoaderMixin, BasePipeline):
+    """Wrapper for Qwen-Image with multi-LoRA and GGUF support."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._init_lora_state()
 
     def _parse_transformer_path(self, transformer: str) -> tuple[str, bool]:
         """Parse transformer path, returning (resolved_path, is_gguf).
@@ -94,8 +99,6 @@ class QwenPipelineWrapper(BasePipeline):
 
         repo = model_config.get("repo", "Qwen/Qwen-Image")
         transformer_path = model_config.get("transformer")
-        lora_repo = model_config.get("lora")
-        lora_weights = model_config.get("lora_weights")
         cpu_offload = model_config.get("cpu_offload", True)
 
         print(f"Loading Qwen-Image from {repo}")
@@ -134,10 +137,10 @@ class QwenPipelineWrapper(BasePipeline):
 
         self.pipe = DiffusionPipeline.from_pretrained(repo, **pipeline_kwargs)
 
-        # Load LoRA if specified
-        if lora_repo and lora_weights:
-            print(f"Loading LoRA from {lora_repo}")
-            self.pipe.load_lora_weights(lora_repo, weight_name=lora_weights)
+        loras = parse_loras_from_model_config(model_config)
+        if loras:
+            print(f"  Loading {len(loras)} LoRA(s)...")
+            self.load_loras_sync(loras)
 
         if cpu_offload and self._device == "cuda":
             self.pipe.enable_model_cpu_offload()

@@ -1,0 +1,392 @@
+"""Tests for LoRA configuration and loading functionality."""
+
+from pathlib import Path
+from unittest.mock import AsyncMock, Mock
+
+import pytest
+
+from oneiro.pipelines.lora import (
+    PIPELINE_BASE_MODEL_MAP,
+    LoraConfig,
+    LoraIncompatibleError,
+    LoraSource,
+    is_lora_compatible,
+    parse_civitai_url,
+    parse_lora_config,
+    parse_loras_from_model_config,
+)
+
+
+class TestParseCivitaiUrl:
+    """Tests for parse_civitai_url function."""
+
+    def test_basic_model_url(self):
+        """Parses basic model URL."""
+        model_id, version_id = parse_civitai_url("https://civitai.com/models/12345")
+        assert model_id == 12345
+        assert version_id is None
+
+    def test_model_url_with_name(self):
+        """Parses model URL with name slug."""
+        model_id, version_id = parse_civitai_url("https://civitai.com/models/12345/my-cool-model")
+        assert model_id == 12345
+        assert version_id is None
+
+    def test_model_url_with_version(self):
+        """Parses model URL with version ID in query string."""
+        model_id, version_id = parse_civitai_url(
+            "https://civitai.com/models/12345?modelVersionId=67890"
+        )
+        assert model_id == 12345
+        assert version_id == 67890
+
+    def test_model_url_with_name_and_version(self):
+        """Parses model URL with name and version."""
+        model_id, version_id = parse_civitai_url(
+            "https://civitai.com/models/12345/model-name?modelVersionId=67890"
+        )
+        assert model_id == 12345
+        assert version_id == 67890
+
+    def test_invalid_url_raises(self):
+        """Invalid URL raises ValueError."""
+        with pytest.raises(ValueError, match="Invalid Civitai URL"):
+            parse_civitai_url("https://example.com/something")
+
+
+class TestLoraConfig:
+    """Tests for LoraConfig dataclass."""
+
+    def test_civitai_config_valid(self):
+        """Valid Civitai config creates successfully."""
+        config = LoraConfig(
+            source=LoraSource.CIVITAI,
+            civitai_id=12345,
+            weight=0.8,
+        )
+        assert config.source == LoraSource.CIVITAI
+        assert config.civitai_id == 12345
+        assert config.weight == 0.8
+
+    def test_civitai_config_with_url(self):
+        """Civitai config with URL is valid."""
+        config = LoraConfig(
+            source=LoraSource.CIVITAI,
+            civitai_url="https://civitai.com/models/12345",
+        )
+        assert config.civitai_url == "https://civitai.com/models/12345"
+
+    def test_civitai_config_requires_id_or_url(self):
+        """Civitai config without ID or URL raises."""
+        with pytest.raises(ValueError, match="civitai_id or civitai_url"):
+            LoraConfig(source=LoraSource.CIVITAI)
+
+    def test_huggingface_config_valid(self):
+        """Valid HuggingFace config creates successfully."""
+        config = LoraConfig(
+            source=LoraSource.HUGGINGFACE,
+            repo="user/repo",
+            weight_name="lora.safetensors",
+        )
+        assert config.source == LoraSource.HUGGINGFACE
+        assert config.repo == "user/repo"
+
+    def test_huggingface_config_requires_repo(self):
+        """HuggingFace config without repo raises."""
+        with pytest.raises(ValueError, match="repo"):
+            LoraConfig(source=LoraSource.HUGGINGFACE)
+
+    def test_local_config_valid(self):
+        """Valid local config creates successfully."""
+        config = LoraConfig(
+            source=LoraSource.LOCAL,
+            path="/path/to/lora.safetensors",
+        )
+        assert config.source == LoraSource.LOCAL
+        assert config.path == "/path/to/lora.safetensors"
+
+    def test_local_config_requires_path(self):
+        """Local config without path raises."""
+        with pytest.raises(ValueError, match="path"):
+            LoraConfig(source=LoraSource.LOCAL)
+
+    def test_default_weight_is_one(self):
+        """Default weight is 1.0."""
+        config = LoraConfig(source=LoraSource.LOCAL, path="/path")
+        assert config.weight == 1.0
+
+
+class TestParseLoraConfig:
+    """Tests for parse_lora_config function."""
+
+    def test_civitai_url_string(self):
+        """Parses Civitai URL string."""
+        config = parse_lora_config("https://civitai.com/models/12345")
+        assert config.source == LoraSource.CIVITAI
+        assert config.civitai_id == 12345
+        assert config.adapter_name == "civitai_12345"
+
+    def test_civitai_url_with_version(self):
+        """Parses Civitai URL with version."""
+        config = parse_lora_config("https://civitai.com/models/12345?modelVersionId=67890")
+        assert config.civitai_id == 12345
+        assert config.civitai_version == 67890
+
+    def test_local_path_string(self):
+        """Parses local path string."""
+        config = parse_lora_config("/path/to/lora.safetensors")
+        assert config.source == LoraSource.LOCAL
+        assert config.path == "/path/to/lora.safetensors"
+
+    def test_civitai_dict_with_id(self):
+        """Parses Civitai dict with ID."""
+        config = parse_lora_config(
+            {
+                "source": "civitai",
+                "id": 12345,
+                "version": 67890,
+                "weight": 0.8,
+            }
+        )
+        assert config.source == LoraSource.CIVITAI
+        assert config.civitai_id == 12345
+        assert config.civitai_version == 67890
+        assert config.weight == 0.8
+
+    def test_huggingface_dict(self):
+        """Parses HuggingFace dict."""
+        config = parse_lora_config(
+            {
+                "source": "huggingface",
+                "repo": "user/repo",
+                "weight_name": "lora.safetensors",
+                "weight": 0.7,
+            }
+        )
+        assert config.source == LoraSource.HUGGINGFACE
+        assert config.repo == "user/repo"
+        assert config.weight_name == "lora.safetensors"
+        assert config.weight == 0.7
+
+    def test_local_dict(self):
+        """Parses local dict."""
+        config = parse_lora_config(
+            {
+                "source": "local",
+                "path": "/path/to/lora.safetensors",
+            }
+        )
+        assert config.source == LoraSource.LOCAL
+        assert config.path == "/path/to/lora.safetensors"
+
+    def test_custom_adapter_name(self):
+        """Custom adapter_name is preserved."""
+        config = parse_lora_config(
+            {
+                "source": "civitai",
+                "id": 12345,
+                "adapter_name": "my_style",
+            }
+        )
+        assert config.adapter_name == "my_style"
+
+    def test_invalid_source_raises(self):
+        """Invalid source raises ValueError."""
+        with pytest.raises(ValueError, match="Invalid LoRA source"):
+            parse_lora_config({"source": "invalid"})
+
+
+class TestParseLORAsFromModelConfig:
+    """Tests for parse_loras_from_model_config function."""
+
+    def test_loras_array(self):
+        """Parses loras array format."""
+        config = {
+            "loras": [
+                {"source": "civitai", "id": 12345, "weight": 0.8},
+                {"source": "huggingface", "repo": "user/repo", "weight": 0.7},
+            ]
+        }
+        loras = parse_loras_from_model_config(config)
+        assert len(loras) == 2
+        assert loras[0].source == LoraSource.CIVITAI
+        assert loras[1].source == LoraSource.HUGGINGFACE
+
+    def test_civitai_lora_url(self):
+        """Parses civitai_lora URL format."""
+        config = {"civitai_lora": "https://civitai.com/models/12345"}
+        loras = parse_loras_from_model_config(config)
+        assert len(loras) == 1
+        assert loras[0].source == LoraSource.CIVITAI
+        assert loras[0].civitai_id == 12345
+
+    def test_civitai_lora_id(self):
+        """Parses civitai_lora_id format."""
+        config = {
+            "civitai_lora_id": 12345,
+            "civitai_lora_version": 67890,
+            "civitai_lora_weight": 0.9,
+        }
+        loras = parse_loras_from_model_config(config)
+        assert len(loras) == 1
+        assert loras[0].civitai_id == 12345
+        assert loras[0].civitai_version == 67890
+        assert loras[0].weight == 0.9
+
+    def test_legacy_lora_format(self):
+        """Parses legacy lora/lora_weights format."""
+        config = {
+            "lora": "user/repo",
+            "lora_weights": "lora.safetensors",
+        }
+        loras = parse_loras_from_model_config(config)
+        assert len(loras) == 1
+        assert loras[0].source == LoraSource.HUGGINGFACE
+        assert loras[0].repo == "user/repo"
+        assert loras[0].weight_name == "lora.safetensors"
+
+    def test_legacy_local_path(self):
+        """Parses legacy lora as local path."""
+        config = {"lora": "/path/to/lora.safetensors"}
+        loras = parse_loras_from_model_config(config)
+        assert len(loras) == 1
+        assert loras[0].source == LoraSource.LOCAL
+
+    def test_no_loras(self):
+        """Returns empty list when no LoRAs configured."""
+        loras = parse_loras_from_model_config({"type": "flux2"})
+        assert loras == []
+
+
+class TestIsLoraCompatible:
+    """Tests for is_lora_compatible function."""
+
+    def test_flux_compatible(self):
+        """Flux.1 LoRAs compatible with flux2 pipeline."""
+        assert is_lora_compatible("flux2", "Flux.1 Dev")
+        assert is_lora_compatible("flux2", "Flux.1 Schnell")
+        assert is_lora_compatible("flux2", "Flux.1 D")
+
+    def test_sdxl_compatible(self):
+        """SDXL LoRAs compatible with sdxl pipeline."""
+        assert is_lora_compatible("sdxl", "SDXL 1.0")
+        assert is_lora_compatible("sdxl", "Pony")
+        assert is_lora_compatible("sdxl", "Illustrious")
+
+    def test_incompatible_base_model(self):
+        """Incompatible base model returns False."""
+        assert not is_lora_compatible("flux2", "SDXL 1.0")
+        assert not is_lora_compatible("sdxl", "Flux.1 Dev")
+        assert not is_lora_compatible("flux2", "SD 1.5")
+
+    def test_none_base_model_is_compatible(self):
+        """None base model assumed compatible."""
+        assert is_lora_compatible("flux2", None)
+
+    def test_unknown_pipeline_is_compatible(self):
+        """Unknown pipeline type assumed compatible."""
+        assert is_lora_compatible("unknown", "SDXL 1.0")
+
+    def test_case_insensitive(self):
+        """Comparison is case-insensitive."""
+        assert is_lora_compatible("flux2", "flux.1 dev")
+        assert is_lora_compatible("flux2", "FLUX.1 DEV")
+
+
+class TestLoraIncompatibleError:
+    """Tests for LoraIncompatibleError exception."""
+
+    def test_error_message(self):
+        """Error message contains relevant info."""
+        err = LoraIncompatibleError("my_lora", "flux2", "SDXL 1.0")
+        assert "my_lora" in str(err)
+        assert "flux2" in str(err)
+        assert "SDXL 1.0" in str(err)
+
+    def test_error_attributes(self):
+        """Error has correct attributes."""
+        err = LoraIncompatibleError("my_lora", "flux2", "SDXL 1.0")
+        assert err.lora_name == "my_lora"
+        assert err.pipeline_type == "flux2"
+        assert err.base_model == "SDXL 1.0"
+
+
+class TestPipelineBaseModelMap:
+    """Tests for PIPELINE_BASE_MODEL_MAP constant."""
+
+    def test_all_pipeline_types_have_mappings(self):
+        """All common pipeline types have base model mappings."""
+        expected_types = ["flux2", "zimage", "qwen", "sdxl", "sd15"]
+        for pipeline_type in expected_types:
+            assert pipeline_type in PIPELINE_BASE_MODEL_MAP
+            assert len(PIPELINE_BASE_MODEL_MAP[pipeline_type]) > 0
+
+
+@pytest.mark.asyncio
+class TestResolveLoraPath:
+    """Tests for resolve_lora_path function."""
+
+    async def test_local_path_exists(self, tmp_path):
+        """Local path resolves when file exists."""
+        from oneiro.pipelines.lora import resolve_lora_path
+
+        lora_file = tmp_path / "test.safetensors"
+        lora_file.write_bytes(b"test")
+
+        config = LoraConfig(source=LoraSource.LOCAL, path=str(lora_file))
+        result = await resolve_lora_path(config)
+
+        assert result == lora_file
+        assert config._resolved_path == lora_file
+
+    async def test_local_path_not_exists(self, tmp_path):
+        """Local path raises when file doesn't exist."""
+        from oneiro.pipelines.lora import resolve_lora_path
+
+        config = LoraConfig(
+            source=LoraSource.LOCAL,
+            path=str(tmp_path / "nonexistent.safetensors"),
+        )
+
+        with pytest.raises(FileNotFoundError):
+            await resolve_lora_path(config)
+
+    async def test_huggingface_returns_repo_path(self):
+        """HuggingFace source returns repo as path."""
+        from oneiro.pipelines.lora import resolve_lora_path
+
+        config = LoraConfig(source=LoraSource.HUGGINGFACE, repo="user/repo")
+        result = await resolve_lora_path(config)
+
+        assert result == Path("user/repo")
+        assert config._resolved_path is None
+
+    async def test_civitai_requires_client(self):
+        """Civitai source requires CivitaiClient."""
+        from oneiro.pipelines.lora import resolve_lora_path
+
+        config = LoraConfig(source=LoraSource.CIVITAI, civitai_id=12345)
+
+        with pytest.raises(ValueError, match="CivitaiClient required"):
+            await resolve_lora_path(config)
+
+    async def test_civitai_validates_compatibility(self):
+        """Civitai source validates base model compatibility."""
+        from oneiro.pipelines.lora import resolve_lora_path
+
+        mock_client = AsyncMock()
+        mock_model = Mock()
+        mock_version = Mock()
+        mock_version.base_model = "SDXL 1.0"
+        mock_model.latest_version = mock_version
+        mock_client.get_model = AsyncMock(return_value=mock_model)
+
+        config = LoraConfig(source=LoraSource.CIVITAI, civitai_id=12345)
+
+        with pytest.raises(LoraIncompatibleError):
+            await resolve_lora_path(
+                config,
+                civitai_client=mock_client,
+                pipeline_type="flux2",
+                validate_compatibility=True,
+            )
