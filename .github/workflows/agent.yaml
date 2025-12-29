@@ -65,6 +65,14 @@ jobs:
           fetch-depth: 0
           token: ${{ steps.app-token.outputs.token }}
 
+      - name: Setup uv
+        # yamllint disable-line rule:line-length rule:comments
+        uses: astral-sh/setup-uv@681c641aba71e4a1c380be3ab5e12ad51f415867  # v7.1.6
+
+      - name: Setup ruff
+        # yamllint disable-line rule:line-length rule:comments
+        uses: astral-sh/ruff-action@57714a7c8a2e59f32539362ba31877a1957dded1  # v3.5.1
+
       - name: Determine mode
         id: mode
         shell: bash
