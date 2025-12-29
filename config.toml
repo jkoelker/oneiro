@@ -35,3 +35,10 @@ requires_negative = true
 [blacklist]
 words = ["loli", "shota", "child", "children", "minor", "underage"]
 allow_in_negative = true
+
+[civitai]
+# API key for authentication (optional, enables restricted downloads)
+# api_key = "${CIVITAI_API_KEY}"
+cache_dir = "~/.cache/civitai"
+download_timeout = 3600  # 1 hour for large files
+verify_hashes = true
