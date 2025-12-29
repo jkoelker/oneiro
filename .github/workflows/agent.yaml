@@ -20,6 +20,9 @@ name: AI Agent
   pull_request_review:
     types: [submitted]
 
+  pull_request_review_comment:
+    types: [created]
+
 jobs:
   agent:
     # yamllint disable rule:line-length
@@ -33,7 +36,11 @@ jobs:
        github.event.requested_reviewer.login == 'dobbyphus[bot]') ||
       (github.event_name == 'pull_request_review' &&
        github.event.review.user.login != 'dobbyphus[bot]' &&
-       contains(github.event.review.body, '@dobbyphus'))
+       contains(github.event.review.body, '@dobbyphus')) ||
+      (github.event_name == 'pull_request_review_comment' &&
+       contains(github.event.comment.body, '@dobbyphus') &&
+       github.event.comment.user.login != 'dobbyphus[bot]' &&
+       contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association))
     # yamllint enable rule:line-length
     runs-on: ubuntu-latest
     permissions:
@@ -44,7 +51,8 @@ jobs:
     steps:
       - name: Generate App Token
         id: app-token
-        uses: actions/create-github-app-token@29824e69f54612133e76f7eaac726eef6c875baf # v2
+        # yamllint disable-line rule:line-length rule:comments
+        uses: actions/create-github-app-token@29824e69f54612133e76f7eaac726eef6c875baf  # v2
         with:
           app-id: ${{ secrets.APP_ID }}
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
@@ -63,7 +71,8 @@ jobs:
         run: |
           EVENT="${{ github.event_name }}"
           if [[ "$EVENT" == "pull_request" ]] || \
-             [[ "$EVENT" == "pull_request_review" ]]; then
+             [[ "$EVENT" == "pull_request_review" ]] || \
+             [[ "$EVENT" == "pull_request_review_comment" ]]; then
             echo "value=review" >> "$GITHUB_OUTPUT"
           else
             echo "value=agent" >> "$GITHUB_OUTPUT"
