@@ -2,16 +2,26 @@
 
 import asyncio
 import io
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from PIL import Image
 
 from oneiro.pipelines.base import BasePipeline, GenerationResult
 from oneiro.pipelines.flux2 import Flux2PipelineWrapper
+from oneiro.pipelines.lora import (
+    LoraConfig,
+    LoraIncompatibleError,
+    LoraLoaderMixin,
+    LoraSource,
+    parse_lora_config,
+    parse_loras_from_model_config,
+    resolve_lora_path,
+)
 from oneiro.pipelines.qwen import QwenPipelineWrapper
 from oneiro.pipelines.zimage import ZImagePipelineWrapper
 
 if TYPE_CHECKING:
+    from oneiro.civitai import CivitaiClient
     from oneiro.config import Config
 
 __all__ = [
@@ -21,6 +31,13 @@ __all__ = [
     "Flux2PipelineWrapper",
     "QwenPipelineWrapper",
     "ZImagePipelineWrapper",
+    "LoraConfig",
+    "LoraSource",
+    "LoraLoaderMixin",
+    "LoraIncompatibleError",
+    "parse_lora_config",
+    "parse_loras_from_model_config",
+    "resolve_lora_path",
 ]
 
 
@@ -52,7 +69,8 @@ class PipelineManager:
         if self.current_model == model_name and self.pipeline is not None:
             return
 
-        # Get model config
+        # Get model config - model_name is guaranteed to be str at this point
+        assert model_name is not None
         model_config = self.config.get("models", model_name)
         if not model_config:
             raise ValueError(f"Unknown model: {model_name}")
@@ -112,3 +130,42 @@ class PipelineManager:
         image.save(buffer, format=format)
         buffer.seek(0)
         return buffer
+
+    async def load_civitai_loras(
+        self,
+        loras: list[LoraConfig],
+        civitai_client: "CivitaiClient",
+        validate_compatibility: bool = True,
+    ) -> list[str]:
+        """Load LoRAs from Civitai, downloading as needed.
+
+        This method should be called after load_model() when using Civitai LoRAs.
+        Local and HuggingFace LoRAs are loaded automatically in load_model().
+
+        Args:
+            loras: List of LoRA configurations
+            civitai_client: CivitaiClient for downloads
+            validate_compatibility: Whether to check base model compatibility
+
+        Returns:
+            List of loaded adapter names
+        """
+        if self.pipeline is None:
+            raise RuntimeError("No pipeline loaded")
+
+        if not hasattr(self.pipeline, "load_loras_async"):
+            raise RuntimeError(f"Pipeline {type(self.pipeline)} does not support LoRAs")
+
+        pipeline_type = None
+        if self.current_model:
+            model_config = self.config.get("models", self.current_model)
+            if model_config:
+                pipeline_type = model_config.get("type")
+
+        lora_pipeline = cast(LoraLoaderMixin, self.pipeline)
+        return await lora_pipeline.load_loras_async(
+            loras,
+            civitai_client=civitai_client,
+            pipeline_type=pipeline_type,
+            validate_compatibility=validate_compatibility,
+        )

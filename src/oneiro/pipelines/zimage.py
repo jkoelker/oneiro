@@ -1,14 +1,19 @@
-"""Z-Image-Turbo pipeline wrapper."""
+"""Z-Image-Turbo pipeline wrapper with LoRA support."""
 
 from typing import Any
 
 import torch
 
 from oneiro.pipelines.base import BasePipeline, GenerationResult
+from oneiro.pipelines.lora import LoraLoaderMixin, parse_loras_from_model_config
 
 
-class ZImagePipelineWrapper(BasePipeline):
-    """Wrapper for Z-Image-Turbo pipeline."""
+class ZImagePipelineWrapper(LoraLoaderMixin, BasePipeline):
+    """Wrapper for Z-Image-Turbo pipeline with multi-LoRA support."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._init_lora_state()
 
     def load(self, model_config: dict[str, Any]) -> None:
         """Load Z-Image-Turbo model."""
@@ -24,6 +29,11 @@ class ZImagePipelineWrapper(BasePipeline):
 
         if self._device == "cuda":
             self.pipe.enable_model_cpu_offload()
+
+        loras = parse_loras_from_model_config(model_config)
+        if loras:
+            print(f"  Loading {len(loras)} LoRA(s)...")
+            self.load_loras_sync(loras)
 
         print(f"Z-Image loaded from {repo}")
 
