@@ -257,6 +257,74 @@ class TestParseLORAsFromModelConfig:
         loras = parse_loras_from_model_config({"type": "flux2"})
         assert loras == []
 
+    def test_duplicate_civitai_lora_skipped(self):
+        """Duplicate Civitai LoRAs by ID and version are skipped."""
+        config = {
+            "loras": [
+                {"source": "civitai", "id": 12345, "version": 67890, "weight": 0.8},
+                {"source": "civitai", "id": 12345, "version": 67890, "weight": 0.5},
+            ]
+        }
+        loras = parse_loras_from_model_config(config)
+        assert len(loras) == 1
+        assert loras[0].civitai_id == 12345
+        assert loras[0].weight == 0.8
+
+    def test_same_civitai_id_different_version_not_duplicate(self):
+        """Same Civitai ID with different versions are NOT duplicates."""
+        config = {
+            "loras": [
+                {"source": "civitai", "id": 12345, "version": 67890},
+                {"source": "civitai", "id": 12345, "version": 99999},
+            ]
+        }
+        loras = parse_loras_from_model_config(config)
+        assert len(loras) == 2
+
+    def test_duplicate_huggingface_lora_skipped(self):
+        """Duplicate HuggingFace LoRAs by repo and weight_name are skipped."""
+        config = {
+            "loras": [
+                {"source": "huggingface", "repo": "user/repo", "weight_name": "lora.safetensors"},
+                {"source": "huggingface", "repo": "user/repo", "weight_name": "lora.safetensors"},
+            ]
+        }
+        loras = parse_loras_from_model_config(config)
+        assert len(loras) == 1
+
+    def test_same_repo_different_weight_name_not_duplicate(self):
+        """Same HF repo with different weight_name are NOT duplicates."""
+        config = {
+            "loras": [
+                {"source": "huggingface", "repo": "user/repo", "weight_name": "lora1.safetensors"},
+                {"source": "huggingface", "repo": "user/repo", "weight_name": "lora2.safetensors"},
+            ]
+        }
+        loras = parse_loras_from_model_config(config)
+        assert len(loras) == 2
+
+    def test_duplicate_local_lora_skipped(self):
+        """Duplicate local LoRAs by path are skipped."""
+        config = {
+            "loras": [
+                {"source": "local", "path": "/path/to/lora.safetensors"},
+                {"source": "local", "path": "/path/to/lora.safetensors"},
+            ]
+        }
+        loras = parse_loras_from_model_config(config)
+        assert len(loras) == 1
+
+    def test_same_source_different_identifiers_not_duplicate(self):
+        """Different identifiers within same source type are NOT duplicates."""
+        config = {
+            "loras": [
+                {"source": "civitai", "id": 11111},
+                {"source": "civitai", "id": 22222},
+            ]
+        }
+        loras = parse_loras_from_model_config(config)
+        assert len(loras) == 2
+
 
 class TestIsLoraCompatible:
     """Tests for is_lora_compatible function."""
