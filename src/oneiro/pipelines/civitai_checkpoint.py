@@ -14,6 +14,11 @@ import torch
 
 from oneiro.pipelines.base import BasePipeline, GenerationResult
 from oneiro.pipelines.embedding import EmbeddingLoaderMixin, parse_embeddings_from_config
+from oneiro.pipelines.long_prompt import (
+    get_weighted_text_embeddings_sd15,
+    get_weighted_text_embeddings_sdxl,
+    needs_long_prompt_handling,
+)
 from oneiro.pipelines.lora import LoraLoaderMixin, parse_loras_from_model_config
 
 if TYPE_CHECKING:
@@ -777,22 +782,33 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
 
         # Build generation kwargs
         gen_kwargs: dict[str, Any] = {
-            "prompt": prompt,
             "num_inference_steps": steps,
             "guidance_scale": guidance_scale,
             "generator": generator,
         }
 
-        # Add negative prompt only for pipelines that support it
-        if self._pipeline_config.supports_negative_prompt and negative_prompt:
-            gen_kwargs["negative_prompt"] = negative_prompt
+        # Check if we need long prompt handling (>77 tokens)
+        use_long_prompt = self._should_use_long_prompt(prompt, negative_prompt)
+
+        if use_long_prompt:
+            # Generate embeddings with chunking for long prompts
+            self._add_long_prompt_embeddings(gen_kwargs, prompt, negative_prompt)
+            print(f"CivitAI generating (long prompt): '{prompt[:50]}...' seed={actual_seed}")
+        else:
+            # Standard prompt handling
+            gen_kwargs["prompt"] = prompt
+            if self._pipeline_config.supports_negative_prompt and negative_prompt:
+                gen_kwargs["negative_prompt"] = negative_prompt
 
         if init_image:
             print(f"CivitAI img2img: '{prompt[:50]}...' seed={actual_seed} strength={strength}")
             gen_kwargs["image"] = init_image
             gen_kwargs["strength"] = strength
-        else:
+        elif not use_long_prompt:
             print(f"CivitAI generating: '{prompt[:50]}...' seed={actual_seed}")
+            gen_kwargs["height"] = height
+            gen_kwargs["width"] = width
+        else:
             gen_kwargs["height"] = height
             gen_kwargs["width"] = width
 
@@ -822,3 +838,89 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
     def detected_base_model(self) -> str | None:
         """Get the detected/configured base model."""
         return self._base_model
+
+    def _should_use_long_prompt(self, prompt: str, negative_prompt: str | None) -> bool:
+        """Check if long prompt handling is needed.
+
+        Long prompt handling is used when:
+        - The pipeline uses a CLIP-based text encoder (SD 1.x, SD 2.x, SDXL)
+        - Either the prompt or negative prompt exceeds 77 tokens
+
+        Args:
+            prompt: The positive prompt
+            negative_prompt: The negative prompt (may be None)
+
+        Returns:
+            True if long prompt handling should be used
+        """
+        if self.pipe is None or self._pipeline_config is None:
+            return False
+
+        # Only handle long prompts for CLIP-based pipelines
+        pipeline_class = self._pipeline_config.pipeline_class
+        supported_pipelines = {
+            "StableDiffusionPipeline",
+            "StableDiffusionXLPipeline",
+        }
+
+        if pipeline_class not in supported_pipelines:
+            return False
+
+        # Check if either prompt needs long handling
+        return needs_long_prompt_handling(self.pipe, prompt, negative_prompt or "")
+
+    def _add_long_prompt_embeddings(
+        self,
+        gen_kwargs: dict[str, Any],
+        prompt: str,
+        negative_prompt: str | None,
+    ) -> None:
+        """Add pre-computed embeddings to generation kwargs for long prompts.
+
+        This method handles the chunking and encoding of prompts that exceed
+        CLIP's 77-token limit. It generates embeddings using the appropriate
+        method based on the pipeline type (SD 1.x/2.x vs SDXL).
+
+        Args:
+            gen_kwargs: Generation kwargs dict to update (modified in place)
+            prompt: The positive prompt
+            negative_prompt: The negative prompt (may be None)
+        """
+        if self.pipe is None or self._pipeline_config is None:
+            return
+
+        neg_prompt = negative_prompt or ""
+        pipeline_class = self._pipeline_config.pipeline_class
+
+        if pipeline_class == "StableDiffusionXLPipeline":
+            # SDXL uses dual text encoders
+            (
+                prompt_embeds,
+                negative_prompt_embeds,
+                pooled_prompt_embeds,
+                negative_pooled_prompt_embeds,
+            ) = get_weighted_text_embeddings_sdxl(
+                self.pipe,
+                prompt=prompt,
+                negative_prompt=neg_prompt,
+            )
+
+            gen_kwargs["prompt_embeds"] = prompt_embeds
+            gen_kwargs["pooled_prompt_embeds"] = pooled_prompt_embeds
+
+            if self._pipeline_config.supports_negative_prompt:
+                gen_kwargs["negative_prompt_embeds"] = negative_prompt_embeds
+                gen_kwargs["negative_pooled_prompt_embeds"] = negative_pooled_prompt_embeds
+
+        else:
+            # SD 1.x / 2.x use single text encoder
+            prompt_embeds, negative_prompt_embeds = get_weighted_text_embeddings_sd15(
+                self.pipe,
+                prompt=prompt,
+                negative_prompt=neg_prompt,
+            )
+
+            gen_kwargs["prompt_embeds"] = prompt_embeds
+
+            if self._pipeline_config.supports_negative_prompt:
+                gen_kwargs["negative_prompt_embeds"] = negative_prompt_embeds
