@@ -129,6 +129,7 @@ class Config:
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
         with open(self.state_path, "w") as f:
             json.dump(self._state, f, indent=2)
+            f.write("\n")
 
         print(f"State updated: {'.'.join(keys)} = {value}")
 

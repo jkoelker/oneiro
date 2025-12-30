@@ -290,6 +290,24 @@ class TestCivitaiCache:
 
         assert cache2.get("abc123") == test_file
 
+    def test_metadata_file_has_trailing_newline(self, tmp_path):
+        """Metadata file should end with a newline."""
+        cache = CivitaiCache(tmp_path)
+        test_file = tmp_path / "test.bin"
+        test_file.write_bytes(b"test content")
+
+        cache.add(
+            file_path=test_file,
+            sha256="abc123",
+            model_id=1,
+            version_id=2,
+            filename="test.bin",
+            size_kb=100,
+        )
+
+        content = cache.metadata_file.read_text()
+        assert content.endswith("\n"), "metadata.json should end with a newline"
+
     def test_total_size(self, tmp_path):
         """total_size_kb returns sum of all cached file sizes."""
         cache = CivitaiCache(tmp_path)
