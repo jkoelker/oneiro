@@ -23,13 +23,15 @@ class Flux1PipelineWrapper(BasePipeline):
     """
 
     def load(self, model_config: dict[str, Any]) -> None:
-        """Load FLUX.1 model with optional CPU offloading.
+        """Load FLUX.1 model with optional CPU offloading and LoRA support.
 
         Args:
             model_config: Configuration dict with keys:
                 - repo: HuggingFace repo ID (default: "black-forest-labs/FLUX.1-dev")
                 - cpu_offload: Enable CPU offloading (default: True)
                 - cpu_utilization: Fraction of CPU cores to use (default: 0.75)
+                - lora: LoRA repository ID (optional)
+                - lora_weights: LoRA weights filename (optional, required if lora is set)
         """
         from diffusers import FluxPipeline
 
@@ -54,6 +56,14 @@ class Flux1PipelineWrapper(BasePipeline):
         # Memory optimization for large T5 encoder and high-res VAE decoding
         self.pipe.vae.enable_tiling()
         self.pipe.vae.enable_slicing()
+
+        # Load LoRA if specified
+        lora_repo = model_config.get("lora")
+        lora_weights = model_config.get("lora_weights")
+
+        if lora_repo and lora_weights:
+            print(f"Loading LoRA from {lora_repo}")
+            self.pipe.load_lora_weights(lora_repo, weight_name=lora_weights)
 
         print(f"FLUX.1 loaded from {repo}")
 

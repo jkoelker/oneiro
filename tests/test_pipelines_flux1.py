@@ -104,6 +104,57 @@ class TestFlux1PipelineWrapperLoad:
         mock_pipe.vae.enable_tiling.assert_called_once()
         mock_pipe.vae.enable_slicing.assert_called_once()
 
+    @patch("oneiro.pipelines.base.torch.cuda.is_available", return_value=False)
+    @patch("oneiro.pipelines.base.torch.set_num_interop_threads")
+    @patch("oneiro.pipelines.base.torch.set_num_threads")
+    @patch("diffusers.FluxPipeline")
+    def test_load_with_lora(self, mock_flux_pipeline, mock_threads, mock_interop, mock_cuda):
+        """Load applies LoRA weights when lora and lora_weights are specified."""
+        mock_pipe = MagicMock()
+        mock_flux_pipeline.from_pretrained.return_value = mock_pipe
+
+        pipeline = Flux1PipelineWrapper()
+        pipeline.load(
+            {
+                "lora": "example/flux-lora-repo",
+                "lora_weights": "flux_lora.safetensors",
+            }
+        )
+
+        mock_pipe.load_lora_weights.assert_called_once_with(
+            "example/flux-lora-repo", weight_name="flux_lora.safetensors"
+        )
+
+    @patch("oneiro.pipelines.base.torch.cuda.is_available", return_value=False)
+    @patch("oneiro.pipelines.base.torch.set_num_interop_threads")
+    @patch("oneiro.pipelines.base.torch.set_num_threads")
+    @patch("diffusers.FluxPipeline")
+    def test_load_without_lora(self, mock_flux_pipeline, mock_threads, mock_interop, mock_cuda):
+        """Load does not call load_lora_weights when lora config is not specified."""
+        mock_pipe = MagicMock()
+        mock_flux_pipeline.from_pretrained.return_value = mock_pipe
+
+        pipeline = Flux1PipelineWrapper()
+        pipeline.load({})
+
+        mock_pipe.load_lora_weights.assert_not_called()
+
+    @patch("oneiro.pipelines.base.torch.cuda.is_available", return_value=False)
+    @patch("oneiro.pipelines.base.torch.set_num_interop_threads")
+    @patch("oneiro.pipelines.base.torch.set_num_threads")
+    @patch("diffusers.FluxPipeline")
+    def test_load_with_lora_repo_only_no_weights(
+        self, mock_flux_pipeline, mock_threads, mock_interop, mock_cuda
+    ):
+        """Load does not call load_lora_weights when only lora repo is specified (no weights)."""
+        mock_pipe = MagicMock()
+        mock_flux_pipeline.from_pretrained.return_value = mock_pipe
+
+        pipeline = Flux1PipelineWrapper()
+        pipeline.load({"lora": "example/flux-lora-repo"})
+
+        mock_pipe.load_lora_weights.assert_not_called()
+
 
 class TestFlux1PipelineWrapperGenerate:
     """Tests for Flux1PipelineWrapper.generate()."""
