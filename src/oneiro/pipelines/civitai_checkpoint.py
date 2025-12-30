@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from oneiro.pipelines.base import BasePipeline, GenerationResult
+from oneiro.pipelines.embedding import EmbeddingLoaderMixin, parse_embeddings_from_config
 from oneiro.pipelines.lora import LoraLoaderMixin, parse_loras_from_model_config
 
 if TYPE_CHECKING:
@@ -436,7 +437,7 @@ def get_diffusers_pipeline_class(class_name: str) -> type:
     return getattr(diffusers, class_name)
 
 
-class CivitaiCheckpointPipeline(LoraLoaderMixin, BasePipeline):
+class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipeline):
     """Pipeline wrapper for CivitAI checkpoints with auto-detection.
 
     Supports loading single-file checkpoints from CivitAI with automatic
@@ -456,17 +457,21 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, BasePipeline):
     def __init__(self) -> None:
         super().__init__()
         self._init_lora_state()
+        self._init_embedding_state()
         self._pipeline_config: PipelineConfig | None = None
         self._base_model: str | None = None
+        self._full_config: dict[str, Any] | None = None
 
-    def load(self, model_config: dict[str, Any]) -> None:
+    def load(self, model_config: dict[str, Any], full_config: dict[str, Any] | None = None) -> None:
         """Load checkpoint from config (synchronous, requires checkpoint_path).
 
         For CivitAI downloads, use load_async() instead.
 
         Args:
             model_config: Configuration with checkpoint_path and optional overrides
+            full_config: Full configuration dict (for accessing global sections like embeddings)
         """
+        self._full_config = full_config
         checkpoint_path = model_config.get("checkpoint_path")
         if not checkpoint_path:
             raise ValueError(
@@ -480,13 +485,16 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, BasePipeline):
         self,
         model_config: dict[str, Any],
         civitai_client: "CivitaiClient",
+        full_config: dict[str, Any] | None = None,
     ) -> None:
         """Load checkpoint from CivitAI, downloading if needed.
 
         Args:
             model_config: Configuration with civitai_model_id or checkpoint_path
             civitai_client: CivitaiClient for API access and downloads
+            full_config: Full configuration dict (for accessing global sections like embeddings)
         """
+        self._full_config = full_config
         checkpoint_path = model_config.get("checkpoint_path")
         civitai_model_id = model_config.get("civitai_model_id")
         civitai_version_id = model_config.get("civitai_version_id")
@@ -580,6 +588,13 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, BasePipeline):
         if loras:
             print(f"  Loading {len(loras)} LoRA(s)...")
             self.load_loras_sync(loras)
+
+        # Load embeddings if full_config provided
+        if self._full_config:
+            embeddings = parse_embeddings_from_config(self._full_config, model_config)
+            if embeddings:
+                print(f"  Loading {len(embeddings)} embedding(s)...")
+                self.load_embeddings_sync(embeddings)
 
         print(f"Checkpoint loaded: {checkpoint_path.name}")
 

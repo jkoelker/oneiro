@@ -1,21 +1,23 @@
-"""Z-Image-Turbo pipeline wrapper with LoRA support."""
+"""Z-Image-Turbo pipeline wrapper with LoRA and embedding support."""
 
 from typing import Any
 
 import torch
 
 from oneiro.pipelines.base import BasePipeline, GenerationResult
+from oneiro.pipelines.embedding import EmbeddingLoaderMixin, parse_embeddings_from_config
 from oneiro.pipelines.lora import LoraLoaderMixin, parse_loras_from_model_config
 
 
-class ZImagePipelineWrapper(LoraLoaderMixin, BasePipeline):
-    """Wrapper for Z-Image-Turbo pipeline with multi-LoRA support."""
+class ZImagePipelineWrapper(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipeline):
+    """Wrapper for Z-Image-Turbo pipeline with multi-LoRA and embedding support."""
 
     def __init__(self) -> None:
         super().__init__()
         self._init_lora_state()
+        self._init_embedding_state()
 
-    def load(self, model_config: dict[str, Any]) -> None:
+    def load(self, model_config: dict[str, Any], full_config: dict[str, Any] | None = None) -> None:
         """Load Z-Image-Turbo model."""
         from diffusers import ZImagePipeline
 
@@ -34,6 +36,13 @@ class ZImagePipelineWrapper(LoraLoaderMixin, BasePipeline):
         if loras:
             print(f"  Loading {len(loras)} LoRA(s)...")
             self.load_loras_sync(loras)
+
+        # Load embeddings if full_config provided
+        if full_config:
+            embeddings = parse_embeddings_from_config(full_config, model_config)
+            if embeddings:
+                print(f"  Loading {len(embeddings)} embedding(s)...")
+                self.load_embeddings_sync(embeddings)
 
         print(f"Z-Image loaded from {repo}")
 
