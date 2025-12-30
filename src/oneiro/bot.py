@@ -23,6 +23,27 @@ generation_queue: GenerationQueue | None = None
 content_filter: ContentFilter | None = None
 civitai_client: CivitaiClient | None = None
 
+# LoRA weight validation limits
+MIN_LORA_WEIGHT = -2.0
+MAX_LORA_WEIGHT = 2.0
+
+
+def validate_lora_weight(weight: float, lora_name: str) -> None:
+    """Validate that a LoRA weight is within acceptable bounds.
+
+    Args:
+        weight: The LoRA weight value to validate
+        lora_name: Name/identifier of the LoRA (for error messages)
+
+    Raises:
+        ValueError: If weight is outside the valid range [-2.0, 2.0]
+    """
+    if weight < MIN_LORA_WEIGHT or weight > MAX_LORA_WEIGHT:
+        raise ValueError(
+            f"LoRA weight {weight} for '{lora_name}' is out of range. "
+            f"Valid range is [{MIN_LORA_WEIGHT}, {MAX_LORA_WEIGHT}]."
+        )
+
 
 def slugify(text: str) -> str:
     """Convert text to a URL-friendly slug.
@@ -60,6 +81,9 @@ def parse_lora_param(lora_str: str) -> list[tuple[str, float]]:
 
     Returns:
         List of (identifier, weight) tuples
+
+    Raises:
+        ValueError: If a weight is outside the valid range [-2.0, 2.0]
     """
     results: list[tuple[str, float]] = []
     if not lora_str:
@@ -81,19 +105,26 @@ def parse_lora_param(lora_str: str) -> list[tuple[str, float]]:
                 # civitai:12345:0.8
                 try:
                     weight = float(segments[2])
-                    results.append((f"civitai:{segments[1]}", weight))
                 except ValueError:
+                    # Couldn't parse weight as float, treat whole thing as name
                     results.append((part, 1.0))
+                else:
+                    lora_name = f"civitai:{segments[1]}"
+                    validate_lora_weight(weight, lora_name)
+                    results.append((lora_name, weight))
         else:
             # Regular name or name:weight
             if ":" in part:
                 name, weight_str = part.rsplit(":", 1)
                 try:
                     weight = float(weight_str)
-                    results.append((name.strip(), weight))
                 except ValueError:
-                    # Couldn't parse weight, treat whole thing as name
+                    # Couldn't parse weight as float, treat whole thing as name
                     results.append((part, 1.0))
+                else:
+                    lora_name = name.strip()
+                    validate_lora_weight(weight, lora_name)
+                    results.append((lora_name, weight))
             else:
                 results.append((part, 1.0))
 
