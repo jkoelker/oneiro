@@ -224,6 +224,28 @@ def parse_lora_config(config: dict[str, Any] | str, index: int = 0) -> LoraConfi
         )
 
 
+def _get_lora_unique_key(lora: LoraConfig) -> tuple:
+    """Generate a unique key for a LoRA config to detect duplicates.
+
+    The key is based on the source type and identifying attributes:
+    - Civitai: (source, civitai_id, civitai_version)
+    - HuggingFace: (source, repo, weight_name)
+    - Local: (source, path)
+
+    Args:
+        lora: LoRA configuration
+
+    Returns:
+        Tuple that uniquely identifies this LoRA
+    """
+    if lora.source == LoraSource.CIVITAI:
+        return (lora.source, lora.civitai_id, lora.civitai_version)
+    elif lora.source == LoraSource.HUGGINGFACE:
+        return (lora.source, lora.repo, lora.weight_name)
+    else:  # LOCAL
+        return (lora.source, lora.path)
+
+
 def parse_loras_from_model_config(model_config: dict[str, Any]) -> list[LoraConfig]:
     """Parse all LoRA configurations from a model config section.
 
@@ -257,31 +279,46 @@ def parse_loras_from_model_config(model_config: dict[str, Any]) -> list[LoraConf
        lora_weights = "filename.safetensors"
        ```
 
+    Duplicate detection is performed based on source type:
+    - Civitai: (source, civitai_id, civitai_version)
+    - HuggingFace: (source, repo, weight_name)
+    - Local: (source, path)
+
     Args:
         model_config: Model configuration dict from TOML
 
     Returns:
-        List of LoraConfig instances
+        List of LoraConfig instances (duplicates are skipped with a warning)
     """
     loras: list[LoraConfig] = []
+    loaded_keys: set[tuple] = set()
+
+    def _add_lora(lora: LoraConfig) -> None:
+        """Add a LoRA if not already loaded, with duplicate warning."""
+        key = _get_lora_unique_key(lora)
+        if key in loaded_keys:
+            print(f"Warning: duplicate LoRA detected, skipping: {lora.adapter_name}")
+            return
+        loaded_keys.add(key)
+        loras.append(lora)
 
     # Check for loras array (preferred format)
     if "loras" in model_config:
         loras_config = model_config["loras"]
         if isinstance(loras_config, list):
             for i, lora_config in enumerate(loras_config):
-                loras.append(parse_lora_config(lora_config, index=i))
+                _add_lora(parse_lora_config(lora_config, index=i))
         else:
             # Single dict
-            loras.append(parse_lora_config(loras_config, index=0))
+            _add_lora(parse_lora_config(loras_config, index=0))
 
     # Check for civitai_lora URL
     elif "civitai_lora" in model_config:
-        loras.append(parse_lora_config(model_config["civitai_lora"], index=0))
+        _add_lora(parse_lora_config(model_config["civitai_lora"], index=0))
 
     # Check for civitai_lora_id
     elif "civitai_lora_id" in model_config:
-        loras.append(
+        _add_lora(
             LoraConfig(
                 source=LoraSource.CIVITAI,
                 civitai_id=model_config["civitai_lora_id"],
@@ -298,7 +335,7 @@ def parse_loras_from_model_config(model_config: dict[str, Any]) -> list[LoraConf
 
         # Check if it's a local path
         if lora_repo.startswith(("/", "./", "~/")):
-            loras.append(
+            _add_lora(
                 LoraConfig(
                     source=LoraSource.LOCAL,
                     path=lora_repo,
@@ -308,7 +345,7 @@ def parse_loras_from_model_config(model_config: dict[str, Any]) -> list[LoraConf
             )
         else:
             # Assume HuggingFace repo
-            loras.append(
+            _add_lora(
                 LoraConfig(
                     source=LoraSource.HUGGINGFACE,
                     repo=lora_repo,
