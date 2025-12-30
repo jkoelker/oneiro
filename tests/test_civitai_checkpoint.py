@@ -575,7 +575,10 @@ class TestCivitaiCheckpointPipelineGenerate:
         mock_pipe.return_value.images = [mock_image]
         pipeline.pipe = mock_pipe
 
-        with patch("oneiro.pipelines.civitai_checkpoint.torch"):
+        with (
+            patch("oneiro.pipelines.civitai_checkpoint.torch"),
+            patch.object(pipeline, "_encode_prompts_to_embeddings"),
+        ):
             pipeline.generate("test prompt", negative_prompt="bad quality")
 
         call_kwargs = mock_pipe.call_args.kwargs

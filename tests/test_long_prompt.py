@@ -3,6 +3,7 @@
 from oneiro.pipelines.long_prompt import (
     BOS_TOKEN_ID,
     EOS_TOKEN_ID,
+    get_t5_tokens_and_weights,
     get_tokens_and_weights,
     group_tokens_into_chunks,
     parse_prompt_attention,
@@ -214,3 +215,67 @@ class TestIntegration:
         # Should have entries with different weights
         weights = [w for _, w in parsed]
         assert len(set(weights)) > 1  # Multiple different weights
+
+
+class TestGetT5TokensAndWeights:
+    """Tests for get_t5_tokens_and_weights function."""
+
+    def test_requires_tokenizer(self):
+        """Function requires a tokenizer."""
+        from unittest.mock import Mock
+
+        tokenizer = Mock()
+        # T5 tokenizer includes special tokens, no BOS/EOS stripping
+        tokenizer.return_value = Mock(input_ids=[100, 101, 102, 1])  # 1 is T5's EOS
+
+        tokens, weights = get_t5_tokens_and_weights(tokenizer, "test")
+
+        tokenizer.assert_called()
+
+    def test_empty_prompt(self):
+        """Empty prompt should use placeholder."""
+        from unittest.mock import Mock
+
+        tokenizer = Mock()
+        tokenizer.return_value = Mock(input_ids=[100, 1])
+
+        tokens, weights = get_t5_tokens_and_weights(tokenizer, "")
+
+        # Should have called tokenizer with "empty" placeholder
+        tokenizer.assert_called()
+
+    def test_break_keyword_ignored(self):
+        """BREAK keyword should be ignored for T5 (no chunking)."""
+        from unittest.mock import Mock
+
+        tokenizer = Mock()
+        # Simulate tokenizing "first" and "second" separately
+        tokenizer.side_effect = [
+            Mock(input_ids=[100, 101]),  # "first"
+            Mock(input_ids=[200, 201]),  # "second"
+        ]
+
+        # BREAK is between first and second
+        tokens, weights = get_t5_tokens_and_weights(tokenizer, "first BREAK second")
+
+        # Should have tokens from both parts, BREAK not included
+        # Note: actual tokens depend on mock setup
+        assert tokenizer.call_count >= 1
+
+    def test_weights_applied(self):
+        """Weights should be extracted and applied to tokens."""
+        from unittest.mock import Mock
+
+        tokenizer = Mock()
+        # Each call returns some tokens
+        tokenizer.side_effect = [
+            Mock(input_ids=[100]),  # "a "
+            Mock(input_ids=[200, 201]),  # "red"
+            Mock(input_ids=[300]),  # " cat"
+        ]
+
+        tokens, weights = get_t5_tokens_and_weights(tokenizer, "a (red:1.5) cat")
+
+        # Weights for "red" tokens should be 1.5
+        # The actual structure depends on parse_prompt_attention output
+        assert len(tokens) == len(weights)

@@ -15,6 +15,8 @@ import torch
 from oneiro.pipelines.base import BasePipeline, GenerationResult
 from oneiro.pipelines.embedding import EmbeddingLoaderMixin, parse_embeddings_from_config
 from oneiro.pipelines.long_prompt import (
+    get_weighted_text_embeddings_flux,
+    get_weighted_text_embeddings_sd3,
     get_weighted_text_embeddings_sd15,
     get_weighted_text_embeddings_sdxl,
 )
@@ -838,8 +840,8 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
     def _supports_prompt_embeddings(self) -> bool:
         """Check if this pipeline supports embedding-based prompt handling.
 
-        Returns True for CLIP-based pipelines (SD 1.x, SD 2.x, SDXL) which support
-        pre-computed embeddings with weight handling and long prompt chunking.
+        Returns True for pipelines that support pre-computed embeddings with
+        weight handling (CLIP-based: SD 1.x, SD 2.x, SDXL; and flow-based: Flux, SD3).
 
         Returns:
             True if the pipeline supports prompt embeddings
@@ -847,11 +849,13 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
         if self.pipe is None or self._pipeline_config is None:
             return False
 
-        # CLIP-based pipelines support embedding-based prompt handling
+        # Pipelines that support embedding-based prompt handling
         pipeline_class = self._pipeline_config.pipeline_class
         supported_pipelines = {
             "StableDiffusionPipeline",
             "StableDiffusionXLPipeline",
+            "FluxPipeline",
+            "StableDiffusion3Pipeline",
         }
 
         return pipeline_class in supported_pipelines
@@ -869,8 +873,8 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
         - Prompts longer than CLIP's 77-token limit via chunking
         - BREAK keyword for forcing chunk boundaries
 
-        This method is used for all CLIP-based pipelines to provide consistent
-        weight handling regardless of prompt length.
+        This method handles all supported pipelines (SD 1.x/2.x, SDXL, Flux, SD3)
+        with appropriate embedding generation for each architecture.
 
         Args:
             gen_kwargs: Generation kwargs dict to update (modified in place)
@@ -883,7 +887,38 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
         neg_prompt = negative_prompt or ""
         pipeline_class = self._pipeline_config.pipeline_class
 
-        if pipeline_class == "StableDiffusionXLPipeline":
+        if pipeline_class == "FluxPipeline":
+            # Flux uses T5 for main embeddings + CLIP for pooled
+            # Note: Flux does not support negative prompts
+            prompt_embeds, pooled_prompt_embeds = get_weighted_text_embeddings_flux(
+                self.pipe,
+                prompt=prompt,
+            )
+
+            gen_kwargs["prompt_embeds"] = prompt_embeds
+            gen_kwargs["pooled_prompt_embeds"] = pooled_prompt_embeds
+
+        elif pipeline_class == "StableDiffusion3Pipeline":
+            # SD3 uses dual CLIP + T5 encoders
+            (
+                prompt_embeds,
+                negative_prompt_embeds,
+                pooled_prompt_embeds,
+                negative_pooled_prompt_embeds,
+            ) = get_weighted_text_embeddings_sd3(
+                self.pipe,
+                prompt=prompt,
+                negative_prompt=neg_prompt,
+            )
+
+            gen_kwargs["prompt_embeds"] = prompt_embeds
+            gen_kwargs["pooled_prompt_embeds"] = pooled_prompt_embeds
+
+            if self._pipeline_config.supports_negative_prompt:
+                gen_kwargs["negative_prompt_embeds"] = negative_prompt_embeds
+                gen_kwargs["negative_pooled_prompt_embeds"] = negative_pooled_prompt_embeds
+
+        elif pipeline_class == "StableDiffusionXLPipeline":
             # SDXL uses dual text encoders
             (
                 prompt_embeds,
