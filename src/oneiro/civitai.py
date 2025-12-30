@@ -342,9 +342,12 @@ class CivitaiClient:
             env_var = api_key[2:-1]
             api_key = os.environ.get(env_var)
 
-        cache_dir = civitai_config.get("cache_dir")
-        if cache_dir:
-            cache_dir = Path(cache_dir).expanduser()
+        # Environment variable takes precedence over config file for cache_dir
+        cache_dir: Path | None = None
+        if env_cache_dir := os.environ.get("CIVITAI_CACHE_DIR"):
+            cache_dir = Path(env_cache_dir).expanduser()
+        elif config_cache_dir := civitai_config.get("cache_dir"):
+            cache_dir = Path(config_cache_dir).expanduser()
 
         return cls(
             api_key=api_key,
