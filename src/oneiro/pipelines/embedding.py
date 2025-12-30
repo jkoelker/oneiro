@@ -545,6 +545,47 @@ class EmbeddingLoaderMixin:
 
         return self.load_embeddings_sync(embeddings)
 
+    def unload_single_embedding(self, token: str) -> None:
+        """Unload a single embedding by token.
+
+        Args:
+            token: The token to unload
+
+        Raises:
+            RuntimeError: If pipeline not loaded
+            ValueError: If token not found in loaded embeddings
+        """
+        if self.pipe is None:
+            raise RuntimeError("Pipeline not loaded")
+
+        if token not in self._loaded_tokens:
+            raise ValueError(f"Embedding token '{token}' not found in loaded embeddings")
+
+        print(f"Unloading embedding: {token}")
+        try:
+            self.pipe.unload_textual_inversion(token)
+        except Exception as e:
+            print(f"Warning: Error unloading embedding '{token}': {e}")
+
+        self._loaded_tokens.remove(token)
+        self._embedding_configs = [
+            cfg for cfg in self._embedding_configs if (cfg.token or cfg.name) != token
+        ]
+
+    def unload_all_embeddings(self) -> None:
+        """Unload all embeddings and free memory."""
+        if self.pipe is None or not self._loaded_tokens:
+            return
+
+        print(f"Unloading {len(self._loaded_tokens)} embedding(s)")
+        try:
+            self.pipe.unload_textual_inversion()
+        except Exception as e:
+            print(f"Warning: Error unloading embeddings: {e}")
+
+        self._loaded_tokens.clear()
+        self._embedding_configs.clear()
+
     @property
     def active_embeddings(self) -> list[str]:
         """Get list of currently loaded embedding tokens."""
