@@ -251,6 +251,14 @@ def create_bot() -> discord.Bot:
 
         # Start config file watching
         await config.start_watching()
+
+        # Sync slash commands to all guilds for instant availability
+        # (global commands can take up to 1 hour to propagate)
+        if bot.guilds:
+            guild_ids = [g.id for g in bot.guilds]
+            await bot.sync_commands(guild_ids=guild_ids)
+            print(f"Commands synced to {len(guild_ids)} guild(s): {[g.name for g in bot.guilds]}")
+
         print("Ready to generate images!")
 
     @bot.event
