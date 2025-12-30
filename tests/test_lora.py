@@ -61,10 +61,12 @@ class TestLoraConfig:
     def test_civitai_config_valid(self):
         """Valid Civitai config creates successfully."""
         config = LoraConfig(
+            name="my-civitai-lora",
             source=LoraSource.CIVITAI,
             civitai_id=12345,
             weight=0.8,
         )
+        assert config.name == "my-civitai-lora"
         assert config.source == LoraSource.CIVITAI
         assert config.civitai_id == 12345
         assert config.weight == 0.8
@@ -72,6 +74,7 @@ class TestLoraConfig:
     def test_civitai_config_with_url(self):
         """Civitai config with URL is valid."""
         config = LoraConfig(
+            name="url-lora",
             source=LoraSource.CIVITAI,
             civitai_url="https://civitai.com/models/12345",
         )
@@ -80,11 +83,12 @@ class TestLoraConfig:
     def test_civitai_config_requires_id_or_url(self):
         """Civitai config without ID or URL raises."""
         with pytest.raises(ValueError, match="civitai_id or civitai_url"):
-            LoraConfig(source=LoraSource.CIVITAI)
+            LoraConfig(name="invalid", source=LoraSource.CIVITAI)
 
     def test_huggingface_config_valid(self):
         """Valid HuggingFace config creates successfully."""
         config = LoraConfig(
+            name="my-hf-lora",
             source=LoraSource.HUGGINGFACE,
             repo="user/repo",
             weight_name="lora.safetensors",
@@ -95,11 +99,12 @@ class TestLoraConfig:
     def test_huggingface_config_requires_repo(self):
         """HuggingFace config without repo raises."""
         with pytest.raises(ValueError, match="repo"):
-            LoraConfig(source=LoraSource.HUGGINGFACE)
+            LoraConfig(name="invalid", source=LoraSource.HUGGINGFACE)
 
     def test_local_config_valid(self):
         """Valid local config creates successfully."""
         config = LoraConfig(
+            name="my-local-lora",
             source=LoraSource.LOCAL,
             path="/path/to/lora.safetensors",
         )
@@ -109,12 +114,28 @@ class TestLoraConfig:
     def test_local_config_requires_path(self):
         """Local config without path raises."""
         with pytest.raises(ValueError, match="path"):
-            LoraConfig(source=LoraSource.LOCAL)
+            LoraConfig(name="invalid", source=LoraSource.LOCAL)
 
     def test_default_weight_is_one(self):
         """Default weight is 1.0."""
-        config = LoraConfig(source=LoraSource.LOCAL, path="/path")
+        config = LoraConfig(name="test", source=LoraSource.LOCAL, path="/path")
         assert config.weight == 1.0
+
+    def test_adapter_name_defaults_to_name(self):
+        """adapter_name defaults to name when not provided."""
+        config = LoraConfig(name="my-lora", source=LoraSource.LOCAL, path="/path")
+        assert config.adapter_name == "my-lora"
+
+    def test_adapter_name_can_be_different_from_name(self):
+        """adapter_name can be explicitly set different from name."""
+        config = LoraConfig(
+            name="my-lora",
+            source=LoraSource.LOCAL,
+            path="/path",
+            adapter_name="custom_adapter",
+        )
+        assert config.name == "my-lora"
+        assert config.adapter_name == "custom_adapter"
 
 
 class TestParseLoraConfig:
@@ -125,6 +146,7 @@ class TestParseLoraConfig:
         config = parse_lora_config("https://civitai.com/models/12345")
         assert config.source == LoraSource.CIVITAI
         assert config.civitai_id == 12345
+        assert config.name == "civitai_12345"
         assert config.adapter_name == "civitai_12345"
 
     def test_civitai_url_with_version(self):
@@ -138,6 +160,8 @@ class TestParseLoraConfig:
         config = parse_lora_config("/path/to/lora.safetensors")
         assert config.source == LoraSource.LOCAL
         assert config.path == "/path/to/lora.safetensors"
+        assert config.name == "local_0"
+        assert config.adapter_name == "local_0"
 
     def test_civitai_dict_with_id(self):
         """Parses Civitai dict with ID."""
@@ -181,7 +205,7 @@ class TestParseLoraConfig:
         assert config.path == "/path/to/lora.safetensors"
 
     def test_custom_adapter_name(self):
-        """Custom adapter_name is preserved."""
+        """Custom adapter_name is preserved, name auto-generated."""
         config = parse_lora_config(
             {
                 "source": "civitai",
@@ -189,7 +213,33 @@ class TestParseLoraConfig:
                 "adapter_name": "my_style",
             }
         )
+        assert config.name == "civitai_12345"
         assert config.adapter_name == "my_style"
+
+    def test_custom_name_field(self):
+        """Custom name field is used for both name and adapter_name."""
+        config = parse_lora_config(
+            {
+                "source": "civitai",
+                "id": 12345,
+                "name": "my-lora",
+            }
+        )
+        assert config.name == "my-lora"
+        assert config.adapter_name == "my-lora"
+
+    def test_custom_name_and_adapter_name(self):
+        """Both name and adapter_name can be specified independently."""
+        config = parse_lora_config(
+            {
+                "source": "civitai",
+                "id": 12345,
+                "name": "my-lora",
+                "adapter_name": "custom_adapter",
+            }
+        )
+        assert config.name == "my-lora"
+        assert config.adapter_name == "custom_adapter"
 
     def test_invalid_source_raises(self):
         """Invalid source raises ValueError."""
@@ -636,7 +686,7 @@ class TestResolveLoraPath:
         lora_file = tmp_path / "test.safetensors"
         lora_file.write_bytes(b"test")
 
-        config = LoraConfig(source=LoraSource.LOCAL, path=str(lora_file))
+        config = LoraConfig(name="test-lora", source=LoraSource.LOCAL, path=str(lora_file))
         result = await resolve_lora_path(config)
 
         assert result == lora_file
@@ -647,6 +697,7 @@ class TestResolveLoraPath:
         from oneiro.pipelines.lora import resolve_lora_path
 
         config = LoraConfig(
+            name="nonexistent-lora",
             source=LoraSource.LOCAL,
             path=str(tmp_path / "nonexistent.safetensors"),
         )
@@ -658,7 +709,7 @@ class TestResolveLoraPath:
         """HuggingFace source returns repo as path."""
         from oneiro.pipelines.lora import resolve_lora_path
 
-        config = LoraConfig(source=LoraSource.HUGGINGFACE, repo="user/repo")
+        config = LoraConfig(name="hf-lora", source=LoraSource.HUGGINGFACE, repo="user/repo")
         result = await resolve_lora_path(config)
 
         assert result == Path("user/repo")
@@ -668,7 +719,7 @@ class TestResolveLoraPath:
         """Civitai source requires CivitaiClient."""
         from oneiro.pipelines.lora import resolve_lora_path
 
-        config = LoraConfig(source=LoraSource.CIVITAI, civitai_id=12345)
+        config = LoraConfig(name="civitai-lora", source=LoraSource.CIVITAI, civitai_id=12345)
 
         with pytest.raises(ValueError, match="CivitaiClient required"):
             await resolve_lora_path(config)
@@ -684,7 +735,7 @@ class TestResolveLoraPath:
         mock_model.latest_version = mock_version
         mock_client.get_model = AsyncMock(return_value=mock_model)
 
-        config = LoraConfig(source=LoraSource.CIVITAI, civitai_id=12345)
+        config = LoraConfig(name="civitai-lora", source=LoraSource.CIVITAI, civitai_id=12345)
 
         with pytest.raises(LoraIncompatibleError):
             await resolve_lora_path(
