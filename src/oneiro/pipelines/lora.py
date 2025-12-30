@@ -427,10 +427,7 @@ def parse_loras_from_config(
                 parsed = parse_lora_config(lora_config, index=len(loras))
                 if not lora_config.get("name"):
                     object.__setattr__(parsed, "name", ref_name)
-                    if (
-                        parsed.adapter_name == parsed.name
-                        or lora_config.get("adapter_name") is None
-                    ):
+                    if lora_config.get("adapter_name") is None:
                         object.__setattr__(parsed, "adapter_name", ref_name)
                 loras.append(parsed)
                 loaded_names.add(parsed.name)
@@ -449,10 +446,7 @@ def parse_loras_from_config(
                     parsed = parse_lora_config(lora_config, index=len(loras))
                     if not lora_config.get("name"):
                         object.__setattr__(parsed, "name", ref)
-                        if (
-                            parsed.adapter_name == parsed.name
-                            or lora_config.get("adapter_name") is None
-                        ):
+                        if lora_config.get("adapter_name") is None:
                             object.__setattr__(parsed, "adapter_name", ref)
                     loras.append(parsed)
                     loaded_names.add(parsed.name)
