@@ -347,6 +347,22 @@ def create_bot() -> discord.Bot:
         required=False,
     )
     @option(
+        "steps",
+        int,
+        description="Number of inference steps (default: model-specific)",
+        required=False,
+        min_value=1,
+        max_value=100,
+    )
+    @option(
+        "guidance_scale",
+        float,
+        description="CFG scale - prompt adherence (default: model-specific)",
+        required=False,
+        min_value=0.0,
+        max_value=15.0,
+    )
+    @option(
         "lora",
         str,
         description=(
@@ -372,6 +388,8 @@ def create_bot() -> discord.Bot:
         width: int = 1024,
         height: int = 1024,
         seed: int = -1,
+        steps: int | None = None,
+        guidance_scale: float | None = None,
         lora: str | None = None,
         scheduler: str | None = None,
     ):
@@ -408,12 +426,26 @@ def create_bot() -> discord.Bot:
         current_model = pipeline_manager.current_model or "zimage-turbo"
         model_config = config.get("models", current_model, default={}) if config else {}
         pipeline_type = model_config.get("type") if model_config else None
-        steps = model_config.get("steps", 9)
-        guidance_scale = model_config.get("guidance_scale", 0.0)
+
+        # Get model config defaults
+        model_steps = model_config.get("steps", 9)
+        model_guidance = model_config.get("guidance_scale", 0.0)
 
         # Handle Qwen's true_cfg_scale
         if model_config.get("true_cfg_scale"):
-            guidance_scale = model_config.get("true_cfg_scale", 4.0)
+            model_guidance = model_config.get("true_cfg_scale", 4.0)
+
+        # Check for model-specific overrides set via /model command
+        model_overrides = config.get("model_overrides", current_model, default={}) if config else {}
+        if model_overrides:
+            if "steps" in model_overrides:
+                model_steps = model_overrides["steps"]
+            if "guidance_scale" in model_overrides:
+                model_guidance = model_overrides["guidance_scale"]
+
+        # User-provided values take priority over model defaults
+        actual_steps = steps if steps is not None else model_steps
+        actual_guidance = guidance_scale if guidance_scale is not None else model_guidance
 
         # Resolve LoRAs if specified
         lora_configs: list[LoraConfig] = []
@@ -507,8 +539,8 @@ def create_bot() -> discord.Bot:
             "width": width,
             "height": height,
             "seed": seed,
-            "steps": steps,
-            "guidance_scale": guidance_scale,
+            "steps": actual_steps,
+            "guidance_scale": actual_guidance,
         }
 
         if scheduler:
@@ -575,6 +607,8 @@ def create_bot() -> discord.Bot:
             embed.add_field(name="Seed", value=str(result.seed), inline=True)
             embed.add_field(name="Time", value=f"{elapsed:.1f}s", inline=True)
             embed.add_field(name="Model", value=f"`{current_model}`", inline=True)
+            embed.add_field(name="Steps", value=str(result.steps), inline=True)
+            embed.add_field(name="CFG", value=f"{result.guidance_scale:.1f}", inline=True)
             if is_img2img:
                 embed.add_field(name="Strength", value=f"{strength:.2f}", inline=True)
             if lora_configs:
@@ -667,10 +701,28 @@ def create_bot() -> discord.Bot:
         required=False,
         choices=SCHEDULER_CHOICES,
     )
+    @option(
+        "steps",
+        int,
+        description="Override default steps for this model",
+        required=False,
+        min_value=1,
+        max_value=100,
+    )
+    @option(
+        "guidance_scale",
+        float,
+        description="Override default CFG scale for this model",
+        required=False,
+        min_value=0.0,
+        max_value=15.0,
+    )
     async def model_command(
         ctx: discord.ApplicationContext,
         model: str,
         scheduler: str | None = None,
+        steps: int | None = None,
+        guidance_scale: float | None = None,
     ):
         """Switch the active diffusion model and optionally override its scheduler.
 
@@ -698,14 +750,13 @@ def create_bot() -> discord.Bot:
 
         # Check if already loaded
         if pipeline_manager.current_model == model:
+            # Model is already active - handle overrides only
+            overrides_applied = []
+
             if scheduler and pipeline_manager.pipeline is not None:
                 if isinstance(pipeline_manager.pipeline, CivitaiCheckpointPipeline):
                     pipeline_manager.pipeline.configure_scheduler(scheduler)
-                    await ctx.respond(
-                        f"✅ Model `{model}` already active, scheduler set to `{scheduler}`.",
-                        ephemeral=True,
-                    )
-                    return
+                    overrides_applied.append(f"scheduler=`{scheduler}`")
                 else:
                     await ctx.respond(
                         f"✅ Model `{model}` is already active.\n"
@@ -714,10 +765,25 @@ def create_bot() -> discord.Bot:
                     )
                     return
 
-            await ctx.respond(
-                f"✅ Model `{model}` is already active.",
-                ephemeral=True,
-            )
+            # Save steps/guidance_scale overrides to state
+            if config.state_path:
+                if steps is not None:
+                    config.set("model_overrides", model, "steps", value=steps)
+                    overrides_applied.append(f"steps={steps}")
+                if guidance_scale is not None:
+                    config.set("model_overrides", model, "guidance_scale", value=guidance_scale)
+                    overrides_applied.append(f"guidance_scale={guidance_scale}")
+
+            if overrides_applied:
+                await ctx.respond(
+                    f"✅ Model `{model}` already active. Set: {', '.join(overrides_applied)}",
+                    ephemeral=True,
+                )
+            else:
+                await ctx.respond(
+                    f"✅ Model `{model}` is already active.",
+                    ephemeral=True,
+                )
             return
 
         # Defer for model loading (can be slow)
@@ -733,10 +799,22 @@ def create_bot() -> discord.Bot:
 
             if config.state_path:
                 config.set("defaults", "model", value=model)
+                # Save steps/guidance_scale overrides to state
+                if steps is not None:
+                    config.set("model_overrides", model, "steps", value=steps)
+                if guidance_scale is not None:
+                    config.set("model_overrides", model, "guidance_scale", value=guidance_scale)
 
             msg = f"✅ Switched to model `{model}`"
+            overrides = []
             if scheduler:
-                msg += f" with scheduler `{scheduler}`"
+                overrides.append(f"scheduler=`{scheduler}`")
+            if steps is not None:
+                overrides.append(f"steps={steps}")
+            if guidance_scale is not None:
+                overrides.append(f"guidance_scale={guidance_scale}")
+            if overrides:
+                msg += f" with {', '.join(overrides)}"
             await loading_msg.edit(content=msg)
         except Exception as e:
             await ctx.followup.send(f"❌ Failed to load model: {e}", ephemeral=True)
