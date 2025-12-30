@@ -831,7 +831,7 @@ def create_bot() -> discord.Bot:
                 embed.add_field(name="Type", value="LoRA", inline=True)
                 embed.add_field(
                     name="Usage",
-                    value=f'`/dream "your prompt" --lora {resource_name}:0.8`',
+                    value=f'`/dream prompt:"your prompt" lora:{resource_name}:0.8`',
                     inline=False,
                 )
                 if compatibility_warning:
