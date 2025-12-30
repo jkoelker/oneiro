@@ -114,6 +114,9 @@ async def get_lora_choices(ctx: discord.AutocompleteContext) -> list[str]:
     current = ctx.value or ""
     parts = [p.strip() for p in current.split(",")]
     to_match = parts[-1].lower() if parts else ""
+    # Strip weight suffix for matching (e.g., "my-lora:0.8" -> "my-lora")
+    if ":" in to_match:
+        to_match = to_match.rsplit(":", 1)[0]
     prefix = ", ".join(parts[:-1]) + (", " if len(parts) > 1 else "")
 
     # Filter loras - exclude auto_load which is a list, not a lora definition
@@ -300,7 +303,10 @@ def create_bot() -> discord.Bot:
     @option(
         "lora",
         str,
-        description="LoRA(s) to apply: name:weight or civitai:id:weight (comma-separated)",
+        description=(
+            "LoRA(s) to apply: name[:weight] or civitai:id[:weight] "
+            "(comma-separated, weight defaults to 1.0)"
+        ),
         required=False,
         autocomplete=get_lora_choices,
     )
@@ -424,8 +430,10 @@ def create_bot() -> discord.Bot:
                                                 f"⚠️ LoRA `{lora_ref}` (base: {version.base_model}) "
                                                 f"may not be compatible with current model ({pipeline_type})"
                                             )
-                                    except CivitaiError:
-                                        pass  # Silently skip compatibility check on error
+                                    except CivitaiError as e:
+                                        lora_warnings.append(
+                                            f"⚠️ Could not verify LoRA `{lora_ref}`: {e}"
+                                        )
 
                             lora_configs.append(lora_config)
                         else:
@@ -516,7 +524,9 @@ def create_bot() -> discord.Bot:
                 embed.add_field(name="Strength", value=f"{strength:.2f}", inline=True)
             if lora_configs:
                 lora_display = ", ".join(f"`{lc.name}`:{lc.weight}" for lc in lora_configs)
-                embed.add_field(name="LoRA", value=lora_display[:1024], inline=True)
+                if len(lora_display) > 1024:
+                    lora_display = lora_display[:1021] + "..."
+                embed.add_field(name="LoRA", value=lora_display, inline=True)
             embed.set_image(url="attachment://dream.png")
             embed.set_footer(
                 text=f"Requested by {ctx.author.name} • React ❌ to delete",
@@ -757,7 +767,12 @@ def create_bot() -> discord.Bot:
             counter = 1
             existing_loras = config.get("loras", default={})
             existing_models = config.get("models", default={})
-            while resource_name in existing_loras or resource_name in existing_models:
+            existing_embeddings = config.get("embeddings", default={})
+            while (
+                resource_name in existing_loras
+                or resource_name in existing_models
+                or resource_name in existing_embeddings
+            ):
                 resource_name = f"{base_name}-{counter}"
                 counter += 1
 
