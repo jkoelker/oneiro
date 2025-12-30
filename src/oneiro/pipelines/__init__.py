@@ -7,6 +7,12 @@ from typing import TYPE_CHECKING, Any, cast
 from PIL import Image
 
 from oneiro.pipelines.base import BasePipeline, GenerationResult
+from oneiro.pipelines.civitai_checkpoint import (
+    CIVITAI_BASE_MODEL_PIPELINE_MAP,
+    CivitaiCheckpointPipeline,
+    PipelineConfig,
+    get_pipeline_config_for_base_model,
+)
 from oneiro.pipelines.flux1 import Flux1PipelineWrapper
 from oneiro.pipelines.flux2 import Flux2PipelineWrapper
 from oneiro.pipelines.lora import (
@@ -33,6 +39,10 @@ __all__ = [
     "Flux2PipelineWrapper",
     "QwenPipelineWrapper",
     "ZImagePipelineWrapper",
+    "CivitaiCheckpointPipeline",
+    "PipelineConfig",
+    "CIVITAI_BASE_MODEL_PIPELINE_MAP",
+    "get_pipeline_config_for_base_model",
     "LoraConfig",
     "LoraSource",
     "LoraLoaderMixin",
@@ -51,12 +61,22 @@ class PipelineManager:
         "flux1": Flux1PipelineWrapper,
         "flux2": Flux2PipelineWrapper,
         "qwen": QwenPipelineWrapper,
+        "civitai": CivitaiCheckpointPipeline,
     }
 
     def __init__(self, config: "Config"):
         self.config = config
         self.current_model: str | None = None
         self.pipeline: BasePipeline | None = None
+        self._civitai_client: CivitaiClient | None = None
+
+    def set_civitai_client(self, client: "CivitaiClient") -> None:
+        """Set the CivitAI client for checkpoint downloads.
+
+        Args:
+            client: CivitaiClient instance for API access and downloads
+        """
+        self._civitai_client = client
 
     async def load_model(self, model_name: str | None = None) -> None:
         """Load a model by name from config.
@@ -89,7 +109,25 @@ class PipelineManager:
         # Load new pipeline
         wrapper_class = self.PIPELINE_TYPES[pipeline_type]
         self.pipeline = wrapper_class()
-        await asyncio.to_thread(self.pipeline.load, model_config)
+
+        # Special handling for CivitAI checkpoints (async loading)
+        if pipeline_type == "civitai":
+            civitai_pipeline = cast(CivitaiCheckpointPipeline, self.pipeline)
+            if self._civitai_client is None:
+                # Check if checkpoint_path is provided (can load without client)
+                if not model_config.get("checkpoint_path"):
+                    raise ValueError(
+                        "CivitAI pipeline requires either checkpoint_path in config "
+                        "or a CivitaiClient set via set_civitai_client()"
+                    )
+                # Load synchronously from path
+                await asyncio.to_thread(civitai_pipeline.load, model_config)
+            else:
+                # Load asynchronously with CivitAI client
+                await civitai_pipeline.load_async(model_config, self._civitai_client)
+        else:
+            await asyncio.to_thread(self.pipeline.load, model_config)
+
         self.current_model = model_name
 
     async def generate(
