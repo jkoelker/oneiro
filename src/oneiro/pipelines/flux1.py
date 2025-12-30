@@ -11,11 +11,16 @@ class Flux1PipelineWrapper(BasePipeline):
     """Wrapper for FLUX.1 (dev/schnell variants).
 
     FLUX.1 uses:
-    - FluxPipeline from diffusers
+    - FluxPipeline from diffusers (inherits FluxLoraLoaderMixin for LoRA support)
     - FluxTransformer2DModel (MMDiT architecture)
     - T5-v1.1-XXL + CLIP ViT-L/14 text encoders
     - AutoencoderKL VAE
     - FlowMatchEulerDiscreteScheduler
+
+    LoRA Support:
+    - FluxPipeline inherits from FluxLoraLoaderMixin (not the deprecated LoraLoaderMixin)
+    - LoRA weights are loaded via self.pipe.load_lora_weights() which uses the
+      FLUX-specific mixin from diffusers.loaders.lora_pipeline
 
     Variants:
     - FLUX.1-dev: High-quality distilled (steps=28, guidance_scale=3.5)
