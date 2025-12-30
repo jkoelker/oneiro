@@ -12,7 +12,14 @@ from discord import option
 from oneiro.civitai import CivitaiClient, CivitaiError
 from oneiro.config import Config
 from oneiro.filters import ContentFilter
-from oneiro.pipelines import GenerationResult, LoraConfig, LoraSource, PipelineManager
+from oneiro.pipelines import (
+    SCHEDULER_CHOICES,
+    GenerationResult,
+    LoraConfig,
+    LoraSource,
+    PipelineManager,
+)
+from oneiro.pipelines.civitai_checkpoint import CivitaiCheckpointPipeline
 from oneiro.pipelines.lora import is_lora_compatible, parse_civitai_url
 from oneiro.queue import GenerationQueue, QueueStatus
 
@@ -349,6 +356,13 @@ def create_bot() -> discord.Bot:
         required=False,
         autocomplete=get_lora_choices,
     )
+    @option(
+        "scheduler",
+        str,
+        description="Scheduler for denoising (dpm++_karras, euler_a, etc.)",
+        required=False,
+        choices=SCHEDULER_CHOICES,
+    )
     async def dream(
         ctx: discord.ApplicationContext,
         prompt: str,
@@ -359,6 +373,7 @@ def create_bot() -> discord.Bot:
         height: int = 1024,
         seed: int = -1,
         lora: str | None = None,
+        scheduler: str | None = None,
     ):
         """Generate an image from a text prompt."""
         global config, pipeline_manager, generation_queue, content_filter, civitai_client
@@ -486,7 +501,6 @@ def create_bot() -> discord.Bot:
                     await ctx.followup.send(f"❌ Invalid LoRA specification: {e}", ephemeral=True)
                     return
 
-        # Build generation request
         request: dict[str, Any] = {
             "prompt": prompt,
             "negative_prompt": negative_prompt,
@@ -497,7 +511,9 @@ def create_bot() -> discord.Bot:
             "guidance_scale": guidance_scale,
         }
 
-        # Add LoRA configs to request if any
+        if scheduler:
+            request["scheduler"] = scheduler
+
         if lora_configs:
             request["loras"] = lora_configs
 
@@ -566,6 +582,8 @@ def create_bot() -> discord.Bot:
                 if len(lora_display) > 1024:
                     lora_display = lora_display[:1021] + "..."
                 embed.add_field(name="LoRA", value=lora_display, inline=True)
+            if scheduler:
+                embed.add_field(name="Scheduler", value=f"`{scheduler}`", inline=True)
             embed.set_image(url="attachment://dream.png")
             embed.set_footer(
                 text=f"Requested by {ctx.author.name} • React ❌ to delete",
@@ -642,11 +660,25 @@ def create_bot() -> discord.Bot:
         required=True,
         autocomplete=get_model_choices,
     )
+    @option(
+        "scheduler",
+        str,
+        description="Override default scheduler for this model",
+        required=False,
+        choices=SCHEDULER_CHOICES,
+    )
     async def model_command(
         ctx: discord.ApplicationContext,
         model: str,
+        scheduler: str | None = None,
     ):
-        """Switch the active generation model."""
+        """Switch the active diffusion model and optionally override its scheduler.
+
+        This command changes which configured model is used for image generation.
+        If a scheduler is provided and supported by the loaded pipeline, it will be
+        applied after the model is loaded. The selected model may also be stored as
+        the default in the persistent configuration if a state path is configured.
+        """
         global config, pipeline_manager
 
         if pipeline_manager is None or config is None:
@@ -666,6 +698,22 @@ def create_bot() -> discord.Bot:
 
         # Check if already loaded
         if pipeline_manager.current_model == model:
+            if scheduler and pipeline_manager.pipeline is not None:
+                if isinstance(pipeline_manager.pipeline, CivitaiCheckpointPipeline):
+                    pipeline_manager.pipeline.configure_scheduler(scheduler)
+                    await ctx.respond(
+                        f"✅ Model `{model}` already active, scheduler set to `{scheduler}`.",
+                        ephemeral=True,
+                    )
+                    return
+                else:
+                    await ctx.respond(
+                        f"✅ Model `{model}` is already active.\n"
+                        f"⚠️ Scheduler override is not supported for this pipeline type.",
+                        ephemeral=True,
+                    )
+                    return
+
             await ctx.respond(
                 f"✅ Model `{model}` is already active.",
                 ephemeral=True,
@@ -679,11 +727,17 @@ def create_bot() -> discord.Bot:
             loading_msg = await ctx.followup.send(f"⏳ Loading model `{model}`...")
             await pipeline_manager.load_model(model)
 
-            # Persist model choice for next restart
+            if scheduler and pipeline_manager.pipeline is not None:
+                if isinstance(pipeline_manager.pipeline, CivitaiCheckpointPipeline):
+                    pipeline_manager.pipeline.configure_scheduler(scheduler)
+
             if config.state_path:
                 config.set("defaults", "model", value=model)
 
-            await loading_msg.edit(content=f"✅ Switched to model `{model}`")
+            msg = f"✅ Switched to model `{model}`"
+            if scheduler:
+                msg += f" with scheduler `{scheduler}`"
+            await loading_msg.edit(content=msg)
         except Exception as e:
             await ctx.followup.send(f"❌ Failed to load model: {e}", ephemeral=True)
 
