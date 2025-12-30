@@ -7,6 +7,8 @@ import pytest
 from oneiro.pipelines.civitai_checkpoint import (
     CIVITAI_BASE_MODEL_PIPELINE_MAP,
     DEFAULT_PIPELINE_CONFIG,
+    SCHEDULER_CHOICES,
+    SCHEDULER_MAP,
     CivitaiCheckpointPipeline,
     PipelineConfig,
     get_diffusers_pipeline_class,
@@ -258,8 +260,9 @@ class TestCivitaiCheckpointPipelineLoad:
         with pytest.raises(FileNotFoundError, match="Checkpoint not found"):
             pipeline.load({"checkpoint_path": str(tmp_path / "nonexistent.safetensors")})
 
+    @patch.object(CivitaiCheckpointPipeline, "configure_scheduler")
     @patch("oneiro.pipelines.civitai_checkpoint.get_diffusers_pipeline_class")
-    def test_load_with_base_model_override(self, mock_get_class, tmp_path):
+    def test_load_with_base_model_override(self, mock_get_class, mock_config_sched, tmp_path):
         """load() uses base_model override from config."""
         # Create dummy checkpoint file
         checkpoint = tmp_path / "model.safetensors"
@@ -307,8 +310,9 @@ class TestCivitaiCheckpointPipelineLoad:
         assert pipeline._pipeline_config.default_guidance_scale == 5.0
         mock_get_class.assert_called_once_with("CustomPipeline")
 
+    @patch.object(CivitaiCheckpointPipeline, "configure_scheduler")
     @patch("oneiro.pipelines.civitai_checkpoint.get_diffusers_pipeline_class")
-    def test_load_enables_cpu_offload(self, mock_get_class, tmp_path):
+    def test_load_enables_cpu_offload(self, mock_get_class, mock_config_sched, tmp_path):
         """load() enables CPU offload when configured."""
         checkpoint = tmp_path / "model.safetensors"
         checkpoint.write_bytes(b"dummy")
@@ -329,8 +333,9 @@ class TestCivitaiCheckpointPipelineLoad:
 
         mock_pipe.enable_model_cpu_offload.assert_called_once()
 
+    @patch.object(CivitaiCheckpointPipeline, "configure_scheduler")
     @patch("oneiro.pipelines.civitai_checkpoint.get_diffusers_pipeline_class")
-    def test_load_enables_vae_optimizations(self, mock_get_class, tmp_path):
+    def test_load_enables_vae_optimizations(self, mock_get_class, mock_config_sched, tmp_path):
         """load() enables VAE tiling and slicing."""
         checkpoint = tmp_path / "model.safetensors"
         checkpoint.write_bytes(b"dummy")
@@ -620,3 +625,212 @@ class TestCivitaiCheckpointPipelineGenerate:
         assert call_kwargs["strength"] == 0.5
         assert "width" not in call_kwargs
         assert "height" not in call_kwargs
+
+    def test_generate_with_scheduler_override(self):
+        pipeline = CivitaiCheckpointPipeline()
+        pipeline._pipeline_config = PipelineConfig(
+            pipeline_class="StableDiffusionXLPipeline",
+            default_scheduler="dpm++_karras",
+        )
+
+        mock_pipe = MagicMock()
+        mock_scheduler = MagicMock()
+        mock_scheduler.config = {}
+        mock_pipe.scheduler = mock_scheduler
+        mock_image = MagicMock()
+        mock_image.width = 1024
+        mock_image.height = 1024
+        mock_pipe.return_value.images = [mock_image]
+        pipeline.pipe = mock_pipe
+
+        mock_euler = MagicMock()
+        with (
+            patch("oneiro.pipelines.civitai_checkpoint.torch"),
+            patch("diffusers.EulerAncestralDiscreteScheduler", mock_euler),
+        ):
+            pipeline.generate("test prompt", scheduler="euler_a")
+
+        mock_euler.from_config.assert_called_once()
+
+
+class TestSchedulerMap:
+    def test_scheduler_choices_matches_map_keys(self):
+        assert set(SCHEDULER_CHOICES) == set(SCHEDULER_MAP.keys())
+
+    def test_default_entry_has_none_class(self):
+        class_name, kwargs = SCHEDULER_MAP["default"]
+        assert class_name is None
+        assert kwargs == {}
+
+    def test_dpm_karras_entry(self):
+        class_name, kwargs = SCHEDULER_MAP["dpm++_karras"]
+        assert class_name == "DPMSolverMultistepScheduler"
+        assert kwargs["algorithm_type"] == "sde-dpmsolver++"
+        assert kwargs["use_karras_sigmas"] is True
+
+    def test_dpm_entry(self):
+        class_name, kwargs = SCHEDULER_MAP["dpm++"]
+        assert class_name == "DPMSolverMultistepScheduler"
+        assert kwargs["algorithm_type"] == "sde-dpmsolver++"
+        assert kwargs["use_karras_sigmas"] is False
+
+    def test_euler_a_entry(self):
+        class_name, kwargs = SCHEDULER_MAP["euler_a"]
+        assert class_name == "EulerAncestralDiscreteScheduler"
+        assert kwargs == {}
+
+    def test_euler_entry(self):
+        class_name, kwargs = SCHEDULER_MAP["euler"]
+        assert class_name == "EulerDiscreteScheduler"
+        assert kwargs == {}
+
+    def test_heun_entry(self):
+        class_name, kwargs = SCHEDULER_MAP["heun"]
+        assert class_name == "HeunDiscreteScheduler"
+        assert kwargs == {}
+
+    def test_ddim_entry(self):
+        class_name, kwargs = SCHEDULER_MAP["ddim"]
+        assert class_name == "DDIMScheduler"
+        assert kwargs == {}
+
+
+class TestDefaultSchedulers:
+    def test_sd15_has_dpm_karras(self):
+        config = CIVITAI_BASE_MODEL_PIPELINE_MAP["SD 1.5"]
+        assert config.default_scheduler == "dpm++_karras"
+
+    def test_sdxl_has_dpm_karras(self):
+        config = CIVITAI_BASE_MODEL_PIPELINE_MAP["SDXL 1.0"]
+        assert config.default_scheduler == "dpm++_karras"
+
+    def test_pony_has_dpm_karras(self):
+        config = CIVITAI_BASE_MODEL_PIPELINE_MAP["Pony"]
+        assert config.default_scheduler == "dpm++_karras"
+
+    def test_illustrious_has_dpm_karras(self):
+        config = CIVITAI_BASE_MODEL_PIPELINE_MAP["Illustrious"]
+        assert config.default_scheduler == "dpm++_karras"
+
+    def test_sdxl_turbo_keeps_default(self):
+        config = CIVITAI_BASE_MODEL_PIPELINE_MAP["SDXL Turbo"]
+        assert config.default_scheduler == "default"
+
+    def test_sdxl_lightning_keeps_default(self):
+        config = CIVITAI_BASE_MODEL_PIPELINE_MAP["SDXL Lightning"]
+        assert config.default_scheduler == "default"
+
+    def test_flux_keeps_default(self):
+        config = CIVITAI_BASE_MODEL_PIPELINE_MAP["Flux.1 Dev"]
+        assert config.default_scheduler == "default"
+
+    def test_sd3_keeps_default(self):
+        config = CIVITAI_BASE_MODEL_PIPELINE_MAP["SD 3"]
+        assert config.default_scheduler == "default"
+
+
+class TestConfigureScheduler:
+    def test_configure_scheduler_with_none_uses_pipeline_default(self):
+        pipeline = CivitaiCheckpointPipeline()
+        pipeline._pipeline_config = PipelineConfig(
+            pipeline_class="StableDiffusionXLPipeline",
+            default_scheduler="dpm++_karras",
+        )
+        mock_pipe = MagicMock()
+        mock_scheduler = MagicMock()
+        mock_scheduler.config = {}
+        mock_pipe.scheduler = mock_scheduler
+        pipeline.pipe = mock_pipe
+
+        mock_dpm = MagicMock()
+        with patch("diffusers.DPMSolverMultistepScheduler", mock_dpm):
+            pipeline.configure_scheduler(None)
+
+        mock_dpm.from_config.assert_called_once()
+
+    def test_configure_scheduler_default_string_no_change(self):
+        pipeline = CivitaiCheckpointPipeline()
+        pipeline._pipeline_config = PipelineConfig(
+            pipeline_class="StableDiffusionXLPipeline",
+            default_scheduler="default",
+        )
+        mock_pipe = MagicMock()
+        original_scheduler = MagicMock()
+        mock_pipe.scheduler = original_scheduler
+        pipeline.pipe = mock_pipe
+
+        pipeline.configure_scheduler("default")
+
+        assert mock_pipe.scheduler is original_scheduler
+
+    def test_configure_scheduler_unknown_warns(self, capsys):
+        pipeline = CivitaiCheckpointPipeline()
+        pipeline._pipeline_config = PipelineConfig(
+            pipeline_class="StableDiffusionXLPipeline",
+        )
+        mock_pipe = MagicMock()
+        original_scheduler = MagicMock()
+        mock_pipe.scheduler = original_scheduler
+        pipeline.pipe = mock_pipe
+
+        pipeline.configure_scheduler("unknown_scheduler")
+
+        captured = capsys.readouterr()
+        assert "Unknown scheduler" in captured.out
+        assert mock_pipe.scheduler is original_scheduler
+
+    def test_configure_scheduler_euler_a(self):
+        pipeline = CivitaiCheckpointPipeline()
+        pipeline._pipeline_config = PipelineConfig(
+            pipeline_class="StableDiffusionXLPipeline",
+        )
+        mock_pipe = MagicMock()
+        mock_scheduler = MagicMock()
+        mock_scheduler.config = {}
+        mock_pipe.scheduler = mock_scheduler
+        pipeline.pipe = mock_pipe
+
+        mock_euler = MagicMock()
+        with patch("diffusers.EulerAncestralDiscreteScheduler", mock_euler):
+            pipeline.configure_scheduler("euler_a")
+
+        mock_euler.from_config.assert_called_once_with({})
+
+    def test_configure_scheduler_with_kwargs(self):
+        pipeline = CivitaiCheckpointPipeline()
+        pipeline._pipeline_config = PipelineConfig(
+            pipeline_class="StableDiffusionXLPipeline",
+        )
+        mock_pipe = MagicMock()
+        mock_scheduler = MagicMock()
+        mock_scheduler.config = {"some": "config"}
+        mock_pipe.scheduler = mock_scheduler
+        pipeline.pipe = mock_pipe
+
+        mock_dpm = MagicMock()
+        with patch("diffusers.DPMSolverMultistepScheduler", mock_dpm):
+            pipeline.configure_scheduler("dpm++_karras")
+
+        mock_dpm.from_config.assert_called_once_with(
+            {"some": "config"},
+            algorithm_type="sde-dpmsolver++",
+            use_karras_sigmas=True,
+        )
+
+    def test_configure_scheduler_skips_redundant_reconfiguration(self):
+        pipeline = CivitaiCheckpointPipeline()
+        pipeline._pipeline_config = PipelineConfig(
+            pipeline_class="StableDiffusionXLPipeline",
+        )
+        mock_pipe = MagicMock()
+        mock_scheduler = MagicMock()
+        mock_scheduler.config = {}
+        mock_pipe.scheduler = mock_scheduler
+        pipeline.pipe = mock_pipe
+
+        mock_euler = MagicMock()
+        with patch("diffusers.EulerAncestralDiscreteScheduler", mock_euler):
+            pipeline.configure_scheduler("euler_a")
+            pipeline.configure_scheduler("euler_a")
+
+        mock_euler.from_config.assert_called_once()

@@ -143,6 +143,21 @@ verify_hashes = true
 # - SD 3, SD 3.5 Medium/Large (1024x1024)
 # - PixArt Alpha/Sigma, Kolors, Hunyuan DiT, AuraFlow
 #
+# SCHEDULER OPTIONS:
+# The scheduler controls the denoising process. Available options:
+#   - dpm++_karras: DPM++ with Karras sigmas (recommended for SD/SDXL/Pony)
+#   - dpm++: DPM++ without Karras sigmas
+#   - euler_a: Euler Ancestral (good variety, slightly random)
+#   - euler: Euler (deterministic)
+#   - heun: Heun (higher quality, 2x slower)
+#   - ddim: DDIM (classic, deterministic)
+#   - default: Keep the model's built-in scheduler
+#
+# Defaults by model type:
+#   - SD/SDXL/Pony/Illustrious: dpm++_karras
+#   - Turbo/Lightning/LCM/Hyper: default (keep optimized scheduler)
+#   - Flux/SD3/PixArt/etc: default (flow-based models)
+#
 # Example 1: CivitAI checkpoint by model ID (downloads automatically)
 # [models.civitai-example]
 # type = "civitai"
@@ -181,3 +196,9 @@ verify_hashes = true
 # steps = 30
 # guidance_scale = 5.0
 # supports_negative_prompt = true
+#
+# Example 6: CivitAI checkpoint with custom scheduler
+# [models.realistic-xl]
+# type = "civitai"
+# civitai_model_id = 12345
+# scheduler = "euler_a"           # Override default scheduler
