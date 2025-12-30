@@ -91,6 +91,7 @@ class PipelineConfig:
     default_width: int = 512
     default_height: int = 512
     requires_safety_checker: bool = False
+    default_scheduler: str | None = None  # None = auto-detect based on model type
 
 
 # Mapping from CivitAI base model strings to pipeline configurations
@@ -103,6 +104,7 @@ CIVITAI_BASE_MODEL_PIPELINE_MAP: dict[str, PipelineConfig] = {
         default_guidance_scale=7.5,
         default_width=512,
         default_height=512,
+        default_scheduler="dpm++_karras",
     ),
     "SD 1.5": PipelineConfig(
         pipeline_class="StableDiffusionPipeline",
@@ -110,6 +112,7 @@ CIVITAI_BASE_MODEL_PIPELINE_MAP: dict[str, PipelineConfig] = {
         default_guidance_scale=7.5,
         default_width=512,
         default_height=512,
+        default_scheduler="dpm++_karras",
     ),
     "SD 1.5 LCM": PipelineConfig(
         pipeline_class="StableDiffusionPipeline",
@@ -117,6 +120,7 @@ CIVITAI_BASE_MODEL_PIPELINE_MAP: dict[str, PipelineConfig] = {
         default_guidance_scale=1.0,
         default_width=512,
         default_height=512,
+        default_scheduler="default",
     ),
     "SD 1.5 Hyper": PipelineConfig(
         pipeline_class="StableDiffusionPipeline",
@@ -124,6 +128,7 @@ CIVITAI_BASE_MODEL_PIPELINE_MAP: dict[str, PipelineConfig] = {
         default_guidance_scale=1.0,
         default_width=512,
         default_height=512,
+        default_scheduler="default",
     ),
     # SD 2.x family
     "SD 2.0": PipelineConfig(
@@ -132,6 +137,7 @@ CIVITAI_BASE_MODEL_PIPELINE_MAP: dict[str, PipelineConfig] = {
         default_guidance_scale=7.5,
         default_width=768,
         default_height=768,
+        default_scheduler="dpm++_karras",
     ),
     "SD 2.1": PipelineConfig(
         pipeline_class="StableDiffusionPipeline",
@@ -139,6 +145,7 @@ CIVITAI_BASE_MODEL_PIPELINE_MAP: dict[str, PipelineConfig] = {
         default_guidance_scale=7.5,
         default_width=768,
         default_height=768,
+        default_scheduler="dpm++_karras",
     ),
     # SDXL family
     "SDXL 0.9": PipelineConfig(
@@ -147,6 +154,7 @@ CIVITAI_BASE_MODEL_PIPELINE_MAP: dict[str, PipelineConfig] = {
         default_guidance_scale=7.0,
         default_width=1024,
         default_height=1024,
+        default_scheduler="dpm++_karras",
     ),
     "SDXL 1.0": PipelineConfig(
         pipeline_class="StableDiffusionXLPipeline",
@@ -154,6 +162,7 @@ CIVITAI_BASE_MODEL_PIPELINE_MAP: dict[str, PipelineConfig] = {
         default_guidance_scale=7.0,
         default_width=1024,
         default_height=1024,
+        default_scheduler="dpm++_karras",
     ),
     "SDXL 1.0 LCM": PipelineConfig(
         pipeline_class="StableDiffusionXLPipeline",
@@ -161,6 +170,7 @@ CIVITAI_BASE_MODEL_PIPELINE_MAP: dict[str, PipelineConfig] = {
         default_guidance_scale=1.0,
         default_width=1024,
         default_height=1024,
+        default_scheduler="default",
     ),
     "SDXL Turbo": PipelineConfig(
         pipeline_class="StableDiffusionXLPipeline",
@@ -168,6 +178,7 @@ CIVITAI_BASE_MODEL_PIPELINE_MAP: dict[str, PipelineConfig] = {
         default_guidance_scale=0.0,
         default_width=1024,
         default_height=1024,
+        default_scheduler="default",
     ),
     "SDXL Lightning": PipelineConfig(
         pipeline_class="StableDiffusionXLPipeline",
@@ -175,6 +186,7 @@ CIVITAI_BASE_MODEL_PIPELINE_MAP: dict[str, PipelineConfig] = {
         default_guidance_scale=0.0,
         default_width=1024,
         default_height=1024,
+        default_scheduler="default",
     ),
     "SDXL Hyper": PipelineConfig(
         pipeline_class="StableDiffusionXLPipeline",
@@ -182,6 +194,7 @@ CIVITAI_BASE_MODEL_PIPELINE_MAP: dict[str, PipelineConfig] = {
         default_guidance_scale=0.0,
         default_width=1024,
         default_height=1024,
+        default_scheduler="default",
     ),
     # Pony (SDXL-based)
     "Pony": PipelineConfig(
@@ -190,6 +203,7 @@ CIVITAI_BASE_MODEL_PIPELINE_MAP: dict[str, PipelineConfig] = {
         default_guidance_scale=7.0,
         default_width=1024,
         default_height=1024,
+        default_scheduler="dpm++_karras",
     ),
     # Illustrious (SDXL-based)
     "Illustrious": PipelineConfig(
@@ -198,8 +212,9 @@ CIVITAI_BASE_MODEL_PIPELINE_MAP: dict[str, PipelineConfig] = {
         default_guidance_scale=7.0,
         default_width=1024,
         default_height=1024,
+        default_scheduler="dpm++_karras",
     ),
-    # Flux family
+    # Flux family (flow-based, incompatible with DPM schedulers)
     "Flux.1 D": PipelineConfig(
         pipeline_class="FluxPipeline",
         supports_negative_prompt=False,
@@ -207,6 +222,7 @@ CIVITAI_BASE_MODEL_PIPELINE_MAP: dict[str, PipelineConfig] = {
         default_guidance_scale=3.5,
         default_width=1024,
         default_height=1024,
+        default_scheduler="default",
     ),
     "Flux.1 S": PipelineConfig(
         pipeline_class="FluxPipeline",
@@ -215,6 +231,7 @@ CIVITAI_BASE_MODEL_PIPELINE_MAP: dict[str, PipelineConfig] = {
         default_guidance_scale=0.0,
         default_width=1024,
         default_height=1024,
+        default_scheduler="default",
     ),
     "Flux.1 Dev": PipelineConfig(
         pipeline_class="FluxPipeline",
@@ -223,6 +240,7 @@ CIVITAI_BASE_MODEL_PIPELINE_MAP: dict[str, PipelineConfig] = {
         default_guidance_scale=3.5,
         default_width=1024,
         default_height=1024,
+        default_scheduler="default",
     ),
     "Flux.1 Schnell": PipelineConfig(
         pipeline_class="FluxPipeline",
@@ -231,14 +249,16 @@ CIVITAI_BASE_MODEL_PIPELINE_MAP: dict[str, PipelineConfig] = {
         default_guidance_scale=0.0,
         default_width=1024,
         default_height=1024,
+        default_scheduler="default",
     ),
-    # SD 3.x family
+    # SD 3.x family (flow-based, incompatible with DPM schedulers)
     "SD 3": PipelineConfig(
         pipeline_class="StableDiffusion3Pipeline",
         default_steps=28,
         default_guidance_scale=7.0,
         default_width=1024,
         default_height=1024,
+        default_scheduler="default",
     ),
     "SD 3 Medium": PipelineConfig(
         pipeline_class="StableDiffusion3Pipeline",
@@ -246,6 +266,7 @@ CIVITAI_BASE_MODEL_PIPELINE_MAP: dict[str, PipelineConfig] = {
         default_guidance_scale=7.0,
         default_width=1024,
         default_height=1024,
+        default_scheduler="default",
     ),
     "SD 3.5": PipelineConfig(
         pipeline_class="StableDiffusion3Pipeline",
@@ -253,6 +274,7 @@ CIVITAI_BASE_MODEL_PIPELINE_MAP: dict[str, PipelineConfig] = {
         default_guidance_scale=7.0,
         default_width=1024,
         default_height=1024,
+        default_scheduler="default",
     ),
     "SD 3.5 Medium": PipelineConfig(
         pipeline_class="StableDiffusion3Pipeline",
@@ -260,6 +282,7 @@ CIVITAI_BASE_MODEL_PIPELINE_MAP: dict[str, PipelineConfig] = {
         default_guidance_scale=4.5,
         default_width=1024,
         default_height=1024,
+        default_scheduler="default",
     ),
     "SD 3.5 Large": PipelineConfig(
         pipeline_class="StableDiffusion3Pipeline",
@@ -267,6 +290,7 @@ CIVITAI_BASE_MODEL_PIPELINE_MAP: dict[str, PipelineConfig] = {
         default_guidance_scale=4.5,
         default_width=1024,
         default_height=1024,
+        default_scheduler="default",
     ),
     "SD 3.5 Large Turbo": PipelineConfig(
         pipeline_class="StableDiffusion3Pipeline",
@@ -274,6 +298,7 @@ CIVITAI_BASE_MODEL_PIPELINE_MAP: dict[str, PipelineConfig] = {
         default_guidance_scale=0.0,
         default_width=1024,
         default_height=1024,
+        default_scheduler="default",
     ),
     # Other architectures
     "PixArt a": PipelineConfig(
@@ -282,6 +307,7 @@ CIVITAI_BASE_MODEL_PIPELINE_MAP: dict[str, PipelineConfig] = {
         default_guidance_scale=4.5,
         default_width=1024,
         default_height=1024,
+        default_scheduler="default",
     ),
     "PixArt Sigma": PipelineConfig(
         pipeline_class="PixArtSigmaPipeline",
@@ -289,6 +315,7 @@ CIVITAI_BASE_MODEL_PIPELINE_MAP: dict[str, PipelineConfig] = {
         default_guidance_scale=4.5,
         default_width=1024,
         default_height=1024,
+        default_scheduler="default",
     ),
     "Kolors": PipelineConfig(
         pipeline_class="KolorsPipeline",
@@ -296,6 +323,7 @@ CIVITAI_BASE_MODEL_PIPELINE_MAP: dict[str, PipelineConfig] = {
         default_guidance_scale=5.0,
         default_width=1024,
         default_height=1024,
+        default_scheduler="default",
     ),
     "Hunyuan DiT": PipelineConfig(
         pipeline_class="HunyuanDiTPipeline",
@@ -303,6 +331,7 @@ CIVITAI_BASE_MODEL_PIPELINE_MAP: dict[str, PipelineConfig] = {
         default_guidance_scale=5.0,
         default_width=1024,
         default_height=1024,
+        default_scheduler="default",
     ),
     "Lumina": PipelineConfig(
         pipeline_class="LuminaText2ImgPipeline",
@@ -310,6 +339,7 @@ CIVITAI_BASE_MODEL_PIPELINE_MAP: dict[str, PipelineConfig] = {
         default_guidance_scale=4.0,
         default_width=1024,
         default_height=1024,
+        default_scheduler="default",
     ),
     "AuraFlow": PipelineConfig(
         pipeline_class="AuraFlowPipeline",
@@ -317,8 +347,27 @@ CIVITAI_BASE_MODEL_PIPELINE_MAP: dict[str, PipelineConfig] = {
         default_guidance_scale=3.5,
         default_width=1024,
         default_height=1024,
+        default_scheduler="default",
     ),
 }
+
+SCHEDULER_MAP: dict[str, tuple[str | None, dict[str, Any]]] = {
+    "dpm++_karras": (
+        "DPMSolverMultistepScheduler",
+        {"algorithm_type": "sde-dpmsolver++", "use_karras_sigmas": True},
+    ),
+    "dpm++": (
+        "DPMSolverMultistepScheduler",
+        {"algorithm_type": "sde-dpmsolver++", "use_karras_sigmas": False},
+    ),
+    "euler_a": ("EulerAncestralDiscreteScheduler", {}),
+    "euler": ("EulerDiscreteScheduler", {}),
+    "heun": ("HeunDiscreteScheduler", {}),
+    "ddim": ("DDIMScheduler", {}),
+    "default": (None, {}),
+}
+
+SCHEDULER_CHOICES: list[str] = list(SCHEDULER_MAP.keys())
 
 # Default fallback configuration
 DEFAULT_PIPELINE_CONFIG = PipelineConfig(
@@ -327,6 +376,7 @@ DEFAULT_PIPELINE_CONFIG = PipelineConfig(
     default_guidance_scale=7.0,
     default_width=1024,
     default_height=1024,
+    default_scheduler="dpm++_karras",
 )
 
 
@@ -461,6 +511,7 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
         self._pipeline_config: PipelineConfig | None = None
         self._base_model: str | None = None
         self._full_config: dict[str, Any] | None = None
+        self._current_scheduler: str | None = None
 
     def load(self, model_config: dict[str, Any], full_config: dict[str, Any] | None = None) -> None:
         """Load checkpoint from config (synchronous, requires checkpoint_path).
@@ -569,6 +620,9 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
             torch_dtype=self._dtype,
         )
 
+        scheduler_override = model_config.get("scheduler")
+        self.configure_scheduler(scheduler_override)
+
         # Apply optimizations
         cpu_offload = model_config.get("cpu_offload", True)
         if cpu_offload and self._device == "cuda":
@@ -598,6 +652,35 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
 
         print(f"Checkpoint loaded: {checkpoint_path.name}")
 
+    def configure_scheduler(self, scheduler_name: str | None) -> None:
+        if self.pipe is None or self._pipeline_config is None:
+            return
+
+        if scheduler_name is None or scheduler_name == "default":
+            scheduler_name = self._pipeline_config.default_scheduler
+
+        if scheduler_name is None or scheduler_name == "default":
+            return
+
+        if scheduler_name == self._current_scheduler:
+            return
+
+        if scheduler_name not in SCHEDULER_MAP:
+            print(f"  Warning: Unknown scheduler '{scheduler_name}', keeping default")
+            return
+
+        class_name, kwargs = SCHEDULER_MAP[scheduler_name]
+        if class_name is None:
+            self._current_scheduler = scheduler_name
+            return
+
+        import diffusers
+
+        scheduler_class = getattr(diffusers, class_name)
+        self.pipe.scheduler = scheduler_class.from_config(self.pipe.scheduler.config, **kwargs)
+        self._current_scheduler = scheduler_name
+        print(f"  Scheduler: {scheduler_name}")
+
     def generate(
         self,
         prompt: str,
@@ -609,26 +692,72 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
         guidance_scale: float | None = None,
         **kwargs: Any,
     ) -> GenerationResult:
-        """Generate image using the loaded checkpoint.
+        """
+        Run a text-to-image or image-to-image generation using the loaded CivitAI
+        checkpoint-backed diffusers pipeline.
 
-        Args:
-            prompt: Text prompt for generation
-            negative_prompt: Negative prompt (ignored for Flux models)
-            width: Image width (defaults to pipeline config)
-            height: Image height (defaults to pipeline config)
-            seed: Random seed (-1 for random)
-            steps: Inference steps (defaults to pipeline config)
-            guidance_scale: Guidance scale (defaults to pipeline config)
-            **kwargs: Additional pipeline-specific parameters
+        This method uses defaults from the resolved pipeline configuration for
+        image size, number of inference steps, and guidance scale when those
+        values are not provided explicitly.
 
-        Returns:
-            GenerationResult with generated image and metadata
+        Parameters
+        ----------
+        prompt:
+            The primary prompt describing the desired image.
+        negative_prompt:
+            An optional negative prompt used to steer the model away from
+            unwanted content. This is only applied if the underlying pipeline
+            supports negative prompts.
+        width:
+            Target image width in pixels. If omitted, the pipeline's
+            ``default_width`` is used for text-to-image generation.
+        height:
+            Target image height in pixels. If omitted, the pipeline's
+            ``default_height`` is used for text-to-image generation.
+        seed:
+            Random seed used to create the diffusion generator. A value of
+            ``-1`` indicates that a random seed should be chosen.
+        steps:
+            Number of diffusion inference steps. If omitted, the pipeline's
+            ``default_steps`` is used.
+        guidance_scale:
+            Classifier-free guidance scale. If ``None``, the pipeline's
+            ``default_guidance_scale`` is used.
+        **kwargs:
+            Additional options forwarded to the underlying diffusers pipeline.
+            Recognized options in this wrapper include:
+
+            - ``scheduler``: Optional scheduler name to override the pipeline's
+              default scheduler. Must be a key in ``SCHEDULER_MAP``; if
+              provided, :meth:`configure_scheduler` is called before
+              generation.
+            - ``init_image``: Optional initial image (path-like, PIL image, or
+              other supported type) to enable image-to-image (img2img) mode.
+              When provided, the method will call :meth:`_load_init_image` and
+              pass the resulting image to the pipeline.
+            - ``strength``: Strength parameter for img2img generation, used
+              when ``init_image`` is provided. Defaults to ``0.75``.
+
+            Any other keyword arguments are passed through unchanged to the
+            underlying diffusers pipeline call and may be used to control
+            advanced generation options.
+
+        Returns
+        -------
+        GenerationResult
+            An object containing the generated image along with metadata such
+            as the actual seed used, prompts, final image size, number of
+            steps, and guidance scale.
         """
         if self.pipe is None:
             raise RuntimeError("Pipeline not loaded")
 
         if self._pipeline_config is None:
             raise RuntimeError("Pipeline config not initialized")
+
+        scheduler_override = kwargs.pop("scheduler", None)
+        if scheduler_override:
+            self.configure_scheduler(scheduler_override)
 
         # Use defaults from pipeline config
         width = width or self._pipeline_config.default_width

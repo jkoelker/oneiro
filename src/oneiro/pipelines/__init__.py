@@ -9,6 +9,8 @@ from PIL import Image
 from oneiro.pipelines.base import BasePipeline, GenerationResult
 from oneiro.pipelines.civitai_checkpoint import (
     CIVITAI_BASE_MODEL_PIPELINE_MAP,
+    SCHEDULER_CHOICES,
+    SCHEDULER_MAP,
     CivitaiCheckpointPipeline,
     PipelineConfig,
     get_pipeline_config_for_base_model,
@@ -42,6 +44,8 @@ __all__ = [
     "CivitaiCheckpointPipeline",
     "PipelineConfig",
     "CIVITAI_BASE_MODEL_PIPELINE_MAP",
+    "SCHEDULER_CHOICES",
+    "SCHEDULER_MAP",
     "get_pipeline_config_for_base_model",
     "LoraConfig",
     "LoraSource",
