@@ -527,3 +527,180 @@ class TestResolveEmbeddingPath:
                 pipeline_type="flux2",
                 validate_compatibility=True,
             )
+
+
+class TestEmbeddingLoaderMixin:
+    """Tests for EmbeddingLoaderMixin unload functionality."""
+
+    def test_unload_single_embedding_success(self):
+        """Unloading a loaded embedding removes it from tracking."""
+        from oneiro.pipelines.embedding import EmbeddingLoaderMixin
+
+        class MockPipeline(EmbeddingLoaderMixin):
+            def __init__(self):
+                self.pipe = Mock()
+                self._init_embedding_state()
+
+        pipeline = MockPipeline()
+        pipeline._loaded_tokens = ["token1", "token2"]
+        pipeline._embedding_configs = [
+            EmbeddingConfig(name="emb1", source=EmbeddingSource.LOCAL, path="/p", token="token1"),
+            EmbeddingConfig(name="emb2", source=EmbeddingSource.LOCAL, path="/p", token="token2"),
+        ]
+
+        pipeline.unload_single_embedding("token1")
+
+        assert "token1" not in pipeline._loaded_tokens
+        assert "token2" in pipeline._loaded_tokens
+        assert len(pipeline._embedding_configs) == 1
+        pipeline.pipe.unload_textual_inversion.assert_called_once_with("token1")
+
+    def test_unload_single_embedding_not_found_raises(self):
+        """Unloading non-existent token raises ValueError."""
+        from oneiro.pipelines.embedding import EmbeddingLoaderMixin
+
+        class MockPipeline(EmbeddingLoaderMixin):
+            def __init__(self):
+                self.pipe = Mock()
+                self._init_embedding_state()
+
+        pipeline = MockPipeline()
+        pipeline._loaded_tokens = ["token1"]
+
+        with pytest.raises(ValueError, match="not found"):
+            pipeline.unload_single_embedding("nonexistent")
+
+    def test_unload_single_embedding_no_pipeline_raises(self):
+        """Unloading without pipeline raises RuntimeError."""
+        from oneiro.pipelines.embedding import EmbeddingLoaderMixin
+
+        class MockPipeline(EmbeddingLoaderMixin):
+            def __init__(self):
+                self.pipe = None
+                self._init_embedding_state()
+
+        pipeline = MockPipeline()
+
+        with pytest.raises(RuntimeError, match="not loaded"):
+            pipeline.unload_single_embedding("token1")
+
+    def test_unload_embeddings_success(self):
+        """Unloading all embeddings clears tracking lists."""
+        from oneiro.pipelines.embedding import EmbeddingLoaderMixin
+
+        class MockPipeline(EmbeddingLoaderMixin):
+            def __init__(self):
+                self.pipe = Mock()
+                self._init_embedding_state()
+
+        pipeline = MockPipeline()
+        pipeline._loaded_tokens = ["token1", "token2"]
+        pipeline._embedding_configs = [
+            EmbeddingConfig(name="emb1", source=EmbeddingSource.LOCAL, path="/p", token="token1"),
+            EmbeddingConfig(name="emb2", source=EmbeddingSource.LOCAL, path="/p", token="token2"),
+        ]
+
+        pipeline.unload_embeddings()
+
+        assert pipeline._loaded_tokens == []
+        assert pipeline._embedding_configs == []
+        pipeline.pipe.unload_textual_inversion.assert_called_once_with()
+
+    def test_unload_embeddings_empty_is_noop(self):
+        """Unloading when no embeddings loaded is a no-op."""
+        from oneiro.pipelines.embedding import EmbeddingLoaderMixin
+
+        class MockPipeline(EmbeddingLoaderMixin):
+            def __init__(self):
+                self.pipe = Mock()
+                self._init_embedding_state()
+
+        pipeline = MockPipeline()
+
+        pipeline.unload_embeddings()
+
+        pipeline.pipe.unload_textual_inversion.assert_not_called()
+
+    def test_unload_embeddings_no_pipeline_is_noop(self):
+        """Unloading all without pipeline is a no-op."""
+        from oneiro.pipelines.embedding import EmbeddingLoaderMixin
+
+        class MockPipeline(EmbeddingLoaderMixin):
+            def __init__(self):
+                self.pipe = None
+                self._init_embedding_state()
+
+        pipeline = MockPipeline()
+        pipeline._loaded_tokens = ["token1"]
+
+        pipeline.unload_embeddings()
+
+        assert pipeline._loaded_tokens == ["token1"]
+
+    def test_unload_single_embedding_handles_exception(self, capsys):
+        """Unloading handles exceptions gracefully."""
+        from oneiro.pipelines.embedding import EmbeddingLoaderMixin
+
+        class MockPipeline(EmbeddingLoaderMixin):
+            def __init__(self):
+                self.pipe = Mock()
+                self.pipe.unload_textual_inversion.side_effect = RuntimeError("API error")
+                self._init_embedding_state()
+
+        pipeline = MockPipeline()
+        pipeline._loaded_tokens = ["token1"]
+        pipeline._embedding_configs = [
+            EmbeddingConfig(name="emb1", source=EmbeddingSource.LOCAL, path="/p", token="token1"),
+        ]
+
+        pipeline.unload_single_embedding("token1")
+
+        assert "token1" not in pipeline._loaded_tokens
+        captured = capsys.readouterr()
+        assert "Warning" in captured.out
+        assert "API error" in captured.out
+
+    def test_unload_embeddings_handles_exception(self, capsys):
+        """Unloading all handles exceptions gracefully."""
+        from oneiro.pipelines.embedding import EmbeddingLoaderMixin
+
+        class MockPipeline(EmbeddingLoaderMixin):
+            def __init__(self):
+                self.pipe = Mock()
+                self.pipe.unload_textual_inversion.side_effect = RuntimeError("API error")
+                self._init_embedding_state()
+
+        pipeline = MockPipeline()
+        pipeline._loaded_tokens = ["token1"]
+        pipeline._embedding_configs = [
+            EmbeddingConfig(name="emb1", source=EmbeddingSource.LOCAL, path="/p", token="token1"),
+        ]
+
+        pipeline.unload_embeddings()
+
+        assert pipeline._loaded_tokens == []
+        assert pipeline._embedding_configs == []
+        captured = capsys.readouterr()
+        assert "Warning" in captured.out
+
+    def test_unload_embedding_by_name_when_no_token(self):
+        """Unloading works when embedding uses name as token."""
+        from oneiro.pipelines.embedding import EmbeddingLoaderMixin
+
+        class MockPipeline(EmbeddingLoaderMixin):
+            def __init__(self):
+                self.pipe = Mock()
+                self._init_embedding_state()
+
+        pipeline = MockPipeline()
+        pipeline._loaded_tokens = ["my-embedding"]
+        pipeline._embedding_configs = [
+            EmbeddingConfig(
+                name="my-embedding", source=EmbeddingSource.LOCAL, path="/p", token=None
+            ),
+        ]
+
+        pipeline.unload_single_embedding("my-embedding")
+
+        assert pipeline._loaded_tokens == []
+        assert pipeline._embedding_configs == []
