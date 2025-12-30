@@ -27,8 +27,9 @@ class LoraConfig:
     - local: Load from local file path
 
     Attributes:
+        name: Unique name for referencing this LoRA (required)
         source: Where to load the LoRA from (civitai, huggingface, local)
-        adapter_name: Name for the adapter (auto-generated if not provided)
+        adapter_name: Name for the diffusers adapter (defaults to name if not provided)
         weight: Adapter weight for blending (default: 1.0)
         civitai_id: Civitai model ID (for civitai source)
         civitai_version: Specific version ID (optional, defaults to latest)
@@ -38,6 +39,7 @@ class LoraConfig:
         path: Local file path (for local source)
     """
 
+    name: str
     source: LoraSource
     adapter_name: str | None = None
     weight: float = 1.0
@@ -58,7 +60,10 @@ class LoraConfig:
     _resolved_path: Path | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
-        """Validate configuration based on source type."""
+        """Validate configuration and set defaults."""
+        if self.adapter_name is None:
+            object.__setattr__(self, "adapter_name", self.name)
+
         if self.source == LoraSource.CIVITAI:
             if not self.civitai_id and not self.civitai_url:
                 raise ValueError("civitai source requires civitai_id or civitai_url")
@@ -142,18 +147,20 @@ def parse_lora_config(config: dict[str, Any] | str, index: int = 0) -> LoraConfi
     if isinstance(config, str):
         if "civitai.com" in config:
             model_id, version_id = parse_civitai_url(config)
+            auto_name = f"civitai_{model_id}"
             return LoraConfig(
+                name=auto_name,
                 source=LoraSource.CIVITAI,
                 civitai_id=model_id,
                 civitai_version=version_id,
                 civitai_url=config,
-                adapter_name=f"civitai_{model_id}",
             )
         # Assume local path
+        auto_name = f"local_{index}"
         return LoraConfig(
+            name=auto_name,
             source=LoraSource.LOCAL,
             path=config,
-            adapter_name=f"local_{index}",
         )
 
     # Dict configuration
@@ -168,24 +175,24 @@ def parse_lora_config(config: dict[str, Any] | str, index: int = 0) -> LoraConfi
         raise ValueError(f"Invalid LoRA source: {source_str}") from err
 
     # Common fields
-    adapter_name = config.get("adapter_name") or config.get("name")
+    lora_name = config.get("name")
+    adapter_name = config.get("adapter_name")
     weight = config.get("weight", 1.0)
 
     if source == LoraSource.CIVITAI:
-        # Parse Civitai config
         civitai_id = config.get("id") or config.get("civitai_id")
         civitai_version = config.get("version") or config.get("civitai_version")
         civitai_url = config.get("url") or config.get("civitai_url")
 
-        # Parse URL if provided but no ID
         if civitai_url and not civitai_id:
             civitai_id, parsed_version = parse_civitai_url(civitai_url)
             civitai_version = civitai_version or parsed_version
 
-        if not adapter_name:
-            adapter_name = f"civitai_{civitai_id}" if civitai_id else f"lora_{index}"
+        if not lora_name:
+            lora_name = f"civitai_{civitai_id}" if civitai_id else f"lora_{index}"
 
         return LoraConfig(
+            name=lora_name,
             source=source,
             adapter_name=adapter_name,
             weight=weight,
@@ -198,11 +205,11 @@ def parse_lora_config(config: dict[str, Any] | str, index: int = 0) -> LoraConfi
         repo = config.get("repo")
         weight_name = config.get("weight_name")
 
-        if not adapter_name:
-            # Generate name from repo
-            adapter_name = repo.replace("/", "_") if repo else f"hf_{index}"
+        if not lora_name:
+            lora_name = repo.replace("/", "_") if repo else f"hf_{index}"
 
         return LoraConfig(
+            name=lora_name,
             source=source,
             adapter_name=adapter_name,
             weight=weight,
@@ -213,10 +220,11 @@ def parse_lora_config(config: dict[str, Any] | str, index: int = 0) -> LoraConfi
     else:  # LOCAL
         path = config.get("path")
 
-        if not adapter_name:
-            adapter_name = f"local_{index}"
+        if not lora_name:
+            lora_name = f"local_{index}"
 
         return LoraConfig(
+            name=lora_name,
             source=source,
             adapter_name=adapter_name,
             weight=weight,
@@ -318,12 +326,13 @@ def parse_loras_from_model_config(model_config: dict[str, Any]) -> list[LoraConf
 
     # Check for civitai_lora_id
     elif "civitai_lora_id" in model_config:
+        civitai_id = model_config["civitai_lora_id"]
         _add_lora(
             LoraConfig(
+                name=f"civitai_{civitai_id}",
                 source=LoraSource.CIVITAI,
-                civitai_id=model_config["civitai_lora_id"],
+                civitai_id=civitai_id,
                 civitai_version=model_config.get("civitai_lora_version"),
-                adapter_name=f"civitai_{model_config['civitai_lora_id']}",
                 weight=model_config.get("civitai_lora_weight", 1.0),
             )
         )
@@ -337,9 +346,9 @@ def parse_loras_from_model_config(model_config: dict[str, Any]) -> list[LoraConf
         if lora_repo.startswith(("/", "./", "~/")):
             _add_lora(
                 LoraConfig(
+                    name="legacy_lora",
                     source=LoraSource.LOCAL,
                     path=lora_repo,
-                    adapter_name="legacy_lora",
                     weight=model_config.get("lora_weight", 1.0),
                 )
             )
@@ -347,10 +356,10 @@ def parse_loras_from_model_config(model_config: dict[str, Any]) -> list[LoraConf
             # Assume HuggingFace repo
             _add_lora(
                 LoraConfig(
+                    name="legacy_lora",
                     source=LoraSource.HUGGINGFACE,
                     repo=lora_repo,
                     weight_name=lora_weights,
-                    adapter_name="legacy_lora",
                     weight=model_config.get("lora_weight", 1.0),
                 )
             )
@@ -415,12 +424,16 @@ def parse_loras_from_config(
                 continue
             if ref_name in loras_section and isinstance(loras_section[ref_name], dict):
                 lora_config = loras_section[ref_name]
-                explicit_name = lora_config.get("adapter_name") or lora_config.get("name")
                 parsed = parse_lora_config(lora_config, index=len(loras))
-                if not explicit_name:
-                    parsed.adapter_name = ref_name
+                if not lora_config.get("name"):
+                    object.__setattr__(parsed, "name", ref_name)
+                    if (
+                        parsed.adapter_name == parsed.name
+                        or lora_config.get("adapter_name") is None
+                    ):
+                        object.__setattr__(parsed, "adapter_name", ref_name)
                 loras.append(parsed)
-                loaded_names.add(ref_name)
+                loaded_names.add(parsed.name)
             else:
                 print(f"Warning: auto_load LoRA '{ref_name}' not found in [loras] section")
 
@@ -433,39 +446,33 @@ def parse_loras_from_config(
                     continue
                 if ref in loras_section and isinstance(loras_section[ref], dict):
                     lora_config = loras_section[ref]
-                    explicit_name = lora_config.get("adapter_name") or lora_config.get("name")
                     parsed = parse_lora_config(lora_config, index=len(loras))
-                    if not explicit_name:
-                        parsed.adapter_name = ref
+                    if not lora_config.get("name"):
+                        object.__setattr__(parsed, "name", ref)
+                        if (
+                            parsed.adapter_name == parsed.name
+                            or lora_config.get("adapter_name") is None
+                        ):
+                            object.__setattr__(parsed, "adapter_name", ref)
                     loras.append(parsed)
-                    loaded_names.add(ref)
+                    loaded_names.add(parsed.name)
                 else:
                     print(f"Warning: LoRA '{ref}' not found in [loras] section")
             elif isinstance(ref, dict):
-                lora_name = ref.get("adapter_name") or ref.get("name") or f"inline_{len(loras)}"
-                if lora_name not in loaded_names:
-                    parsed = parse_lora_config(ref, index=len(loras))
-                    if not (ref.get("adapter_name") or ref.get("name")):
-                        parsed.adapter_name = lora_name
+                parsed = parse_lora_config(ref, index=len(loras))
+                if parsed.name not in loaded_names:
                     loras.append(parsed)
-                    loaded_names.add(lora_name)
+                    loaded_names.add(parsed.name)
 
     # 3. Inline definitions via [[models.X.inline_loras]]
     inline_loras = model_config.get("inline_loras", [])
     if isinstance(inline_loras, list):
         for inline_config in inline_loras:
             if isinstance(inline_config, dict):
-                lora_name = (
-                    inline_config.get("adapter_name")
-                    or inline_config.get("name")
-                    or f"inline_{len(loras)}"
-                )
-                if lora_name not in loaded_names:
-                    parsed = parse_lora_config(inline_config, index=len(loras))
-                    if not (inline_config.get("adapter_name") or inline_config.get("name")):
-                        parsed.adapter_name = lora_name
+                parsed = parse_lora_config(inline_config, index=len(loras))
+                if parsed.name not in loaded_names:
                     loras.append(parsed)
-                    loaded_names.add(lora_name)
+                    loaded_names.add(parsed.name)
 
     return loras
 
