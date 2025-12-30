@@ -212,6 +212,17 @@ class TestConfigSet:
         config.set("key", value="value")
         assert state.exists()
 
+    def test_set_writes_trailing_newline(self, tmp_path):
+        """Set writes state file with trailing newline."""
+        base = tmp_path / "config.toml"
+        state = tmp_path / "state.json"
+        base.write_text("")
+        config = Config(base, state_path=state)
+        config.load()
+        config.set("key", value="value")
+        content = state.read_text()
+        assert content.endswith("\n"), "state.json should end with a newline"
+
 
 class TestConfigDeepMerge:
     """Tests for Config._deep_merge()."""

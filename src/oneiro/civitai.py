@@ -226,6 +226,7 @@ class CivitaiCache:
         }
         with open(self.metadata_file, "w") as f:
             json.dump(data, f, indent=2)
+            f.write("\n")
 
     def get(self, sha256: str) -> Path | None:
         """Get cached file path by SHA256 hash."""
