@@ -457,38 +457,3 @@ def get_weighted_text_embeddings_sdxl(
         pooled_prompt_embeds,
         negative_pooled_prompt_embeds,
     )
-
-
-def is_long_prompt(tokenizer: Any, prompt: str) -> bool:
-    """Check if a prompt exceeds the 77-token limit.
-
-    Args:
-        tokenizer: CLIP tokenizer
-        prompt: Prompt text (weight syntax is stripped for counting)
-
-    Returns:
-        True if prompt has more than 75 content tokens
-    """
-    tokens, _ = get_tokens_and_weights(tokenizer, prompt)
-    # Filter out BREAK markers
-    tokens = [t for t in tokens if t != -1]
-    return len(tokens) > MAX_TOKENS_PER_CHUNK
-
-
-def needs_long_prompt_handling(pipe: Any, prompt: str, negative_prompt: str | None) -> bool:
-    """Check if either prompt needs long prompt handling.
-
-    Args:
-        pipe: Pipeline with tokenizer attribute
-        prompt: Positive prompt
-        negative_prompt: Negative prompt (may be None)
-
-    Returns:
-        True if either prompt exceeds token limit
-    """
-    tokenizer = pipe.tokenizer
-    if is_long_prompt(tokenizer, prompt):
-        return True
-    if negative_prompt and is_long_prompt(tokenizer, negative_prompt):
-        return True
-    return False

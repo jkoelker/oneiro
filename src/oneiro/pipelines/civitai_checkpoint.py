@@ -17,7 +17,6 @@ from oneiro.pipelines.embedding import EmbeddingLoaderMixin, parse_embeddings_fr
 from oneiro.pipelines.long_prompt import (
     get_weighted_text_embeddings_sd15,
     get_weighted_text_embeddings_sdxl,
-    needs_long_prompt_handling,
 )
 from oneiro.pipelines.lora import LoraLoaderMixin, parse_loras_from_model_config
 
@@ -787,15 +786,15 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
             "generator": generator,
         }
 
-        # Check if we need long prompt handling (>77 tokens)
-        use_long_prompt = self._should_use_long_prompt(prompt, negative_prompt)
+        # Check if this pipeline supports embedding-based prompt handling
+        # (CLIP-based pipelines: SD 1.x, SD 2.x, SDXL)
+        use_embeddings = self._supports_prompt_embeddings()
 
-        if use_long_prompt:
-            # Generate embeddings with chunking for long prompts
-            self._add_long_prompt_embeddings(gen_kwargs, prompt, negative_prompt)
-            print(f"CivitAI generating (long prompt): '{prompt[:50]}...' seed={actual_seed}")
+        if use_embeddings:
+            # Always use embedding path for consistent weight handling
+            self._encode_prompts_to_embeddings(gen_kwargs, prompt, negative_prompt)
         else:
-            # Standard prompt handling
+            # Non-CLIP pipelines (Flux, SD3, etc.) use standard prompt handling
             gen_kwargs["prompt"] = prompt
             if self._pipeline_config.supports_negative_prompt and negative_prompt:
                 gen_kwargs["negative_prompt"] = negative_prompt
@@ -804,11 +803,8 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
             print(f"CivitAI img2img: '{prompt[:50]}...' seed={actual_seed} strength={strength}")
             gen_kwargs["image"] = init_image
             gen_kwargs["strength"] = strength
-        elif not use_long_prompt:
-            print(f"CivitAI generating: '{prompt[:50]}...' seed={actual_seed}")
-            gen_kwargs["height"] = height
-            gen_kwargs["width"] = width
         else:
+            print(f"CivitAI generating: '{prompt[:50]}...' seed={actual_seed}")
             gen_kwargs["height"] = height
             gen_kwargs["width"] = width
 
@@ -839,47 +835,42 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
         """Get the detected/configured base model."""
         return self._base_model
 
-    def _should_use_long_prompt(self, prompt: str, negative_prompt: str | None) -> bool:
-        """Check if long prompt handling is needed.
+    def _supports_prompt_embeddings(self) -> bool:
+        """Check if this pipeline supports embedding-based prompt handling.
 
-        Long prompt handling is used when:
-        - The pipeline uses a CLIP-based text encoder (SD 1.x, SD 2.x, SDXL)
-        - Either the prompt or negative prompt exceeds 77 tokens
-
-        Args:
-            prompt: The positive prompt
-            negative_prompt: The negative prompt (may be None)
+        Returns True for CLIP-based pipelines (SD 1.x, SD 2.x, SDXL) which support
+        pre-computed embeddings with weight handling and long prompt chunking.
 
         Returns:
-            True if long prompt handling should be used
+            True if the pipeline supports prompt embeddings
         """
         if self.pipe is None or self._pipeline_config is None:
             return False
 
-        # Only handle long prompts for CLIP-based pipelines
+        # CLIP-based pipelines support embedding-based prompt handling
         pipeline_class = self._pipeline_config.pipeline_class
         supported_pipelines = {
             "StableDiffusionPipeline",
             "StableDiffusionXLPipeline",
         }
 
-        if pipeline_class not in supported_pipelines:
-            return False
+        return pipeline_class in supported_pipelines
 
-        # Check if either prompt needs long handling
-        return needs_long_prompt_handling(self.pipe, prompt, negative_prompt or "")
-
-    def _add_long_prompt_embeddings(
+    def _encode_prompts_to_embeddings(
         self,
         gen_kwargs: dict[str, Any],
         prompt: str,
         negative_prompt: str | None,
     ) -> None:
-        """Add pre-computed embeddings to generation kwargs for long prompts.
+        """Encode prompts to embeddings with weight and chunking support.
 
-        This method handles the chunking and encoding of prompts that exceed
-        CLIP's 77-token limit. It generates embeddings using the appropriate
-        method based on the pipeline type (SD 1.x/2.x vs SDXL).
+        Converts text prompts to pre-computed embeddings, supporting:
+        - A1111-style weight syntax like (word:1.5) and [word]
+        - Prompts longer than CLIP's 77-token limit via chunking
+        - BREAK keyword for forcing chunk boundaries
+
+        This method is used for all CLIP-based pipelines to provide consistent
+        weight handling regardless of prompt length.
 
         Args:
             gen_kwargs: Generation kwargs dict to update (modified in place)
