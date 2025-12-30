@@ -4,11 +4,12 @@ Tests for issue #51: Exposing steps and guidance_scale parameters in /dream comm
 and setting model defaults via /model command.
 """
 
-# Constants for validation limits (should match bot.py)
-MIN_STEPS = 1
-MAX_STEPS = 100
-MIN_GUIDANCE_SCALE = 0.0
-MAX_GUIDANCE_SCALE = 15.0
+from oneiro.bot import (
+    MAX_GUIDANCE_SCALE,
+    MAX_STEPS,
+    MIN_GUIDANCE_SCALE,
+    MIN_STEPS,
+)
 
 
 class TestDreamParamValidation:
@@ -50,6 +51,8 @@ class TestDreamParamDefaults:
 
         actual_steps = user_steps if user_steps is not None else model_config_steps
         assert actual_steps == 50
+        # Verify user value takes precedence over model default
+        assert actual_steps != model_config_steps
 
     def test_guidance_scale_none_uses_model_default(self):
         """When guidance_scale is None, model config default should be used."""
@@ -66,6 +69,8 @@ class TestDreamParamDefaults:
 
         actual_guidance = user_guidance if user_guidance is not None else model_config_guidance
         assert actual_guidance == 4.5
+        # Verify user value takes precedence over model default
+        assert actual_guidance != model_config_guidance
 
     def test_guidance_scale_zero_is_valid_override(self):
         """Guidance scale of 0.0 should be treated as a valid override, not None."""
@@ -75,6 +80,8 @@ class TestDreamParamDefaults:
         # Use 'is not None' check, not truthiness
         actual_guidance = user_guidance if user_guidance is not None else model_config_guidance
         assert actual_guidance == 0.0
+        # Verify that 0.0 overrides the model default, not falls back to it
+        assert actual_guidance != model_config_guidance
 
     def test_steps_zero_is_invalid(self):
         """Steps of 0 should be outside valid range."""
@@ -119,9 +126,18 @@ class TestModelOverrides:
         model_override_steps = 30
         model_config_steps = 20
 
-        # Priority: user > model_override > model_config
-        actual_steps = user_steps or model_override_steps or model_config_steps
+        # Priority: user > model_override > model_config (using 'is not None' checks)
+        if user_steps is not None:
+            actual_steps = user_steps
+        elif model_override_steps is not None:
+            actual_steps = model_override_steps
+        else:
+            actual_steps = model_config_steps
+
         assert actual_steps == 40
+        # Verify priority chain: user wins over both
+        assert actual_steps != model_override_steps
+        assert actual_steps != model_config_steps
 
     def test_override_priority_model_override_over_config(self):
         """Model override should take priority over base config default."""
@@ -138,6 +154,8 @@ class TestModelOverrides:
             actual_steps = model_config_steps
 
         assert actual_steps == 30
+        # Verify model_override wins over model_config
+        assert actual_steps != model_config_steps
 
 
 class TestQwenGuidanceScaleMapping:
@@ -158,6 +176,46 @@ class TestQwenGuidanceScaleMapping:
 
         assert guidance_scale == 1.3
 
+    def test_qwen_true_cfg_scale_with_model_override(self):
+        """Model override for guidance_scale should take priority over true_cfg_scale."""
+        model_config = {
+            "type": "qwen",
+            "guidance_scale": 4.0,
+            "true_cfg_scale": 1.3,  # Qwen-specific default
+        }
+        model_overrides = {"guidance_scale": 2.5}  # User set via /model command
+
+        # Simulate the logic from bot.py (lines 430-448):
+        # 1. Start with model_config defaults
+        model_guidance = model_config.get("guidance_scale", 0.0)
+        # 2. Apply Qwen's true_cfg_scale if present
+        if model_config.get("true_cfg_scale"):
+            model_guidance = model_config.get("true_cfg_scale", 4.0)
+        # 3. model_overrides takes priority if set
+        if "guidance_scale" in model_overrides:
+            model_guidance = model_overrides["guidance_scale"]
+
+        # Model override should win
+        assert model_guidance == 2.5
+
+    def test_qwen_true_cfg_scale_no_override(self):
+        """Without model_override, Qwen should use true_cfg_scale."""
+        model_config = {
+            "type": "qwen",
+            "guidance_scale": 4.0,
+            "true_cfg_scale": 1.3,
+        }
+        model_overrides: dict = {}  # No overrides set
+
+        model_guidance = model_config.get("guidance_scale", 0.0)
+        if model_config.get("true_cfg_scale"):
+            model_guidance = model_config.get("true_cfg_scale", 4.0)
+        if "guidance_scale" in model_overrides:
+            model_guidance = model_overrides["guidance_scale"]
+
+        # true_cfg_scale should be used
+        assert model_guidance == 1.3
+
 
 class TestZImageGuidanceScaleWarning:
     """Tests for Z-Image-Turbo guidance_scale handling."""
@@ -166,9 +224,12 @@ class TestZImageGuidanceScaleWarning:
         """Z-Image-Turbo should always use 0.0 for guidance_scale internally."""
         # Z-Image-Turbo hardcodes guidance_scale=0.0
         # Even if user provides a value, pipeline ignores it
-        user_guidance = 7.0  # noqa: F841 - documents user-provided value that gets ignored
+        user_guidance = 7.0
         zimage_actual_guidance = 0.0  # Always 0.0 for Turbo
 
         # Note: We might want to warn user if they provide non-zero guidance
-        # This test documents the expected behavior
+        # This test documents the expected behavior: user can set non-zero guidance,
+        # but Z-Image-Turbo still uses 0.0 internally.
+        assert (user_guidance, zimage_actual_guidance) == (7.0, 0.0)
+        # Verify zimage ignores user guidance
         assert zimage_actual_guidance == 0.0

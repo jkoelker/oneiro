@@ -34,6 +34,14 @@ civitai_client: CivitaiClient | None = None
 MIN_LORA_WEIGHT = -2.0
 MAX_LORA_WEIGHT = 2.0
 
+# Steps validation limits (for /dream and /model commands)
+MIN_STEPS = 1
+MAX_STEPS = 100
+
+# Guidance scale validation limits (for /dream and /model commands)
+MIN_GUIDANCE_SCALE = 0.0
+MAX_GUIDANCE_SCALE = 15.0
+
 
 def validate_lora_weight(weight: float, lora_name: str) -> None:
     """Validate that a LoRA weight is within acceptable bounds.
