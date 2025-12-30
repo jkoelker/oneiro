@@ -35,8 +35,13 @@ class BasePipeline(ABC):
         self._dtype = torch.bfloat16 if self._device == "cuda" else torch.float32
 
     @abstractmethod
-    def load(self, model_config: dict[str, Any]) -> None:
-        """Load the model from config."""
+    def load(self, model_config: dict[str, Any], full_config: dict[str, Any] | None = None) -> None:
+        """Load the model from config.
+
+        Args:
+            model_config: Model-specific configuration dict
+            full_config: Full configuration dict (for accessing global sections like embeddings)
+        """
 
     @abstractmethod
     def generate(

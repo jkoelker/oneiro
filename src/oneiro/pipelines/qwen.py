@@ -1,4 +1,4 @@
-"""Qwen-Image pipeline wrapper with LoRA and GGUF support."""
+"""Qwen-Image pipeline wrapper with LoRA, GGUF, and embedding support."""
 
 import math
 import os
@@ -7,15 +7,17 @@ from typing import Any
 import torch
 
 from oneiro.pipelines.base import BasePipeline, GenerationResult
+from oneiro.pipelines.embedding import EmbeddingLoaderMixin, parse_embeddings_from_config
 from oneiro.pipelines.lora import LoraLoaderMixin, parse_loras_from_model_config
 
 
-class QwenPipelineWrapper(LoraLoaderMixin, BasePipeline):
-    """Wrapper for Qwen-Image with multi-LoRA and GGUF support."""
+class QwenPipelineWrapper(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipeline):
+    """Wrapper for Qwen-Image with multi-LoRA, GGUF, and embedding support."""
 
     def __init__(self) -> None:
         super().__init__()
         self._init_lora_state()
+        self._init_embedding_state()
 
     def _parse_transformer_path(self, transformer: str) -> tuple[str, bool]:
         """Parse transformer path, returning (resolved_path, is_gguf).
@@ -82,8 +84,8 @@ class QwenPipelineWrapper(LoraLoaderMixin, BasePipeline):
             subfolder="transformer",
         )
 
-    def load(self, model_config: dict[str, Any]) -> None:
-        """Load Qwen-Image model with optional LoRA and GGUF support.
+    def load(self, model_config: dict[str, Any], full_config: dict[str, Any] | None = None) -> None:
+        """Load Qwen-Image model with optional LoRA, GGUF, and embedding support.
 
         Config options:
             repo: Base model repository (default: Qwen/Qwen-Image)
@@ -141,6 +143,13 @@ class QwenPipelineWrapper(LoraLoaderMixin, BasePipeline):
         if loras:
             print(f"  Loading {len(loras)} LoRA(s)...")
             self.load_loras_sync(loras)
+
+        # Load embeddings if full_config provided
+        if full_config:
+            embeddings = parse_embeddings_from_config(full_config, model_config)
+            if embeddings:
+                print(f"  Loading {len(embeddings)} embedding(s)...")
+                self.load_embeddings_sync(embeddings)
 
         if cpu_offload and self._device == "cuda":
             self.pipe.enable_model_cpu_offload()
