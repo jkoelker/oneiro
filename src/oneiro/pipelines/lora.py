@@ -358,6 +358,118 @@ def parse_loras_from_model_config(model_config: dict[str, Any]) -> list[LoraConf
     return loras
 
 
+def parse_loras_from_config(
+    full_config: dict[str, Any],
+    model_config: dict[str, Any],
+) -> list[LoraConfig]:
+    """Parse all LoRA configurations for a model from full config.
+
+    Handles three types of LoRA sources:
+    1. Global auto_load: LoRAs loaded for ALL models
+    2. Named references: Model references LoRAs defined in [loras.name]
+    3. Inline definitions: Model-specific LoRAs defined directly in model config
+
+    Config structure:
+    ```toml
+    [loras]
+    auto_load = ["realism-enhancer"]  # Loaded for every model
+
+    [loras.realism-enhancer]
+    source = "civitai"
+    id = 123456
+    weight = 0.5
+
+    [loras.detail-lora]
+    source = "huggingface"
+    repo = "user/detail-lora"
+    weight = 0.8
+
+    [models.my-model]
+    loras = ["detail-lora"]  # Named reference
+
+    # Inline definitions
+    [[models.my-model.inline_loras]]
+    source = "civitai"
+    id = 99999
+    weight = 0.7
+    ```
+
+    Args:
+        full_config: The complete config dict (for accessing [loras] section)
+        model_config: Model-specific config section
+
+    Returns:
+        List of LoraConfig instances (auto_load + named refs + inline)
+    """
+    loras: list[LoraConfig] = []
+    loras_section = full_config.get("loras", {})
+
+    # Track names to avoid duplicates
+    loaded_names: set[str] = set()
+
+    # 1. Global auto_load LoRAs
+    auto_load = loras_section.get("auto_load", [])
+    if isinstance(auto_load, list):
+        for ref_name in auto_load:
+            if ref_name in loaded_names:
+                continue
+            if ref_name in loras_section and isinstance(loras_section[ref_name], dict):
+                lora_config = loras_section[ref_name]
+                explicit_name = lora_config.get("adapter_name") or lora_config.get("name")
+                parsed = parse_lora_config(lora_config, index=len(loras))
+                if not explicit_name:
+                    parsed.adapter_name = ref_name
+                loras.append(parsed)
+                loaded_names.add(ref_name)
+            else:
+                print(f"Warning: auto_load LoRA '{ref_name}' not found in [loras] section")
+
+    # 2. Named references from model config
+    model_loras = model_config.get("loras", [])
+    if isinstance(model_loras, list):
+        for ref in model_loras:
+            if isinstance(ref, str):
+                if ref in loaded_names:
+                    continue
+                if ref in loras_section and isinstance(loras_section[ref], dict):
+                    lora_config = loras_section[ref]
+                    explicit_name = lora_config.get("adapter_name") or lora_config.get("name")
+                    parsed = parse_lora_config(lora_config, index=len(loras))
+                    if not explicit_name:
+                        parsed.adapter_name = ref
+                    loras.append(parsed)
+                    loaded_names.add(ref)
+                else:
+                    print(f"Warning: LoRA '{ref}' not found in [loras] section")
+            elif isinstance(ref, dict):
+                lora_name = ref.get("adapter_name") or ref.get("name") or f"inline_{len(loras)}"
+                if lora_name not in loaded_names:
+                    parsed = parse_lora_config(ref, index=len(loras))
+                    if not (ref.get("adapter_name") or ref.get("name")):
+                        parsed.adapter_name = lora_name
+                    loras.append(parsed)
+                    loaded_names.add(lora_name)
+
+    # 3. Inline definitions via [[models.X.inline_loras]]
+    inline_loras = model_config.get("inline_loras", [])
+    if isinstance(inline_loras, list):
+        for inline_config in inline_loras:
+            if isinstance(inline_config, dict):
+                lora_name = (
+                    inline_config.get("adapter_name")
+                    or inline_config.get("name")
+                    or f"inline_{len(loras)}"
+                )
+                if lora_name not in loaded_names:
+                    parsed = parse_lora_config(inline_config, index=len(loras))
+                    if not (inline_config.get("adapter_name") or inline_config.get("name")):
+                        parsed.adapter_name = lora_name
+                    loras.append(parsed)
+                    loaded_names.add(lora_name)
+
+    return loras
+
+
 # Pipeline type to Civitai base model mapping
 PIPELINE_BASE_MODEL_MAP: dict[str, list[str]] = {
     "flux2": ["Flux.1 D", "Flux.1 S", "Flux.1", "Flux.2", "Flux.1 Dev", "Flux.1 Schnell"],

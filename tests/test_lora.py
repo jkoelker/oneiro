@@ -13,6 +13,7 @@ from oneiro.pipelines.lora import (
     is_lora_compatible,
     parse_civitai_url,
     parse_lora_config,
+    parse_loras_from_config,
     parse_loras_from_model_config,
 )
 
@@ -324,6 +325,240 @@ class TestParseLORAsFromModelConfig:
         }
         loras = parse_loras_from_model_config(config)
         assert len(loras) == 2
+
+
+class TestParseLORAsFromConfig:
+    """Tests for parse_loras_from_config function."""
+
+    def test_auto_load_loras(self):
+        """Parses auto_load LoRAs from global section."""
+        full_config = {
+            "loras": {
+                "auto_load": ["realism-enhancer"],
+                "realism-enhancer": {
+                    "source": "civitai",
+                    "id": 123456,
+                    "weight": 0.5,
+                },
+            }
+        }
+        model_config = {"type": "flux2"}
+
+        loras = parse_loras_from_config(full_config, model_config)
+
+        assert len(loras) == 1
+        assert loras[0].adapter_name == "realism-enhancer"
+        assert loras[0].civitai_id == 123456
+        assert loras[0].weight == 0.5
+
+    def test_named_reference_loras(self):
+        """Parses named reference LoRAs from model config."""
+        full_config = {
+            "loras": {
+                "detail-lora": {
+                    "source": "huggingface",
+                    "repo": "user/detail-lora",
+                    "weight": 0.8,
+                },
+            }
+        }
+        model_config = {
+            "type": "flux2",
+            "loras": ["detail-lora"],
+        }
+
+        loras = parse_loras_from_config(full_config, model_config)
+
+        assert len(loras) == 1
+        assert loras[0].adapter_name == "detail-lora"
+        assert loras[0].repo == "user/detail-lora"
+        assert loras[0].weight == 0.8
+
+    def test_inline_loras_in_array(self):
+        """Parses inline LoRAs defined in loras array."""
+        full_config = {"loras": {}}
+        model_config = {
+            "type": "flux2",
+            "loras": [
+                {
+                    "name": "inline-style",
+                    "source": "civitai",
+                    "id": 99999,
+                    "weight": 0.7,
+                }
+            ],
+        }
+
+        loras = parse_loras_from_config(full_config, model_config)
+
+        assert len(loras) == 1
+        assert loras[0].adapter_name == "inline-style"
+        assert loras[0].civitai_id == 99999
+
+    def test_inline_loras_section(self):
+        """Parses inline_loras section in model config."""
+        full_config = {"loras": {}}
+        model_config = {
+            "type": "flux2",
+            "inline_loras": [
+                {
+                    "adapter_name": "model-specific",
+                    "source": "local",
+                    "path": "/path/to/lora.safetensors",
+                    "weight": 0.9,
+                }
+            ],
+        }
+
+        loras = parse_loras_from_config(full_config, model_config)
+
+        assert len(loras) == 1
+        assert loras[0].adapter_name == "model-specific"
+        assert loras[0].source == LoraSource.LOCAL
+        assert loras[0].weight == 0.9
+
+    def test_combined_sources(self):
+        """Parses LoRAs from all sources combined."""
+        full_config = {
+            "loras": {
+                "auto_load": ["realism-enhancer"],
+                "realism-enhancer": {
+                    "source": "civitai",
+                    "id": 123456,
+                    "weight": 0.5,
+                },
+                "detail-lora": {
+                    "source": "huggingface",
+                    "repo": "user/detail",
+                    "weight": 0.8,
+                },
+            }
+        }
+        model_config = {
+            "type": "flux2",
+            "loras": ["detail-lora"],
+            "inline_loras": [
+                {
+                    "adapter_name": "custom",
+                    "source": "local",
+                    "path": "/path/to/file.safetensors",
+                }
+            ],
+        }
+
+        loras = parse_loras_from_config(full_config, model_config)
+
+        assert len(loras) == 3
+        names = [lora.adapter_name for lora in loras]
+        assert "realism-enhancer" in names
+        assert "detail-lora" in names
+        assert "custom" in names
+
+    def test_no_duplicate_loras(self):
+        """Same LoRA is not loaded twice."""
+        full_config = {
+            "loras": {
+                "auto_load": ["shared"],
+                "shared": {
+                    "source": "civitai",
+                    "id": 12345,
+                },
+            }
+        }
+        model_config = {
+            "type": "flux2",
+            "loras": ["shared"],
+        }
+
+        loras = parse_loras_from_config(full_config, model_config)
+
+        assert len(loras) == 1
+        assert loras[0].adapter_name == "shared"
+
+    def test_missing_named_reference_warns(self, capsys):
+        """Missing named reference prints warning."""
+        full_config = {"loras": {}}
+        model_config = {
+            "type": "flux2",
+            "loras": ["nonexistent"],
+        }
+
+        loras = parse_loras_from_config(full_config, model_config)
+
+        assert len(loras) == 0
+        captured = capsys.readouterr()
+        assert "not found" in captured.out
+
+    def test_missing_auto_load_warns(self, capsys):
+        """Missing auto_load LoRA prints warning."""
+        full_config = {
+            "loras": {
+                "auto_load": ["nonexistent"],
+            }
+        }
+        model_config = {"type": "flux2"}
+
+        loras = parse_loras_from_config(full_config, model_config)
+
+        assert len(loras) == 0
+        captured = capsys.readouterr()
+        assert "not found" in captured.out
+
+    def test_no_loras(self):
+        """Returns empty list when no LoRAs configured."""
+        loras = parse_loras_from_config({}, {"type": "flux2"})
+        assert loras == []
+
+    def test_preserves_custom_adapter_name(self):
+        """Custom adapter_name from config is preserved."""
+        full_config = {
+            "loras": {
+                "my-lora": {
+                    "source": "civitai",
+                    "id": 12345,
+                    "adapter_name": "custom_name",
+                },
+            }
+        }
+        model_config = {
+            "type": "flux2",
+            "loras": ["my-lora"],
+        }
+
+        loras = parse_loras_from_config(full_config, model_config)
+
+        assert len(loras) == 1
+        assert loras[0].adapter_name == "custom_name"
+
+    def test_mixed_string_and_dict_refs(self):
+        """Handles mix of string references and inline dicts in loras array."""
+        full_config = {
+            "loras": {
+                "named-lora": {
+                    "source": "civitai",
+                    "id": 11111,
+                },
+            }
+        }
+        model_config = {
+            "type": "flux2",
+            "loras": [
+                "named-lora",
+                {
+                    "source": "civitai",
+                    "id": 22222,
+                    "name": "inline-lora",
+                },
+            ],
+        }
+
+        loras = parse_loras_from_config(full_config, model_config)
+
+        assert len(loras) == 2
+        assert loras[0].adapter_name == "named-lora"
+        assert loras[0].civitai_id == 11111
+        assert loras[1].adapter_name == "inline-lora"
+        assert loras[1].civitai_id == 22222
 
 
 class TestIsLoraCompatible:

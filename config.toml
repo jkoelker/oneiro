@@ -37,6 +37,49 @@ words = ["loli", "shota", "child", "children", "minor", "underage"]
 allow_in_negative = true
 
 # =============================================================================
+# LORAS - Named LoRA definitions (reusable across models)
+# =============================================================================
+
+[loras]
+# Global auto_load: these LoRAs are loaded for ALL models automatically
+# auto_load = ["realism-enhancer"]
+
+# Example: Civitai LoRA
+# [loras.realism-enhancer]
+# source = "civitai"
+# id = 123456
+# weight = 0.5
+
+# Example: Civitai LoRA via URL
+# [loras.detail-lora]
+# source = "civitai"
+# url = "https://civitai.com/models/789012"
+# weight = 0.8
+
+# Example: HuggingFace LoRA
+# [loras.flux-realism]
+# source = "huggingface"
+# repo = "XLabs-AI/flux-RealismLora"
+# weight_name = "lora.safetensors"
+# weight = 0.7
+
+# Example: Local LoRA
+# [loras.custom-style]
+# source = "local"
+# path = "~/.cache/loras/custom-style.safetensors"
+# weight = 1.0
+
+# Models can reference LoRAs by name:
+# [models.my-model]
+# loras = ["realism-enhancer", "detail-lora"]
+#
+# Or define inline LoRAs for model-specific use:
+# [[models.my-model.inline_loras]]
+# source = "civitai"
+# id = 99999
+# weight = 0.7
+
+# =============================================================================
 # EMBEDDINGS - Named textual inversion definitions (reusable across models)
 # =============================================================================
 
