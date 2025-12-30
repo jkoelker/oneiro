@@ -584,7 +584,7 @@ class TestEmbeddingLoaderMixin:
         with pytest.raises(RuntimeError, match="not loaded"):
             pipeline.unload_single_embedding("token1")
 
-    def test_unload_all_embeddings_success(self):
+    def test_unload_embeddings_success(self):
         """Unloading all embeddings clears tracking lists."""
         from oneiro.pipelines.embedding import EmbeddingLoaderMixin
 
@@ -600,13 +600,13 @@ class TestEmbeddingLoaderMixin:
             EmbeddingConfig(name="emb2", source=EmbeddingSource.LOCAL, path="/p", token="token2"),
         ]
 
-        pipeline.unload_all_embeddings()
+        pipeline.unload_embeddings()
 
         assert pipeline._loaded_tokens == []
         assert pipeline._embedding_configs == []
         pipeline.pipe.unload_textual_inversion.assert_called_once_with()
 
-    def test_unload_all_embeddings_empty_is_noop(self):
+    def test_unload_embeddings_empty_is_noop(self):
         """Unloading when no embeddings loaded is a no-op."""
         from oneiro.pipelines.embedding import EmbeddingLoaderMixin
 
@@ -617,11 +617,11 @@ class TestEmbeddingLoaderMixin:
 
         pipeline = MockPipeline()
 
-        pipeline.unload_all_embeddings()
+        pipeline.unload_embeddings()
 
         pipeline.pipe.unload_textual_inversion.assert_not_called()
 
-    def test_unload_all_embeddings_no_pipeline_is_noop(self):
+    def test_unload_embeddings_no_pipeline_is_noop(self):
         """Unloading all without pipeline is a no-op."""
         from oneiro.pipelines.embedding import EmbeddingLoaderMixin
 
@@ -633,7 +633,7 @@ class TestEmbeddingLoaderMixin:
         pipeline = MockPipeline()
         pipeline._loaded_tokens = ["token1"]
 
-        pipeline.unload_all_embeddings()
+        pipeline.unload_embeddings()
 
         assert pipeline._loaded_tokens == ["token1"]
 
@@ -660,7 +660,7 @@ class TestEmbeddingLoaderMixin:
         assert "Warning" in captured.out
         assert "API error" in captured.out
 
-    def test_unload_all_embeddings_handles_exception(self, capsys):
+    def test_unload_embeddings_handles_exception(self, capsys):
         """Unloading all handles exceptions gracefully."""
         from oneiro.pipelines.embedding import EmbeddingLoaderMixin
 
@@ -676,7 +676,7 @@ class TestEmbeddingLoaderMixin:
             EmbeddingConfig(name="emb1", source=EmbeddingSource.LOCAL, path="/p", token="token1"),
         ]
 
-        pipeline.unload_all_embeddings()
+        pipeline.unload_embeddings()
 
         assert pipeline._loaded_tokens == []
         assert pipeline._embedding_configs == []

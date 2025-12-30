@@ -572,7 +572,7 @@ class EmbeddingLoaderMixin:
             cfg for cfg in self._embedding_configs if (cfg.token or cfg.name) != token
         ]
 
-    def unload_all_embeddings(self) -> None:
+    def unload_embeddings(self) -> None:
         """Unload all embeddings and free memory."""
         if self.pipe is None or not self._loaded_tokens:
             return
