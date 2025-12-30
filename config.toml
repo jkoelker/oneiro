@@ -36,6 +36,48 @@ requires_negative = true
 words = ["loli", "shota", "child", "children", "minor", "underage"]
 allow_in_negative = true
 
+# =============================================================================
+# EMBEDDINGS - Named textual inversion definitions (reusable across models)
+# =============================================================================
+
+[embeddings]
+# Global auto_load: these embeddings are loaded for ALL models automatically
+# auto_load = ["easynegative"]
+
+# Example: Civitai embedding
+# [embeddings.easynegative]
+# source = "civitai"
+# id = 7808
+# token = "easynegative"
+
+# Example: Civitai embedding via URL
+# [embeddings.bad-hands]
+# source = "civitai"
+# url = "https://civitai.com/models/116230"
+# token = "bad-hands-5"
+
+# Example: HuggingFace embedding
+# [embeddings.cat-toy]
+# source = "huggingface"
+# repo = "sd-concepts-library/cat-toy"
+# # token auto-detected from embedding file
+
+# Example: Local embedding
+# [embeddings.custom]
+# source = "local"
+# path = "~/.cache/embeddings/custom.safetensors"
+# token = "<custom>"
+
+# Models can reference embeddings by name:
+# [models.my-model]
+# embeddings = ["easynegative", "bad-hands"]
+#
+# Or define inline embeddings for model-specific use:
+# [[models.my-model.inline_embeddings]]
+# source = "civitai"
+# id = 99999
+# token = "model-specific-style"
+
 [civitai]
 # API key for authentication (optional, enables restricted downloads)
 # api_key = "${CIVITAI_API_KEY}"
