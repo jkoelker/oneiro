@@ -788,15 +788,12 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
             "generator": generator,
         }
 
-        # Check if this pipeline supports embedding-based prompt handling
-        # (CLIP-based pipelines: SD 1.x, SD 2.x, SDXL)
-        use_embeddings = self._supports_prompt_embeddings()
-
-        if use_embeddings:
-            # Always use embedding path for consistent weight handling
+        # Use embedding-based prompt handling for pipelines that support it
+        # (SD 1.x, SD 2.x, SDXL, Flux, SD3) - enables weight syntax like (word:1.5)
+        if self._supports_prompt_embeddings():
             self._encode_prompts_to_embeddings(gen_kwargs, prompt, negative_prompt)
         else:
-            # Non-CLIP pipelines (Flux, SD3, etc.) use standard prompt handling
+            # Fallback for unsupported pipelines
             gen_kwargs["prompt"] = prompt
             if self._pipeline_config.supports_negative_prompt and negative_prompt:
                 gen_kwargs["negative_prompt"] = negative_prompt
