@@ -329,7 +329,7 @@ class CivitaiClient:
 
         Reads from [civitai] section:
             api_key: API key (or reads from CIVITAI_API_KEY env var)
-            cache_dir: Cache directory path
+            cache_dir: Cache directory path (CIVITAI_CACHE_DIR env var takes precedence)
             download_timeout: Download timeout in seconds
             verify_hashes: Whether to verify SHA256 after download
         """
@@ -341,9 +341,12 @@ class CivitaiClient:
             env_var = api_key[2:-1]
             api_key = os.environ.get(env_var)
 
-        cache_dir = civitai_config.get("cache_dir")
-        if cache_dir:
-            cache_dir = Path(cache_dir).expanduser()
+        # Environment variable takes precedence over config file for cache_dir
+        cache_dir: Path | None = None
+        if env_cache_dir := os.environ.get("CIVITAI_CACHE_DIR"):
+            cache_dir = Path(env_cache_dir).expanduser()
+        elif config_cache_dir := civitai_config.get("cache_dir"):
+            cache_dir = Path(config_cache_dir).expanduser()
 
         return cls(
             api_key=api_key,

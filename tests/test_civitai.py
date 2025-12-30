@@ -378,6 +378,60 @@ class TestCivitaiClientInit:
         assert client.download_timeout == 7200.0
         assert client.verify_hashes is False
 
+    def test_from_config_env_var_precedence(self, tmp_path, monkeypatch):
+        """CIVITAI_CACHE_DIR env var takes precedence over config file."""
+        env_cache_dir = tmp_path / "env-cache"
+        config_cache_dir = tmp_path / "config-cache"
+        monkeypatch.setenv("CIVITAI_CACHE_DIR", str(env_cache_dir))
+
+        # Mock config object with cache_dir set
+        class MockConfig:
+            def get(self, *keys, default=None):
+                if keys == ("civitai",):
+                    return {
+                        "cache_dir": str(config_cache_dir),
+                    }
+                return default
+
+        client = CivitaiClient.from_config(MockConfig())
+
+        # Environment variable should win over config file
+        assert client.cache_dir == env_cache_dir
+
+    def test_from_config_falls_back_to_config_cache_dir(self, tmp_path, monkeypatch):
+        """from_config uses config cache_dir when env var is not set."""
+        # Ensure CIVITAI_CACHE_DIR is not set
+        monkeypatch.delenv("CIVITAI_CACHE_DIR", raising=False)
+        config_cache_dir = tmp_path / "config-cache"
+
+        class MockConfig:
+            def get(self, *keys, default=None):
+                if keys == ("civitai",):
+                    return {
+                        "cache_dir": str(config_cache_dir),
+                    }
+                return default
+
+        client = CivitaiClient.from_config(MockConfig())
+
+        assert client.cache_dir == config_cache_dir
+
+    def test_from_config_falls_back_to_default(self, monkeypatch):
+        """from_config uses default cache_dir when neither env var nor config is set."""
+        # Ensure CIVITAI_CACHE_DIR is not set
+        monkeypatch.delenv("CIVITAI_CACHE_DIR", raising=False)
+
+        class MockConfig:
+            def get(self, *keys, default=None):
+                if keys == ("civitai",):
+                    return {}  # No cache_dir in config
+                return default
+
+        client = CivitaiClient.from_config(MockConfig())
+
+        # Should fall back to default
+        assert client.cache_dir == Path.home() / ".cache" / "civitai"
+
 
 @pytest.mark.asyncio
 class TestCivitaiClientAPI:
