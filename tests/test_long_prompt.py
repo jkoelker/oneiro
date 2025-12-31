@@ -250,15 +250,19 @@ class TestGetTokensAndWeights:
     def test_tokenizer_returns_insufficient_tokens(self):
         """Should handle tokenizer returning fewer than 2 tokens gracefully."""
         tokenizer = Mock()
-        # Return only BOS/EOS with no content (len < 2 after strip would be empty)
+        # Return only BOS/EOS with no content (after stripping BOS/EOS, empty remains)
         tokenizer.return_value = Mock(input_ids=[BOS_TOKEN_ID, EOS_TOKEN_ID])
 
         tokens, weights = get_tokens_and_weights(tokenizer, "test")
 
-        # Should not raise, and return valid (possibly empty) lists
+        # Should not raise, and return valid lists
         assert isinstance(tokens, list)
         assert isinstance(weights, list)
         assert len(tokens) == len(weights)
+        # When tokenizer returns only BOS/EOS, stripping yields no content tokens
+        # So the result should be empty lists
+        assert tokens == [], f"Expected empty tokens, got {tokens}"
+        assert weights == [], f"Expected empty weights, got {weights}"
 
     def test_tokenizer_returns_single_token(self):
         """Should handle tokenizer returning single token gracefully."""
