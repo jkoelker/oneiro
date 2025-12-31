@@ -27,6 +27,56 @@ CHUNK_SIZE = 77  # BOS + 75 content tokens + EOS
 T5_EMBEDDING_DIM = 4096
 
 
+def _get_execution_device(pipe: Any) -> torch.device | str:
+    """Get the execution device for a pipeline, handling CPU offload correctly.
+
+    When using enable_model_cpu_offload(), pipe.device returns "cpu" but actual
+    computation happens on GPU. This function returns the correct execution device.
+
+    Args:
+        pipe: Diffusers pipeline instance
+
+    Returns:
+        The device where tensor operations should happen
+    """
+
+    def _is_valid_device(val: Any) -> bool:
+        return isinstance(val, (torch.device, str))
+
+    # For CPU offload, _execution_device returns the actual GPU
+    if hasattr(pipe, "_execution_device"):
+        device = pipe._execution_device
+        if _is_valid_device(device):
+            return device
+
+    # Standard device detection
+    if hasattr(pipe, "device"):
+        device = pipe.device
+        if _is_valid_device(device):
+            return device
+
+    # Fallback to encoder devices
+    if hasattr(pipe, "text_encoder") and pipe.text_encoder is not None:
+        if hasattr(pipe.text_encoder, "device"):
+            device = pipe.text_encoder.device
+            if _is_valid_device(device):
+                return device
+
+    if hasattr(pipe, "text_encoder_2") and pipe.text_encoder_2 is not None:
+        if hasattr(pipe.text_encoder_2, "device"):
+            device = pipe.text_encoder_2.device
+            if _is_valid_device(device):
+                return device
+
+    # Last resort - check hardware availability
+    if torch.cuda.is_available():
+        return "cuda"
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return "mps"
+
+    return "cpu"
+
+
 def _create_empty_chunk() -> tuple[list[int], list[float]]:
     """Create an empty 77-token chunk with BOS/EOS structure.
 
@@ -400,7 +450,7 @@ def get_weighted_text_embeddings_sd15(
     embeds = []
     neg_embeds = []
 
-    device = pipe.device if hasattr(pipe, "device") else pipe.text_encoder.device
+    device = _get_execution_device(pipe)
     dtype = (
         pipe.text_encoder.dtype
         if hasattr(pipe, "text_encoder") and pipe.text_encoder is not None
@@ -555,7 +605,7 @@ def get_weighted_text_embeddings_sdxl(
     pooled_prompt_embeds = None
     negative_pooled_prompt_embeds = None
 
-    device = pipe.device if hasattr(pipe, "device") else pipe.text_encoder.device
+    device = _get_execution_device(pipe)
     dtype = pipe.text_encoder.dtype
 
     for i in range(len(prompt_chunks_1)):
@@ -649,21 +699,7 @@ def get_weighted_text_embeddings_flux(
         - prompt_embeds: T5 embeddings with weights applied
         - pooled_prompt_embeds: Averaged CLIP pooled embeddings
     """
-    # Determine device from pipeline, falling back to encoder devices
-    if hasattr(pipe, "device"):
-        device = pipe.device
-    elif hasattr(pipe, "text_encoder") and hasattr(pipe.text_encoder, "device"):
-        device = pipe.text_encoder.device
-    elif hasattr(pipe, "text_encoder_2") and hasattr(pipe.text_encoder_2, "device"):
-        device = pipe.text_encoder_2.device
-    else:
-        # Last resort fallback - check all common device types
-        if torch.cuda.is_available():
-            device = "cuda"
-        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-            device = "mps"
-        else:
-            device = "cpu"
+    device = _get_execution_device(pipe)
 
     # Use "empty" placeholder for empty prompts (consistent with get_tokens_and_weights)
     effective_prompt = prompt if prompt else "empty"
@@ -731,7 +767,7 @@ def get_weighted_text_embeddings_sd3(
         Tuple of (prompt_embeds, negative_prompt_embeds,
                   pooled_prompt_embeds, negative_pooled_prompt_embeds)
     """
-    device = pipe.device if hasattr(pipe, "device") else pipe.text_encoder.device
+    device = _get_execution_device(pipe)
 
     # Tokenizer 1 (CLIP-L)
     prompt_tokens_1, prompt_weights_1 = get_tokens_and_weights(pipe.tokenizer, prompt)
