@@ -377,7 +377,11 @@ def get_weighted_text_embeddings_sd15(
     neg_embeds = []
 
     device = pipe.device if hasattr(pipe, "device") else pipe.text_encoder.device
-    dtype = pipe.text_encoder.dtype
+    dtype = (
+        pipe.text_encoder.dtype
+        if hasattr(pipe, "text_encoder") and pipe.text_encoder is not None
+        else torch.float32
+    )
 
     for i in range(len(prompt_chunks)):
         # Positive prompt
