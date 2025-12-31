@@ -218,8 +218,6 @@ class TestGetTokensAndWeights:
     def test_requires_tokenizer(self):
         """Function requires a tokenizer."""
         # Create a mock tokenizer
-        from unittest.mock import Mock
-
         tokenizer = Mock()
         tokenizer.return_value = Mock(input_ids=[BOS_TOKEN_ID, 100, 101, EOS_TOKEN_ID])
 
@@ -236,8 +234,6 @@ class TestGetTokensAndWeights:
 
     def test_empty_prompt(self):
         """Empty prompt should use placeholder."""
-        from unittest.mock import Mock
-
         tokenizer = Mock()
         tokenizer.return_value = Mock(input_ids=[BOS_TOKEN_ID, 100, EOS_TOKEN_ID])
 
@@ -253,8 +249,6 @@ class TestGetTokensAndWeights:
 
     def test_tokenizer_returns_insufficient_tokens(self):
         """Should handle tokenizer returning fewer than 2 tokens gracefully."""
-        from unittest.mock import Mock
-
         tokenizer = Mock()
         # Return only BOS/EOS with no content (len < 2 after strip would be empty)
         tokenizer.return_value = Mock(input_ids=[BOS_TOKEN_ID, EOS_TOKEN_ID])
@@ -268,8 +262,6 @@ class TestGetTokensAndWeights:
 
     def test_tokenizer_returns_single_token(self):
         """Should handle tokenizer returning single token gracefully."""
-        from unittest.mock import Mock
-
         tokenizer = Mock()
         # Return only one token (unexpected edge case)
         tokenizer.return_value = Mock(input_ids=[BOS_TOKEN_ID])
@@ -283,8 +275,6 @@ class TestGetTokensAndWeights:
 
     def test_tokenizer_returns_empty_list(self):
         """Should handle tokenizer returning empty list gracefully."""
-        from unittest.mock import Mock
-
         tokenizer = Mock()
         # Return empty input_ids (very unexpected)
         tokenizer.return_value = Mock(input_ids=[])
@@ -298,8 +288,6 @@ class TestGetTokensAndWeights:
 
     def test_tokenizer_missing_input_ids_attribute(self):
         """Should handle tokenizer result missing input_ids attribute gracefully."""
-        from unittest.mock import Mock
-
         tokenizer = Mock()
         # Return object without input_ids attribute
         result = Mock(spec=[])  # Empty spec means no attributes
@@ -343,8 +331,6 @@ class TestGetT5TokensAndWeights:
 
     def test_requires_tokenizer(self):
         """Function requires a tokenizer."""
-        from unittest.mock import Mock
-
         tokenizer = Mock()
         # T5 tokenizer includes special tokens, no BOS/EOS stripping
         tokenizer.return_value = Mock(input_ids=[100, 101, 102, 1])  # 1 is T5's EOS
@@ -360,8 +346,6 @@ class TestGetT5TokensAndWeights:
 
     def test_empty_prompt(self):
         """Empty prompt should use placeholder."""
-        from unittest.mock import Mock
-
         tokenizer = Mock()
         tokenizer.return_value = Mock(input_ids=[100, 1])
 
@@ -377,8 +361,6 @@ class TestGetT5TokensAndWeights:
 
     def test_break_keyword_ignored(self):
         """BREAK keyword should be ignored for T5 (no chunking)."""
-        from unittest.mock import Mock
-
         tokenizer = Mock()
         # Simulate tokenizing "first" and "second" separately
         tokenizer.side_effect = [
@@ -400,8 +382,6 @@ class TestGetT5TokensAndWeights:
 
     def test_weights_applied(self):
         """Weights should be extracted and applied to tokens."""
-        from unittest.mock import Mock
-
         tokenizer = Mock()
         # Each call returns some tokens
         tokenizer.side_effect = [
