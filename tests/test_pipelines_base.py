@@ -1,11 +1,14 @@
 """Tests for pipelines.base module."""
 
 import io
-from unittest.mock import Mock, patch
+from pathlib import Path
+from unittest.mock import AsyncMock, Mock, patch
 
 from PIL import Image
 
+from oneiro.pipelines import PipelineManager
 from oneiro.pipelines.base import BasePipeline, GenerationResult
+from oneiro.pipelines.lora import LoraConfig, LoraSource
 
 
 class TestGenerationResult:
@@ -236,3 +239,106 @@ class TestBasePipelineConfigureCpuThreads:
         pipeline = ConcretePipeline()
         result = pipeline._configure_cpu_threads()
         assert result >= 1  # Should at least be 1
+
+
+class TestPipelineManagerLoraResolution:
+    """Tests for PipelineManager.generate() LoRA path resolution."""
+
+    def _create_manager_with_mocks(self):
+        """Create a PipelineManager with mocked config and pipeline."""
+        mock_config = Mock()
+        mock_config.get = Mock(return_value={})
+        manager = PipelineManager(mock_config)
+        manager.pipeline = Mock()
+        manager.pipeline.generate = Mock(return_value=Mock())
+        return manager
+
+    async def test_generate_resolves_lora_paths(self):
+        """generate() resolves LoRA paths before passing to pipeline."""
+        manager = self._create_manager_with_mocks()
+        manager._civitai_client = Mock()
+
+        lora = LoraConfig(name="test-lora", source=LoraSource.LOCAL, path="/fake.safetensors")
+
+        with patch("oneiro.pipelines.resolve_lora_path", new_callable=AsyncMock) as mock_resolve:
+            await manager.generate("test prompt", loras=[lora])
+
+        mock_resolve.assert_called_once()
+        call_args = mock_resolve.call_args
+        assert call_args.args[0] is lora
+
+    async def test_generate_passes_resolved_loras_to_pipeline(self):
+        """generate() passes resolved LoRAs to the underlying pipeline."""
+        manager = self._create_manager_with_mocks()
+        manager._civitai_client = Mock()
+
+        lora = LoraConfig(name="test-lora", source=LoraSource.LOCAL, path="/fake.safetensors")
+
+        with patch("oneiro.pipelines.resolve_lora_path", new_callable=AsyncMock):
+            await manager.generate("test prompt", loras=[lora])
+
+        call_kwargs = manager.pipeline.generate.call_args.kwargs
+        assert "loras" in call_kwargs
+        assert call_kwargs["loras"] == [lora]
+
+    async def test_generate_resolves_loras_without_civitai_client(self):
+        """generate() resolves local/HF LoRAs even without civitai_client."""
+        manager = self._create_manager_with_mocks()
+        manager._civitai_client = None
+
+        lora = LoraConfig(name="local-lora", source=LoraSource.LOCAL, path="/local.safetensors")
+
+        with patch("oneiro.pipelines.resolve_lora_path", new_callable=AsyncMock) as mock_resolve:
+            await manager.generate("test prompt", loras=[lora])
+
+        mock_resolve.assert_called_once()
+
+    async def test_generate_handles_lora_resolution_failure(self):
+        """generate() skips LoRAs that fail resolution with warning."""
+        manager = self._create_manager_with_mocks()
+        manager._civitai_client = None
+
+        lora = LoraConfig(name="bad-lora", source=LoraSource.LOCAL, path="/nonexistent.safetensors")
+
+        with patch(
+            "oneiro.pipelines.resolve_lora_path",
+            new_callable=AsyncMock,
+            side_effect=FileNotFoundError("Not found"),
+        ):
+            await manager.generate("test prompt", loras=[lora])
+
+        call_kwargs = manager.pipeline.generate.call_args.kwargs
+        assert "loras" not in call_kwargs or call_kwargs.get("loras") is None
+
+    async def test_generate_resolves_multiple_loras(self):
+        """generate() resolves multiple LoRAs, skipping failed ones."""
+        manager = self._create_manager_with_mocks()
+        manager._civitai_client = None
+
+        good_lora = LoraConfig(name="good", source=LoraSource.LOCAL, path="/good.safetensors")
+        bad_lora = LoraConfig(name="bad", source=LoraSource.LOCAL, path="/bad.safetensors")
+
+        async def resolve_side_effect(lora, **kwargs):
+            if lora.name == "bad":
+                raise FileNotFoundError("Not found")
+            return Path("/good.safetensors")
+
+        with patch(
+            "oneiro.pipelines.resolve_lora_path",
+            new_callable=AsyncMock,
+            side_effect=resolve_side_effect,
+        ):
+            await manager.generate("test prompt", loras=[good_lora, bad_lora])
+
+        call_kwargs = manager.pipeline.generate.call_args.kwargs
+        assert call_kwargs["loras"] == [good_lora]
+
+    async def test_generate_skips_lora_resolution_when_no_loras(self):
+        """generate() skips LoRA resolution when no LoRAs provided."""
+        manager = self._create_manager_with_mocks()
+        manager._civitai_client = Mock()
+
+        with patch("oneiro.pipelines.resolve_lora_path", new_callable=AsyncMock) as mock_resolve:
+            await manager.generate("test prompt")
+
+        mock_resolve.assert_not_called()
