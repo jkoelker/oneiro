@@ -28,7 +28,7 @@ RE_ATTENTION = re.compile(
     \\\(|           # escaped (
     \\\)|           # escaped )
     \\\[|           # escaped [
-    \\]|            # escaped ]
+    \\\]|           # escaped ]
     \\\\|           # escaped \
     \\|             # single escape
     \(|             # opening (
@@ -301,8 +301,8 @@ def get_weighted_text_embeddings_sd15(
 
         token_embedding = pipe.text_encoder(token_tensor)[0].squeeze(0)
 
-        # Apply weights
-        for j in range(len(weight_tensor)):
+        # Apply weights (use min to prevent index out of bounds)
+        for j in range(min(len(weight_tensor), token_embedding.size(0))):
             if weight_tensor[j] != 1.0:
                 token_embedding[j] = token_embedding[j] * weight_tensor[j]
 
@@ -314,7 +314,8 @@ def get_weighted_text_embeddings_sd15(
 
         neg_token_embedding = pipe.text_encoder(neg_token_tensor)[0].squeeze(0)
 
-        for j in range(len(neg_weight_tensor)):
+        # Apply weights (use min to prevent index out of bounds)
+        for j in range(min(len(neg_weight_tensor), neg_token_embedding.size(0))):
             if neg_weight_tensor[j] != 1.0:
                 neg_token_embedding[j] = neg_token_embedding[j] * neg_weight_tensor[j]
 
@@ -355,11 +356,18 @@ def get_t5_tokens_and_weights(
             # BREAK not applicable for T5 (no chunking), skip
             continue
 
-        # Tokenize with special tokens for T5
-        token_ids = tokenizer(word, truncation=False, add_special_tokens=True).input_ids
+        # Tokenize without special tokens for fragments to avoid duplicate EOS
+        token_ids = tokenizer(word, truncation=False, add_special_tokens=False).input_ids
 
         text_tokens.extend(token_ids)
         text_weights.extend([weight] * len(token_ids))
+
+    # Add EOS token at the end (T5's EOS token ID is typically 1)
+    if text_tokens:
+        eos_token_id = tokenizer.eos_token_id
+        if eos_token_id is not None:
+            text_tokens.append(eos_token_id)
+            text_weights.append(1.0)
 
     return text_tokens, text_weights
 
@@ -448,8 +456,8 @@ def get_weighted_text_embeddings_sdxl(
             [prompt_embeds_1_hidden, prompt_embeds_2_hidden], dim=-1
         ).squeeze(0)
 
-        # Apply weights
-        for j in range(len(weight_tensor)):
+        # Apply weights (use min to prevent index out of bounds)
+        for j in range(min(len(weight_tensor), token_embedding.size(0))):
             if weight_tensor[j] != 1.0:
                 token_embedding[j] = token_embedding[j] * weight_tensor[j]
 
@@ -477,8 +485,8 @@ def get_weighted_text_embeddings_sdxl(
             [neg_prompt_embeds_1_hidden, neg_prompt_embeds_2_hidden], dim=-1
         ).squeeze(0)
 
-        # Apply weights
-        for j in range(len(neg_weight_tensor)):
+        # Apply weights (use min to prevent index out of bounds)
+        for j in range(min(len(neg_weight_tensor), neg_token_embedding.size(0))):
             if neg_weight_tensor[j] != 1.0:
                 neg_token_embedding[j] = neg_token_embedding[j] * neg_weight_tensor[j]
 
@@ -553,10 +561,10 @@ def get_weighted_text_embeddings_flux(
         t5_output = pipe.text_encoder_2(t5_token_tensor)
     t5_embeds = t5_output[0].squeeze(0)
 
-    # Apply weights to T5 embeddings
-    for i, weight in enumerate(t5_weights):
-        if weight != 1.0:
-            t5_embeds[i] = t5_embeds[i] * weight
+    # Apply weights to T5 embeddings (use min to prevent index out of bounds)
+    for i in range(min(len(t5_weights), t5_embeds.size(0))):
+        if t5_weights[i] != 1.0:
+            t5_embeds[i] = t5_embeds[i] * t5_weights[i]
 
     prompt_embeds = t5_embeds.unsqueeze(0)
     prompt_embeds = prompt_embeds.to(dtype=pipe.text_encoder_2.dtype, device=device)
@@ -659,8 +667,8 @@ def get_weighted_text_embeddings_sd3(
             [prompt_embeds_1_hidden, prompt_embeds_2_hidden], dim=-1
         ).squeeze(0)
 
-        # Apply weights
-        for j in range(len(weight_tensor)):
+        # Apply weights (use min to prevent index out of bounds)
+        for j in range(min(len(weight_tensor), token_embedding.size(0))):
             if weight_tensor[j] != 1.0:
                 token_embedding[j] = token_embedding[j] * weight_tensor[j]
 
@@ -688,8 +696,8 @@ def get_weighted_text_embeddings_sd3(
             [neg_prompt_embeds_1_hidden, neg_prompt_embeds_2_hidden], dim=-1
         ).squeeze(0)
 
-        # Apply weights
-        for j in range(len(neg_weight_tensor)):
+        # Apply weights (use min to prevent index out of bounds)
+        for j in range(min(len(neg_weight_tensor), neg_token_embedding.size(0))):
             if neg_weight_tensor[j] != 1.0:
                 neg_token_embedding[j] = neg_token_embedding[j] * neg_weight_tensor[j]
 
@@ -710,18 +718,20 @@ def get_weighted_text_embeddings_sd3(
         t5_token_tensor = torch.tensor([prompt_tokens_3], dtype=torch.long, device=device)
         t5_embeds = pipe.text_encoder_3(t5_token_tensor)[0].squeeze(0)
 
-        for i, weight in enumerate(prompt_weights_3):
-            if weight != 1.0:
-                t5_embeds[i] = t5_embeds[i] * weight
+        # Apply weights (use min to prevent index out of bounds)
+        for i in range(min(len(prompt_weights_3), t5_embeds.size(0))):
+            if prompt_weights_3[i] != 1.0:
+                t5_embeds[i] = t5_embeds[i] * prompt_weights_3[i]
         t5_embeds = t5_embeds.unsqueeze(0)
 
         # Negative T5
         neg_t5_token_tensor = torch.tensor([neg_tokens_3], dtype=torch.long, device=device)
         neg_t5_embeds = pipe.text_encoder_3(neg_t5_token_tensor)[0].squeeze(0)
 
-        for i, weight in enumerate(neg_weights_3):
-            if weight != 1.0:
-                neg_t5_embeds[i] = neg_t5_embeds[i] * weight
+        # Apply weights (use min to prevent index out of bounds)
+        for i in range(min(len(neg_weights_3), neg_t5_embeds.size(0))):
+            if neg_weights_3[i] != 1.0:
+                neg_t5_embeds[i] = neg_t5_embeds[i] * neg_weights_3[i]
         neg_t5_embeds = neg_t5_embeds.unsqueeze(0)
     else:
         # Create zero tensors if T5 not available
