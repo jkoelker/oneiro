@@ -9,7 +9,7 @@ from typing import Any
 import discord
 from discord import option
 
-from oneiro.civitai import CivitaiClient, CivitaiError
+from oneiro.civitai import CivitaiClient, CivitaiError, parse_civitai_url
 from oneiro.config import Config
 from oneiro.filters import ContentFilter
 from oneiro.lora_detector import AutoLoraDetector, create_detector_from_config
@@ -21,7 +21,7 @@ from oneiro.pipelines import (
     PipelineManager,
 )
 from oneiro.pipelines.civitai_checkpoint import CivitaiCheckpointPipeline
-from oneiro.pipelines.lora import is_lora_compatible, parse_civitai_url
+from oneiro.pipelines.lora import is_lora_compatible
 from oneiro.queue import GenerationQueue, QueueStatus
 
 # Global managers (initialized on bot ready)

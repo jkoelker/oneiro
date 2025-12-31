@@ -11,47 +11,9 @@ from oneiro.pipelines.embedding import (
     EmbeddingIncompatibleError,
     EmbeddingSource,
     is_embedding_compatible,
-    parse_civitai_url,
     parse_embedding_config,
     parse_embeddings_from_config,
 )
-
-
-class TestParseCivitaiUrl:
-    """Tests for parse_civitai_url function."""
-
-    def test_basic_model_url(self):
-        """Parses basic model URL."""
-        model_id, version_id = parse_civitai_url("https://civitai.com/models/12345")
-        assert model_id == 12345
-        assert version_id is None
-
-    def test_model_url_with_name(self):
-        """Parses model URL with name slug."""
-        model_id, version_id = parse_civitai_url("https://civitai.com/models/12345/my-cool-model")
-        assert model_id == 12345
-        assert version_id is None
-
-    def test_model_url_with_version(self):
-        """Parses model URL with version ID in query string."""
-        model_id, version_id = parse_civitai_url(
-            "https://civitai.com/models/12345?modelVersionId=67890"
-        )
-        assert model_id == 12345
-        assert version_id == 67890
-
-    def test_model_url_with_name_and_version(self):
-        """Parses model URL with name and version."""
-        model_id, version_id = parse_civitai_url(
-            "https://civitai.com/models/12345/model-name?modelVersionId=67890"
-        )
-        assert model_id == 12345
-        assert version_id == 67890
-
-    def test_invalid_url_raises(self):
-        """Invalid URL raises ValueError."""
-        with pytest.raises(ValueError, match="Invalid Civitai URL"):
-            parse_civitai_url("https://example.com/something")
 
 
 class TestEmbeddingConfig:
