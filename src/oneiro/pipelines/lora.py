@@ -614,6 +614,11 @@ async def resolve_lora_path(
             object.__setattr__(lora, "trigger_words", version.trained_words)
             print(f"Auto-populated trigger words from Civitai: {version.trained_words}")
 
+        # Populate base_model from Civitai version if not already set
+        if not lora.base_model and version.base_model:
+            object.__setattr__(lora, "base_model", version.base_model)
+            print(f"Auto-populated base model from Civitai: {version.base_model}")
+
         # Download
         print(f"Downloading LoRA: {version.name} (base: {version.base_model})")
         path = await civitai_client.download_model_version(version)
