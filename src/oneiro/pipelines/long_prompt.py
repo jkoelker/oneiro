@@ -240,6 +240,14 @@ def group_tokens_into_chunks(
         new_token_ids.append(chunk)
         new_weights.append(chunk_weights)
 
+    # Handle edge case: if no chunks were produced (e.g., token_ids was empty or only BREAK markers),
+    # create an empty chunk to ensure encoders have at least one chunk to process
+    if not new_token_ids:
+        empty_chunk = [BOS_TOKEN_ID] + [EOS_TOKEN_ID] * (MAX_TOKENS_PER_CHUNK + 1)
+        empty_weights = [1.0] * 77
+        new_token_ids.append(empty_chunk)
+        new_weights.append(empty_weights)
+
     return new_token_ids, new_weights
 
 

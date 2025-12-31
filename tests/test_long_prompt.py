@@ -180,6 +180,37 @@ class TestGroupTokensIntoChunks:
         # Should be BOS + 3 tokens + EOS = 5
         assert len(chunks[0]) == 5
 
+    def test_empty_input_returns_one_chunk(self):
+        """Empty token list should return one empty chunk."""
+        tokens: list[int] = []
+        weights: list[float] = []
+
+        chunks, weight_chunks = group_tokens_into_chunks(tokens, weights)
+
+        # Should return exactly one empty chunk
+        assert len(chunks) == 1
+        assert len(weight_chunks) == 1
+        # Chunk should have correct structure: [BOS] + 75 EOS + [EOS] = 77 tokens
+        assert len(chunks[0]) == 77
+        assert chunks[0][0] == BOS_TOKEN_ID
+        assert len(weight_chunks[0]) == 77
+        assert all(w == 1.0 for w in weight_chunks[0])
+
+    def test_only_break_markers_returns_one_chunk(self):
+        """Token list with only BREAK markers should return one empty chunk."""
+        # BREAK markers are represented as -1
+        tokens = [-1, -1, -1]
+        weights = [-1.0, -1.0, -1.0]
+
+        chunks, weight_chunks = group_tokens_into_chunks(tokens, weights)
+
+        # Should return exactly one empty chunk since all tokens were BREAK markers
+        assert len(chunks) == 1
+        assert len(weight_chunks) == 1
+        # Chunk should have correct structure
+        assert len(chunks[0]) == 77
+        assert chunks[0][0] == BOS_TOKEN_ID
+
 
 class TestGetTokensAndWeights:
     """Tests for get_tokens_and_weights function."""
