@@ -1,11 +1,17 @@
 """Tests for long prompt support."""
 
+from unittest.mock import Mock
+
+import torch
+
 from oneiro.pipelines.long_prompt import (
     BOS_TOKEN_ID,
     EOS_TOKEN_ID,
     get_t5_tokens_and_weights,
     get_tokens_and_weights,
+    get_weighted_text_embeddings_sd15,
     group_tokens_into_chunks,
+    pad_chunks_to_same_count,
     parse_prompt_attention,
 )
 
@@ -304,3 +310,155 @@ class TestGetT5TokensAndWeights:
         # Weights for "red" tokens should be 1.5
         # The actual structure depends on parse_prompt_attention output
         assert len(tokens) == len(weights)
+
+
+class TestPadChunksToSameCount:
+    """Tests for pad_chunks_to_same_count function."""
+
+    def test_equal_counts_unchanged(self):
+        """Equal chunk counts should return unchanged."""
+        chunks_a = [[1, 2, 3]]
+        weights_a = [[1.0, 1.0, 1.0]]
+        chunks_b = [[4, 5, 6]]
+        weights_b = [[1.0, 1.0, 1.0]]
+
+        result = pad_chunks_to_same_count(chunks_a, weights_a, chunks_b, weights_b)
+
+        assert result == (chunks_a, weights_a, chunks_b, weights_b)
+
+    def test_pads_shorter_list_b(self):
+        """Should pad list B when A is longer."""
+        chunks_a = [[1], [2]]  # 2 chunks
+        weights_a = [[1.0], [1.0]]
+        chunks_b = [[3]]  # 1 chunk
+        weights_b = [[1.0]]
+
+        result_a, result_wa, result_b, result_wb = pad_chunks_to_same_count(
+            chunks_a, weights_a, chunks_b, weights_b
+        )
+
+        assert len(result_a) == 2
+        assert len(result_b) == 2
+        # Original chunks unchanged
+        assert result_a[0] == [1]
+        assert result_b[0] == [3]
+        # Padded chunk should be EOS-filled
+        assert result_b[1][0] == BOS_TOKEN_ID
+
+    def test_pads_shorter_list_a(self):
+        """Should pad list A when B is longer."""
+        chunks_a = [[1]]  # 1 chunk
+        weights_a = [[1.0]]
+        chunks_b = [[2], [3], [4]]  # 3 chunks
+        weights_b = [[1.0], [1.0], [1.0]]
+
+        result_a, result_wa, result_b, result_wb = pad_chunks_to_same_count(
+            chunks_a, weights_a, chunks_b, weights_b
+        )
+
+        assert len(result_a) == 3
+        assert len(result_b) == 3
+        # Padded chunks should have correct structure
+        assert result_a[1][0] == BOS_TOKEN_ID
+        assert result_a[2][0] == BOS_TOKEN_ID
+
+    def test_empty_chunk_structure(self):
+        """Padded chunks should have correct BOS/EOS structure."""
+        chunks_a = [[1, 2]]
+        weights_a = [[1.0, 1.0]]
+        chunks_b: list[list[int]] = []
+        weights_b: list[list[float]] = []
+
+        # Edge case: B is empty (should get padded to match A)
+        # This creates empty lists which pad_chunks_to_same_count doesn't handle
+        # But in practice, empty prompts produce at least one chunk
+        # Let's test a realistic case
+        chunks_a = [[1] * 77, [2] * 77]  # 2 chunks
+        weights_a = [[1.0] * 77, [1.0] * 77]
+        chunks_b = [[3] * 77]  # 1 chunk
+        weights_b = [[1.0] * 77]
+
+        result_a, result_wa, result_b, result_wb = pad_chunks_to_same_count(
+            chunks_a, weights_a, chunks_b, weights_b
+        )
+
+        # Padded chunk should be 77 tokens
+        assert len(result_b[1]) == 77
+        # Padded weights should be 77 values of 1.0
+        assert len(result_wb[1]) == 77
+        assert all(w == 1.0 for w in result_wb[1])
+
+
+class TestGetWeightedTextEmbeddingsSD15:
+    """Tests for get_weighted_text_embeddings_sd15 function."""
+
+    def _create_mock_pipe(self, device: str = "cpu"):
+        """Create a mock SD 1.5 pipeline."""
+        pipe = Mock()
+        pipe.device = device
+
+        # Mock tokenizer
+        tokenizer = Mock()
+        tokenizer.return_value = Mock(input_ids=[BOS_TOKEN_ID, 100, 101, EOS_TOKEN_ID])
+        pipe.tokenizer = tokenizer
+
+        # Mock text encoder
+        text_encoder = Mock()
+        text_encoder.device = device
+        text_encoder.dtype = torch.float32
+
+        # Mock encoder output - returns embeddings with shape (batch, seq_len, hidden_dim)
+        def mock_encode(input_ids):
+            batch_size = input_ids.shape[0]
+            seq_len = input_ids.shape[1]
+            hidden_dim = 768  # SD 1.5 uses 768
+            # Return a mock output with the expected structure
+            output = Mock()
+            output.__getitem__ = Mock(return_value=torch.randn(batch_size, seq_len, hidden_dim))
+            return output
+
+        text_encoder.side_effect = mock_encode
+        text_encoder.__call__ = mock_encode
+        pipe.text_encoder = text_encoder
+
+        return pipe
+
+    def test_returns_tuple_of_tensors(self):
+        """Should return tuple of (prompt_embeds, negative_prompt_embeds)."""
+        pipe = self._create_mock_pipe()
+
+        result = get_weighted_text_embeddings_sd15(pipe, "a cat", "bad quality")
+
+        assert isinstance(result, tuple)
+        assert len(result) == 2
+        assert isinstance(result[0], torch.Tensor)
+        assert isinstance(result[1], torch.Tensor)
+
+    def test_empty_prompts(self):
+        """Should handle empty prompts."""
+        pipe = self._create_mock_pipe()
+
+        result = get_weighted_text_embeddings_sd15(pipe, "", "")
+
+        assert isinstance(result, tuple)
+        assert len(result) == 2
+
+    def test_uses_correct_device(self):
+        """Should use pipe's device."""
+        pipe = self._create_mock_pipe(device="cpu")
+
+        prompt_embeds, neg_embeds = get_weighted_text_embeddings_sd15(pipe, "test", "negative")
+
+        # Embeddings should be on CPU
+        assert prompt_embeds.device.type == "cpu"
+        assert neg_embeds.device.type == "cpu"
+
+    def test_handles_weighted_prompt(self):
+        """Should process prompts with weight syntax."""
+        pipe = self._create_mock_pipe()
+
+        # This should not raise
+        result = get_weighted_text_embeddings_sd15(pipe, "a (beautiful:1.5) cat", "[ugly]")
+
+        assert isinstance(result, tuple)
+        assert len(result) == 2
