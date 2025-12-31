@@ -22,6 +22,9 @@ BOS_TOKEN_ID = 49406  # Start of text
 EOS_TOKEN_ID = 49407  # End of text
 MAX_TOKENS_PER_CHUNK = 75  # 77 - 2 (BOS + EOS)
 
+# T5-XXL embedding dimension
+T5_EMBEDDING_DIM = 4096
+
 # Regex for parsing A1111-style attention weights
 RE_ATTENTION = re.compile(
     r"""
@@ -47,13 +50,13 @@ RE_BREAK = re.compile(r"\s*\bBREAK\b\s*", re.S)
 
 
 def parse_prompt_attention(text: str) -> list[tuple[str, float]]:
-    """Parse prompt with A1111-style attention weights.
+    r"""Parse prompt with A1111-style attention weights.
 
     Supported syntax:
       (abc) - increases attention by 1.1x
       (abc:1.5) - increases attention by 1.5x
       [abc] - decreases attention by dividing by 1.1 (multiplies by ~0.909)
-      \\( \\) \\[ \\] - literal brackets
+      \( \) \[ \] - literal brackets
       BREAK - forces a new chunk boundary
 
     Args:
@@ -346,12 +349,14 @@ def get_weighted_text_embeddings_sd15(
         token_tensor = torch.tensor([prompt_chunks[i]], dtype=torch.long, device=device)
         weight_tensor = torch.tensor(prompt_chunk_weights[i], dtype=dtype, device=device)
 
-        token_embedding = pipe.text_encoder(token_tensor)[0].squeeze(0)
+        with torch.no_grad():
+            token_embedding = pipe.text_encoder(token_tensor)[0].squeeze(0)
 
-        # Apply weights (use min to prevent index out of bounds)
-        for j in range(min(len(weight_tensor), token_embedding.size(0))):
-            if weight_tensor[j] != 1.0:
-                token_embedding[j] = token_embedding[j] * weight_tensor[j]
+        # Apply weights using vectorized multiplication
+        num_tokens = min(len(weight_tensor), token_embedding.size(0))
+        token_embedding[:num_tokens] = token_embedding[:num_tokens] * weight_tensor[
+            :num_tokens
+        ].unsqueeze(-1)
 
         embeds.append(token_embedding.unsqueeze(0))
 
@@ -359,12 +364,14 @@ def get_weighted_text_embeddings_sd15(
         neg_token_tensor = torch.tensor([neg_chunks[i]], dtype=torch.long, device=device)
         neg_weight_tensor = torch.tensor(neg_chunk_weights[i], dtype=dtype, device=device)
 
-        neg_token_embedding = pipe.text_encoder(neg_token_tensor)[0].squeeze(0)
+        with torch.no_grad():
+            neg_token_embedding = pipe.text_encoder(neg_token_tensor)[0].squeeze(0)
 
-        # Apply weights (use min to prevent index out of bounds)
-        for j in range(min(len(neg_weight_tensor), neg_token_embedding.size(0))):
-            if neg_weight_tensor[j] != 1.0:
-                neg_token_embedding[j] = neg_token_embedding[j] * neg_weight_tensor[j]
+        # Apply weights using vectorized multiplication
+        num_neg_tokens = min(len(neg_weight_tensor), neg_token_embedding.size(0))
+        neg_token_embedding[:num_neg_tokens] = neg_token_embedding[
+            :num_neg_tokens
+        ] * neg_weight_tensor[:num_neg_tokens].unsqueeze(-1)
 
         neg_embeds.append(neg_token_embedding.unsqueeze(0))
 
@@ -515,10 +522,11 @@ def get_weighted_text_embeddings_sdxl(
             [prompt_embeds_1_hidden, prompt_embeds_2_hidden], dim=-1
         ).squeeze(0)
 
-        # Apply weights (use min to prevent index out of bounds)
-        for j in range(min(len(weight_tensor), token_embedding.size(0))):
-            if weight_tensor[j] != 1.0:
-                token_embedding[j] = token_embedding[j] * weight_tensor[j]
+        # Apply weights using vectorized multiplication
+        num_tokens = min(len(weight_tensor), token_embedding.size(0))
+        token_embedding[:num_tokens] = token_embedding[:num_tokens] * weight_tensor[
+            :num_tokens
+        ].unsqueeze(-1)
 
         embeds.append(token_embedding.unsqueeze(0))
 
@@ -544,10 +552,11 @@ def get_weighted_text_embeddings_sdxl(
             [neg_prompt_embeds_1_hidden, neg_prompt_embeds_2_hidden], dim=-1
         ).squeeze(0)
 
-        # Apply weights (use min to prevent index out of bounds)
-        for j in range(min(len(neg_weight_tensor), neg_token_embedding.size(0))):
-            if neg_weight_tensor[j] != 1.0:
-                neg_token_embedding[j] = neg_token_embedding[j] * neg_weight_tensor[j]
+        # Apply weights using vectorized multiplication
+        num_neg_tokens = min(len(neg_weight_tensor), neg_token_embedding.size(0))
+        neg_token_embedding[:num_neg_tokens] = neg_token_embedding[
+            :num_neg_tokens
+        ] * neg_weight_tensor[:num_neg_tokens].unsqueeze(-1)
 
         neg_embeds.append(neg_token_embedding.unsqueeze(0))
 
@@ -625,10 +634,12 @@ def get_weighted_text_embeddings_flux(
         t5_output = pipe.text_encoder_2(t5_token_tensor)
     t5_embeds = t5_output[0].squeeze(0)
 
-    # Apply weights to T5 embeddings (use min to prevent index out of bounds)
-    for i in range(min(len(t5_weights), t5_embeds.size(0))):
-        if t5_weights[i] != 1.0:
-            t5_embeds[i] = t5_embeds[i] * t5_weights[i]
+    # Apply weights to T5 embeddings using vectorized multiplication
+    t5_weight_tensor = torch.tensor(t5_weights, dtype=t5_embeds.dtype, device=device)
+    num_t5_tokens = min(len(t5_weight_tensor), t5_embeds.size(0))
+    t5_embeds[:num_t5_tokens] = t5_embeds[:num_t5_tokens] * t5_weight_tensor[
+        :num_t5_tokens
+    ].unsqueeze(-1)
 
     prompt_embeds = t5_embeds.unsqueeze(0)
     prompt_embeds = prompt_embeds.to(dtype=pipe.text_encoder_2.dtype, device=device)
@@ -743,10 +754,11 @@ def get_weighted_text_embeddings_sd3(
             [prompt_embeds_1_hidden, prompt_embeds_2_hidden], dim=-1
         ).squeeze(0)
 
-        # Apply weights (use min to prevent index out of bounds)
-        for j in range(min(len(weight_tensor), token_embedding.size(0))):
-            if weight_tensor[j] != 1.0:
-                token_embedding[j] = token_embedding[j] * weight_tensor[j]
+        # Apply weights using vectorized multiplication
+        num_tokens = min(len(weight_tensor), token_embedding.size(0))
+        token_embedding[:num_tokens] = token_embedding[:num_tokens] * weight_tensor[
+            :num_tokens
+        ].unsqueeze(-1)
 
         embeds.append(token_embedding.unsqueeze(0))
 
@@ -772,10 +784,11 @@ def get_weighted_text_embeddings_sd3(
             [neg_prompt_embeds_1_hidden, neg_prompt_embeds_2_hidden], dim=-1
         ).squeeze(0)
 
-        # Apply weights (use min to prevent index out of bounds)
-        for j in range(min(len(neg_weight_tensor), neg_token_embedding.size(0))):
-            if neg_weight_tensor[j] != 1.0:
-                neg_token_embedding[j] = neg_token_embedding[j] * neg_weight_tensor[j]
+        # Apply weights using vectorized multiplication
+        num_neg_tokens = min(len(neg_weight_tensor), neg_token_embedding.size(0))
+        neg_token_embedding[:num_neg_tokens] = neg_token_embedding[
+            :num_neg_tokens
+        ] * neg_weight_tensor[:num_neg_tokens].unsqueeze(-1)
 
         neg_embeds.append(neg_token_embedding.unsqueeze(0))
 
@@ -794,25 +807,33 @@ def get_weighted_text_embeddings_sd3(
         t5_token_tensor = torch.tensor([prompt_tokens_3], dtype=torch.long, device=device)
         t5_embeds = pipe.text_encoder_3(t5_token_tensor)[0].squeeze(0)
 
-        # Apply weights (use min to prevent index out of bounds)
-        for i in range(min(len(prompt_weights_3), t5_embeds.size(0))):
-            if prompt_weights_3[i] != 1.0:
-                t5_embeds[i] = t5_embeds[i] * prompt_weights_3[i]
+        # Apply weights using vectorized multiplication
+        t5_weight_tensor = torch.tensor(prompt_weights_3, dtype=t5_embeds.dtype, device=device)
+        num_t5_tokens = min(len(t5_weight_tensor), t5_embeds.size(0))
+        t5_embeds[:num_t5_tokens] = t5_embeds[:num_t5_tokens] * t5_weight_tensor[
+            :num_t5_tokens
+        ].unsqueeze(-1)
         t5_embeds = t5_embeds.unsqueeze(0)
 
         # Negative T5
         neg_t5_token_tensor = torch.tensor([neg_tokens_3], dtype=torch.long, device=device)
         neg_t5_embeds = pipe.text_encoder_3(neg_t5_token_tensor)[0].squeeze(0)
 
-        # Apply weights (use min to prevent index out of bounds)
-        for i in range(min(len(neg_weights_3), neg_t5_embeds.size(0))):
-            if neg_weights_3[i] != 1.0:
-                neg_t5_embeds[i] = neg_t5_embeds[i] * neg_weights_3[i]
+        # Apply weights using vectorized multiplication
+        neg_t5_weight_tensor = torch.tensor(neg_weights_3, dtype=neg_t5_embeds.dtype, device=device)
+        num_neg_t5_tokens = min(len(neg_t5_weight_tensor), neg_t5_embeds.size(0))
+        neg_t5_embeds[:num_neg_t5_tokens] = neg_t5_embeds[
+            :num_neg_t5_tokens
+        ] * neg_t5_weight_tensor[:num_neg_t5_tokens].unsqueeze(-1)
         neg_t5_embeds = neg_t5_embeds.unsqueeze(0)
     else:
         # Create zero tensors if T5 not available
-        t5_embeds = torch.zeros(1, 1, 4096, dtype=clip_prompt_embeds.dtype, device=device)
-        neg_t5_embeds = torch.zeros(1, 1, 4096, dtype=clip_prompt_embeds.dtype, device=device)
+        t5_embeds = torch.zeros(
+            1, 1, T5_EMBEDDING_DIM, dtype=clip_prompt_embeds.dtype, device=device
+        )
+        neg_t5_embeds = torch.zeros(
+            1, 1, T5_EMBEDDING_DIM, dtype=clip_prompt_embeds.dtype, device=device
+        )
 
     # Pad CLIP embeddings to match T5 dimension and concatenate
     clip_prompt_embeds_padded = torch.nn.functional.pad(
