@@ -179,6 +179,11 @@ class TestGetTokensAndWeights:
         # Tokenizer should have been called
         tokenizer.assert_called()
 
+        # Verify tokens and weights have correct structure
+        assert isinstance(tokens, list), "tokens should be a list"
+        assert isinstance(weights, list), "weights should be a list"
+        assert len(tokens) == len(weights), "tokens and weights should have same length"
+
     def test_empty_prompt(self):
         """Empty prompt should use placeholder."""
         from unittest.mock import Mock
@@ -190,6 +195,11 @@ class TestGetTokensAndWeights:
 
         # Should have called tokenizer with "empty" placeholder
         tokenizer.assert_called()
+
+        # Verify tokens and weights have correct structure
+        assert isinstance(tokens, list), "tokens should be a list"
+        assert isinstance(weights, list), "weights should be a list"
+        assert len(tokens) == len(weights), "tokens and weights should have same length"
 
 
 class TestIntegration:
@@ -232,6 +242,11 @@ class TestGetT5TokensAndWeights:
 
         tokenizer.assert_called()
 
+        # Verify tokens and weights have correct structure
+        assert isinstance(tokens, list), "tokens should be a list"
+        assert isinstance(weights, list), "weights should be a list"
+        assert len(tokens) == len(weights), "tokens and weights should have same length"
+
     def test_empty_prompt(self):
         """Empty prompt should use placeholder."""
         from unittest.mock import Mock
@@ -243,6 +258,11 @@ class TestGetT5TokensAndWeights:
 
         # Should have called tokenizer with "empty" placeholder
         tokenizer.assert_called()
+
+        # Verify tokens and weights have correct structure
+        assert isinstance(tokens, list), "tokens should be a list"
+        assert isinstance(weights, list), "weights should be a list"
+        assert len(tokens) == len(weights), "tokens and weights should have same length"
 
     def test_break_keyword_ignored(self):
         """BREAK keyword should be ignored for T5 (no chunking)."""
@@ -261,6 +281,11 @@ class TestGetT5TokensAndWeights:
         # Should have tokens from both parts, BREAK not included
         # Note: actual tokens depend on mock setup
         assert tokenizer.call_count >= 1
+
+        # Verify tokens and weights have correct structure
+        assert isinstance(tokens, list), "tokens should be a list"
+        assert isinstance(weights, list), "weights should be a list"
+        assert len(tokens) == len(weights), "tokens and weights should have same length"
 
     def test_weights_applied(self):
         """Weights should be extracted and applied to tokens."""
