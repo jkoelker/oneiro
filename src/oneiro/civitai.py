@@ -103,6 +103,7 @@ class ModelVersion:
     name: str
     description: str | None
     base_model: str | None
+    trained_words: list[str] = field(default_factory=list)
     files: list[ModelFile] = field(default_factory=list)
     download_url: str | None = None
     created_at: str | None = None
@@ -117,6 +118,7 @@ class ModelVersion:
             name=data["name"],
             description=data.get("description"),
             base_model=data.get("baseModel"),
+            trained_words=data.get("trainedWords", []),
             files=files,
             download_url=data.get("downloadUrl"),
             created_at=data.get("createdAt"),

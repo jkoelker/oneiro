@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from oneiro.civitai import CivitaiClient
+from oneiro.pipelines.lora import PIPELINE_BASE_MODEL_MAP
 
 
 class EmbeddingSource(str, Enum):
@@ -311,18 +312,6 @@ def parse_embeddings_from_config(
                     loaded_names.add(emb_name)
 
     return embeddings
-
-
-# Pipeline type to Civitai base model mapping for embeddings
-# Embeddings are generally more model-specific than LoRAs
-PIPELINE_BASE_MODEL_MAP: dict[str, list[str]] = {
-    "flux2": ["Flux.1 D", "Flux.1 S", "Flux.1", "Flux.2", "Flux.1 Dev", "Flux.1 Schnell"],
-    "zimage": ["ZImageTurbo", "ZImageBase", "Z-Image"],
-    "qwen": ["Qwen", "Qwen-Image"],
-    "sdxl": ["SDXL 1.0", "SDXL Turbo", "SDXL Lightning", "Pony", "Illustrious"],
-    "sd15": ["SD 1.5", "SD 1.4"],
-    "sd3": ["SD 3", "SD 3.5"],
-}
 
 
 def is_embedding_compatible(pipeline_type: str, civitai_base_model: str | None) -> bool:

@@ -37,6 +37,9 @@ class LoraConfig:
         repo: HuggingFace repository (for huggingface source)
         weight_name: Filename in HF repo (for huggingface source)
         path: Local file path (for local source)
+        trigger_words: List of trigger words that activate this LoRA (for auto-detect)
+        base_model: Base model string (e.g., "SDXL 1.0", "Pony") for compatibility filtering
+        auto_detect: Whether to include in auto-detection (None = auto: true if trigger_words set)
     """
 
     name: str
@@ -53,16 +56,18 @@ class LoraConfig:
     repo: str | None = None
     weight_name: str | None = None
 
-    # Local-specific
     path: str | None = None
 
-    # Resolved path (filled after download)
+    trigger_words: list[str] = field(default_factory=list)
+    base_model: str | None = None
+    auto_detect: bool | None = None
+
     _resolved_path: Path | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         """Validate configuration and set defaults."""
         if self.adapter_name is None:
-            object.__setattr__(self, "adapter_name", self.name)
+            self.adapter_name = self.name
 
         if self.source == LoraSource.CIVITAI:
             if not self.civitai_id and not self.civitai_url:
@@ -178,6 +183,9 @@ def parse_lora_config(config: dict[str, Any] | str, index: int = 0) -> LoraConfi
     lora_name = config.get("name")
     adapter_name = config.get("adapter_name")
     weight = config.get("weight", 1.0)
+    trigger_words = config.get("trigger_words", [])
+    base_model = config.get("base_model")
+    auto_detect = config.get("auto_detect")
 
     if source == LoraSource.CIVITAI:
         civitai_id = config.get("id") or config.get("civitai_id")
@@ -199,6 +207,9 @@ def parse_lora_config(config: dict[str, Any] | str, index: int = 0) -> LoraConfi
             civitai_id=civitai_id,
             civitai_version=civitai_version,
             civitai_url=civitai_url,
+            trigger_words=trigger_words,
+            base_model=base_model,
+            auto_detect=auto_detect,
         )
 
     elif source == LoraSource.HUGGINGFACE:
@@ -215,6 +226,9 @@ def parse_lora_config(config: dict[str, Any] | str, index: int = 0) -> LoraConfi
             weight=weight,
             repo=repo,
             weight_name=weight_name,
+            trigger_words=trigger_words,
+            base_model=base_model,
+            auto_detect=auto_detect,
         )
 
     else:  # LOCAL
@@ -229,6 +243,9 @@ def parse_lora_config(config: dict[str, Any] | str, index: int = 0) -> LoraConfi
             adapter_name=adapter_name,
             weight=weight,
             path=path,
+            trigger_words=trigger_words,
+            base_model=base_model,
+            auto_detect=auto_detect,
         )
 
 
@@ -426,9 +443,9 @@ def parse_loras_from_config(
                 lora_config = loras_section[ref_name]
                 parsed = parse_lora_config(lora_config, index=len(loras))
                 if not lora_config.get("name"):
-                    object.__setattr__(parsed, "name", ref_name)
+                    parsed.name = ref_name
                     if lora_config.get("adapter_name") is None:
-                        object.__setattr__(parsed, "adapter_name", ref_name)
+                        parsed.adapter_name = ref_name
                 loras.append(parsed)
                 loaded_names.add(parsed.name)
             else:
@@ -445,9 +462,9 @@ def parse_loras_from_config(
                     lora_config = loras_section[ref]
                     parsed = parse_lora_config(lora_config, index=len(loras))
                     if not lora_config.get("name"):
-                        object.__setattr__(parsed, "name", ref)
+                        parsed.name = ref
                         if lora_config.get("adapter_name") is None:
-                            object.__setattr__(parsed, "adapter_name", ref)
+                            parsed.adapter_name = ref
                     loras.append(parsed)
                     loaded_names.add(parsed.name)
                 else:
@@ -472,8 +489,10 @@ def parse_loras_from_config(
 
 
 # Pipeline type to Civitai base model mapping
+# FLUX.1 and FLUX.2 are NOT LoRA-compatible due to different transformer architectures
 PIPELINE_BASE_MODEL_MAP: dict[str, list[str]] = {
-    "flux2": ["Flux.1 D", "Flux.1 S", "Flux.1", "Flux.2", "Flux.1 Dev", "Flux.1 Schnell"],
+    "flux1": ["Flux.1 D", "Flux.1 S", "Flux.1", "Flux.1 Dev", "Flux.1 Schnell"],
+    "flux2": ["Flux.2"],
     "zimage": ["ZImageTurbo", "ZImageBase", "Z-Image"],
     "qwen": ["Qwen", "Qwen-Image"],
     "sdxl": ["SDXL 1.0", "SDXL Turbo", "SDXL Lightning", "Pony", "Illustrious"],
@@ -589,6 +608,16 @@ async def resolve_lora_path(
                     pipeline_type,
                     version.base_model,
                 )
+
+        # Populate trigger_words from Civitai trained_words if not already set
+        if not lora.trigger_words and version.trained_words:
+            lora.trigger_words = version.trained_words
+            print(f"Auto-populated trigger words from Civitai: {version.trained_words}")
+
+        # Populate base_model from Civitai version if not already set
+        if not lora.base_model and version.base_model:
+            lora.base_model = version.base_model
+            print(f"Auto-populated base model from Civitai: {version.base_model}")
 
         # Download
         print(f"Downloading LoRA: {version.name} (base: {version.base_model})")
