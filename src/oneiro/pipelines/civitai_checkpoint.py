@@ -838,7 +838,8 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
         """Check if this pipeline supports embedding-based prompt handling.
 
         Returns True for pipelines that support pre-computed embeddings with
-        weight handling (CLIP-based: SD 1.x, SD 2.x, SDXL; and flow-based: Flux, SD3).
+        weight handling (CLIP-based: SD 1.x, SD 2.x, SDXL; flow-based: Flux;
+        and MMDiT-based: SD3).
 
         Returns:
             True if the pipeline supports prompt embeddings
