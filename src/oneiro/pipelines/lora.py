@@ -67,7 +67,7 @@ class LoraConfig:
     def __post_init__(self) -> None:
         """Validate configuration and set defaults."""
         if self.adapter_name is None:
-            object.__setattr__(self, "adapter_name", self.name)
+            self.adapter_name = self.name
 
         if self.source == LoraSource.CIVITAI:
             if not self.civitai_id and not self.civitai_url:
@@ -443,9 +443,9 @@ def parse_loras_from_config(
                 lora_config = loras_section[ref_name]
                 parsed = parse_lora_config(lora_config, index=len(loras))
                 if not lora_config.get("name"):
-                    object.__setattr__(parsed, "name", ref_name)
+                    parsed.name = ref_name
                     if lora_config.get("adapter_name") is None:
-                        object.__setattr__(parsed, "adapter_name", ref_name)
+                        parsed.adapter_name = ref_name
                 loras.append(parsed)
                 loaded_names.add(parsed.name)
             else:
@@ -462,9 +462,9 @@ def parse_loras_from_config(
                     lora_config = loras_section[ref]
                     parsed = parse_lora_config(lora_config, index=len(loras))
                     if not lora_config.get("name"):
-                        object.__setattr__(parsed, "name", ref)
+                        parsed.name = ref
                         if lora_config.get("adapter_name") is None:
-                            object.__setattr__(parsed, "adapter_name", ref)
+                            parsed.adapter_name = ref
                     loras.append(parsed)
                     loaded_names.add(parsed.name)
                 else:
@@ -611,12 +611,12 @@ async def resolve_lora_path(
 
         # Populate trigger_words from Civitai trained_words if not already set
         if not lora.trigger_words and version.trained_words:
-            object.__setattr__(lora, "trigger_words", version.trained_words)
+            lora.trigger_words = version.trained_words
             print(f"Auto-populated trigger words from Civitai: {version.trained_words}")
 
         # Populate base_model from Civitai version if not already set
         if not lora.base_model and version.base_model:
-            object.__setattr__(lora, "base_model", version.base_model)
+            lora.base_model = version.base_model
             print(f"Auto-populated base model from Civitai: {version.base_model}")
 
         # Download
