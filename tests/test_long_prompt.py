@@ -9,7 +9,10 @@ from oneiro.pipelines.long_prompt import (
     EOS_TOKEN_ID,
     get_t5_tokens_and_weights,
     get_tokens_and_weights,
+    get_weighted_text_embeddings_flux,
+    get_weighted_text_embeddings_sd3,
     get_weighted_text_embeddings_sd15,
+    get_weighted_text_embeddings_sdxl,
     group_tokens_into_chunks,
     pad_chunks_to_same_count,
     parse_prompt_attention,
@@ -462,3 +465,365 @@ class TestGetWeightedTextEmbeddingsSD15:
 
         assert isinstance(result, tuple)
         assert len(result) == 2
+
+
+class TestGetWeightedTextEmbeddingsSDXL:
+    """Tests for get_weighted_text_embeddings_sdxl function."""
+
+    def _create_mock_pipe(self, device: str = "cpu"):
+        """Create a mock SDXL pipeline with dual encoders."""
+        pipe = Mock()
+        pipe.device = device
+
+        # Mock tokenizers (CLIP-L and CLIP-G)
+        tokenizer = Mock()
+        tokenizer.return_value = Mock(input_ids=[BOS_TOKEN_ID, 100, 101, EOS_TOKEN_ID])
+        pipe.tokenizer = tokenizer
+
+        tokenizer_2 = Mock()
+        tokenizer_2.return_value = Mock(input_ids=[BOS_TOKEN_ID, 200, 201, EOS_TOKEN_ID])
+        pipe.tokenizer_2 = tokenizer_2
+
+        # Mock text encoders
+        text_encoder = Mock()
+        text_encoder.device = device
+        text_encoder.dtype = torch.float32
+
+        def mock_encode_1(input_ids, output_hidden_states=False):
+            batch_size = input_ids.shape[0]
+            seq_len = input_ids.shape[1]
+            hidden_dim = 768  # CLIP-L uses 768
+            output = Mock()
+            output.__getitem__ = Mock(return_value=torch.randn(batch_size, seq_len, hidden_dim))
+            output.hidden_states = [
+                torch.randn(batch_size, seq_len, hidden_dim)
+                for _ in range(13)  # 12 layers + embedding
+            ]
+            return output
+
+        text_encoder.side_effect = mock_encode_1
+        text_encoder.__call__ = mock_encode_1
+        pipe.text_encoder = text_encoder
+
+        text_encoder_2 = Mock()
+        text_encoder_2.device = device
+        text_encoder_2.dtype = torch.float32
+
+        def mock_encode_2(input_ids, output_hidden_states=False):
+            batch_size = input_ids.shape[0]
+            seq_len = input_ids.shape[1]
+            hidden_dim = 1280  # CLIP-G uses 1280
+            output = Mock()
+            # Pooled output
+            output.__getitem__ = Mock(return_value=torch.randn(batch_size, hidden_dim))
+            output.hidden_states = [
+                torch.randn(batch_size, seq_len, hidden_dim)
+                for _ in range(25)  # 24 layers + embedding
+            ]
+            return output
+
+        text_encoder_2.side_effect = mock_encode_2
+        text_encoder_2.__call__ = mock_encode_2
+        pipe.text_encoder_2 = text_encoder_2
+
+        return pipe
+
+    def test_returns_tuple_of_four_tensors(self):
+        """Should return tuple of (prompt_embeds, neg_embeds, pooled, neg_pooled)."""
+        pipe = self._create_mock_pipe()
+
+        result = get_weighted_text_embeddings_sdxl(pipe, "a cat", "bad quality")
+
+        assert isinstance(result, tuple)
+        assert len(result) == 4
+        assert isinstance(result[0], torch.Tensor)  # prompt_embeds
+        assert isinstance(result[1], torch.Tensor)  # negative_prompt_embeds
+        assert isinstance(result[2], torch.Tensor)  # pooled_prompt_embeds
+        assert isinstance(result[3], torch.Tensor)  # negative_pooled_prompt_embeds
+
+    def test_empty_prompts(self):
+        """Should handle empty prompts."""
+        pipe = self._create_mock_pipe()
+
+        result = get_weighted_text_embeddings_sdxl(pipe, "", "")
+
+        assert isinstance(result, tuple)
+        assert len(result) == 4
+
+    def test_uses_correct_device(self):
+        """Should use pipe's device."""
+        pipe = self._create_mock_pipe(device="cpu")
+
+        prompt_embeds, neg_embeds, pooled, neg_pooled = get_weighted_text_embeddings_sdxl(
+            pipe, "test", "negative"
+        )
+
+        assert prompt_embeds.device.type == "cpu"
+        assert neg_embeds.device.type == "cpu"
+
+    def test_handles_weighted_prompt(self):
+        """Should process prompts with weight syntax."""
+        pipe = self._create_mock_pipe()
+
+        result = get_weighted_text_embeddings_sdxl(pipe, "a (beautiful:1.5) cat", "[ugly]")
+
+        assert isinstance(result, tuple)
+        assert len(result) == 4
+
+    def test_concatenates_encoder_outputs(self):
+        """Should concatenate CLIP-L and CLIP-G embeddings along feature dimension."""
+        pipe = self._create_mock_pipe()
+
+        prompt_embeds, _, _, _ = get_weighted_text_embeddings_sdxl(pipe, "test", "")
+
+        # SDXL concatenates 768 + 1280 = 2048 dimension
+        assert prompt_embeds.shape[-1] == 2048
+
+
+class TestGetWeightedTextEmbeddingsFlux:
+    """Tests for get_weighted_text_embeddings_flux function."""
+
+    def _create_mock_pipe(self, device: str = "cpu"):
+        """Create a mock Flux pipeline."""
+        pipe = Mock()
+        pipe.device = device
+
+        # Mock CLIP tokenizer
+        tokenizer = Mock()
+        tokenizer.return_value = Mock(input_ids=[BOS_TOKEN_ID, 100, 101, EOS_TOKEN_ID])
+        pipe.tokenizer = tokenizer
+
+        # Mock T5 tokenizer
+        tokenizer_2 = Mock()
+        tokenizer_2.return_value = Mock(input_ids=[100, 101, 102, 1])  # T5 format with EOS=1
+        tokenizer_2.eos_token_id = 1
+        pipe.tokenizer_2 = tokenizer_2
+
+        # Mock CLIP text encoder (for pooled embeddings)
+        text_encoder = Mock()
+        text_encoder.device = device
+        text_encoder.dtype = torch.float32
+
+        def mock_clip_encode(input_ids, output_hidden_states=False):
+            batch_size = input_ids.shape[0]
+            hidden_dim = 768
+            output = Mock()
+            output.pooler_output = torch.randn(batch_size, hidden_dim)
+            return output
+
+        text_encoder.side_effect = mock_clip_encode
+        text_encoder.__call__ = mock_clip_encode
+        pipe.text_encoder = text_encoder
+
+        # Mock T5 text encoder
+        text_encoder_2 = Mock()
+        text_encoder_2.device = device
+        text_encoder_2.dtype = torch.float32
+
+        def mock_t5_encode(input_ids):
+            batch_size = input_ids.shape[0]
+            seq_len = input_ids.shape[1]
+            hidden_dim = 4096  # T5-XXL uses 4096
+            output = [torch.randn(batch_size, seq_len, hidden_dim)]
+            return output
+
+        text_encoder_2.side_effect = mock_t5_encode
+        text_encoder_2.__call__ = mock_t5_encode
+        pipe.text_encoder_2 = text_encoder_2
+
+        return pipe
+
+    def test_returns_tuple_of_two_tensors(self):
+        """Should return tuple of (prompt_embeds, pooled_prompt_embeds)."""
+        pipe = self._create_mock_pipe()
+
+        result = get_weighted_text_embeddings_flux(pipe, "a cat")
+
+        assert isinstance(result, tuple)
+        assert len(result) == 2
+        assert isinstance(result[0], torch.Tensor)  # prompt_embeds (T5)
+        assert isinstance(result[1], torch.Tensor)  # pooled_prompt_embeds (CLIP)
+
+    def test_empty_prompt(self):
+        """Should handle empty prompt."""
+        pipe = self._create_mock_pipe()
+
+        result = get_weighted_text_embeddings_flux(pipe, "")
+
+        assert isinstance(result, tuple)
+        assert len(result) == 2
+
+    def test_uses_correct_device(self):
+        """Should use pipe's device."""
+        pipe = self._create_mock_pipe(device="cpu")
+
+        prompt_embeds, pooled = get_weighted_text_embeddings_flux(pipe, "test")
+
+        assert prompt_embeds.device.type == "cpu"
+        assert pooled.device.type == "cpu"
+
+    def test_handles_weighted_prompt(self):
+        """Should process prompts with weight syntax."""
+        pipe = self._create_mock_pipe()
+
+        result = get_weighted_text_embeddings_flux(pipe, "a (beautiful:1.5) cat")
+
+        assert isinstance(result, tuple)
+        assert len(result) == 2
+
+    def test_t5_embedding_dimension(self):
+        """Should return T5 embeddings with 4096 dimension."""
+        pipe = self._create_mock_pipe()
+
+        prompt_embeds, _ = get_weighted_text_embeddings_flux(pipe, "test")
+
+        assert prompt_embeds.shape[-1] == 4096
+
+    def test_pooled_embedding_dimension(self):
+        """Should return pooled CLIP embeddings with 768 dimension."""
+        pipe = self._create_mock_pipe()
+
+        _, pooled = get_weighted_text_embeddings_flux(pipe, "test")
+
+        assert pooled.shape[-1] == 768
+
+
+class TestGetWeightedTextEmbeddingsSD3:
+    """Tests for get_weighted_text_embeddings_sd3 function."""
+
+    def _create_mock_pipe(self, device: str = "cpu", has_t5: bool = True):
+        """Create a mock SD3 pipeline with triple encoders."""
+        pipe = Mock()
+        pipe.device = device
+
+        # Mock CLIP tokenizers
+        tokenizer = Mock()
+        tokenizer.return_value = Mock(input_ids=[BOS_TOKEN_ID, 100, 101, EOS_TOKEN_ID])
+        pipe.tokenizer = tokenizer
+
+        tokenizer_2 = Mock()
+        tokenizer_2.return_value = Mock(input_ids=[BOS_TOKEN_ID, 200, 201, EOS_TOKEN_ID])
+        pipe.tokenizer_2 = tokenizer_2
+
+        # Mock T5 tokenizer
+        tokenizer_3 = Mock()
+        tokenizer_3.return_value = Mock(input_ids=[300, 301, 1])  # T5 format
+        tokenizer_3.eos_token_id = 1
+        pipe.tokenizer_3 = tokenizer_3
+
+        # Mock CLIP-L encoder
+        text_encoder = Mock()
+        text_encoder.device = device
+        text_encoder.dtype = torch.float32
+
+        def mock_encode_1(input_ids, output_hidden_states=False):
+            batch_size = input_ids.shape[0]
+            seq_len = input_ids.shape[1]
+            hidden_dim = 768
+            output = Mock()
+            output.__getitem__ = Mock(return_value=torch.randn(batch_size, hidden_dim))
+            output.hidden_states = [torch.randn(batch_size, seq_len, hidden_dim) for _ in range(13)]
+            return output
+
+        text_encoder.side_effect = mock_encode_1
+        text_encoder.__call__ = mock_encode_1
+        pipe.text_encoder = text_encoder
+
+        # Mock CLIP-G encoder
+        text_encoder_2 = Mock()
+        text_encoder_2.device = device
+        text_encoder_2.dtype = torch.float32
+
+        def mock_encode_2(input_ids, output_hidden_states=False):
+            batch_size = input_ids.shape[0]
+            seq_len = input_ids.shape[1]
+            hidden_dim = 1280
+            output = Mock()
+            output.__getitem__ = Mock(return_value=torch.randn(batch_size, hidden_dim))
+            output.hidden_states = [torch.randn(batch_size, seq_len, hidden_dim) for _ in range(25)]
+            return output
+
+        text_encoder_2.side_effect = mock_encode_2
+        text_encoder_2.__call__ = mock_encode_2
+        pipe.text_encoder_2 = text_encoder_2
+
+        # Mock T5 encoder (optional)
+        if has_t5:
+            text_encoder_3 = Mock()
+            text_encoder_3.device = device
+            text_encoder_3.dtype = torch.float32
+
+            def mock_encode_3(input_ids):
+                batch_size = input_ids.shape[0]
+                seq_len = input_ids.shape[1]
+                hidden_dim = 4096
+                return [torch.randn(batch_size, seq_len, hidden_dim)]
+
+            text_encoder_3.side_effect = mock_encode_3
+            text_encoder_3.__call__ = mock_encode_3
+            pipe.text_encoder_3 = text_encoder_3
+        else:
+            pipe.text_encoder_3 = None
+
+        return pipe
+
+    def test_returns_tuple_of_four_tensors(self):
+        """Should return tuple of (prompt_embeds, neg_embeds, pooled, neg_pooled)."""
+        pipe = self._create_mock_pipe()
+
+        result = get_weighted_text_embeddings_sd3(pipe, "a cat", "bad quality")
+
+        assert isinstance(result, tuple)
+        assert len(result) == 4
+        assert isinstance(result[0], torch.Tensor)
+        assert isinstance(result[1], torch.Tensor)
+        assert isinstance(result[2], torch.Tensor)
+        assert isinstance(result[3], torch.Tensor)
+
+    def test_empty_prompts(self):
+        """Should handle empty prompts."""
+        pipe = self._create_mock_pipe()
+
+        result = get_weighted_text_embeddings_sd3(pipe, "", "")
+
+        assert isinstance(result, tuple)
+        assert len(result) == 4
+
+    def test_uses_correct_device(self):
+        """Should use pipe's device."""
+        pipe = self._create_mock_pipe(device="cpu")
+
+        prompt_embeds, neg_embeds, pooled, neg_pooled = get_weighted_text_embeddings_sd3(
+            pipe, "test", "negative"
+        )
+
+        assert prompt_embeds.device.type == "cpu"
+        assert neg_embeds.device.type == "cpu"
+
+    def test_handles_weighted_prompt(self):
+        """Should process prompts with weight syntax."""
+        pipe = self._create_mock_pipe()
+
+        result = get_weighted_text_embeddings_sd3(pipe, "a (beautiful:1.5) cat", "[ugly]")
+
+        assert isinstance(result, tuple)
+        assert len(result) == 4
+
+    def test_pooled_embeddings_concatenated(self):
+        """Should concatenate pooled embeddings from CLIP-L and CLIP-G."""
+        pipe = self._create_mock_pipe()
+
+        _, _, pooled, neg_pooled = get_weighted_text_embeddings_sd3(pipe, "test", "negative")
+
+        # Pooled: 768 (CLIP-L) + 1280 (CLIP-G) = 2048
+        assert pooled.shape[-1] == 2048
+        assert neg_pooled.shape[-1] == 2048
+
+    def test_without_t5_encoder(self):
+        """Should work without T5 encoder (creates zero tensor)."""
+        pipe = self._create_mock_pipe(has_t5=False)
+
+        result = get_weighted_text_embeddings_sd3(pipe, "test", "negative")
+
+        assert isinstance(result, tuple)
+        assert len(result) == 4
