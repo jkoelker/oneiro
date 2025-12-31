@@ -367,15 +367,7 @@ class TestPadChunksToSameCount:
 
     def test_empty_chunk_structure(self):
         """Padded chunks should have correct BOS/EOS structure."""
-        chunks_a = [[1, 2]]
-        weights_a = [[1.0, 1.0]]
-        chunks_b: list[list[int]] = []
-        weights_b: list[list[float]] = []
-
-        # Edge case: B is empty (should get padded to match A)
-        # This creates empty lists which pad_chunks_to_same_count doesn't handle
-        # But in practice, empty prompts produce at least one chunk
-        # Let's test a realistic case
+        # Realistic case: B has fewer chunks than A but the same chunk length
         chunks_a = [[1] * 77, [2] * 77]  # 2 chunks
         weights_a = [[1.0] * 77, [1.0] * 77]
         chunks_b = [[3] * 77]  # 1 chunk
