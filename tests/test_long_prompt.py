@@ -694,6 +694,30 @@ class TestGetWeightedTextEmbeddingsSDXL:
         # SDXL concatenates 768 + 1280 = 2048 dimension
         assert prompt_embeds.shape[-1] == 2048
 
+    def test_handles_only_break_keywords(self):
+        """Should handle prompts that are only BREAK keywords (edge case).
+
+        When input is only BREAK keywords, tokenization produces no actual tokens,
+        resulting in empty chunk lists. The function should handle this gracefully
+        by creating at least one valid empty chunk instead of failing.
+        """
+        pipe = self._create_mock_pipe()
+
+        # Configure tokenizers to return only BOS/EOS (no content tokens) for BREAK-only input
+        # This simulates what happens when the prompt text after parsing is empty
+        pipe.tokenizer.return_value = Mock(input_ids=[BOS_TOKEN_ID, EOS_TOKEN_ID])
+        pipe.tokenizer_2.return_value = Mock(input_ids=[BOS_TOKEN_ID, EOS_TOKEN_ID])
+
+        # This should not raise - the function should handle empty chunks gracefully
+        result = get_weighted_text_embeddings_sdxl(pipe, "BREAK", "BREAK BREAK")
+
+        assert isinstance(result, tuple)
+        assert len(result) == 4
+        assert isinstance(result[0], torch.Tensor)  # prompt_embeds
+        assert isinstance(result[1], torch.Tensor)  # negative_prompt_embeds
+        assert isinstance(result[2], torch.Tensor)  # pooled_prompt_embeds
+        assert isinstance(result[3], torch.Tensor)  # negative_pooled_prompt_embeds
+
 
 class TestGetWeightedTextEmbeddingsFlux:
     """Tests for get_weighted_text_embeddings_flux function."""
@@ -971,3 +995,27 @@ class TestGetWeightedTextEmbeddingsSD3:
 
         assert isinstance(result, tuple)
         assert len(result) == 4
+
+    def test_handles_only_break_keywords(self):
+        """Should handle prompts that are only BREAK keywords (edge case).
+
+        When input is only BREAK keywords, tokenization produces no actual tokens,
+        resulting in empty chunk lists. The function should handle this gracefully
+        by creating at least one valid empty chunk instead of failing.
+        """
+        pipe = self._create_mock_pipe()
+
+        # Configure CLIP tokenizers to return only BOS/EOS (no content tokens) for BREAK-only input
+        # This simulates what happens when the prompt text after parsing is empty
+        pipe.tokenizer.return_value = Mock(input_ids=[BOS_TOKEN_ID, EOS_TOKEN_ID])
+        pipe.tokenizer_2.return_value = Mock(input_ids=[BOS_TOKEN_ID, EOS_TOKEN_ID])
+
+        # This should not raise - the function should handle empty chunks gracefully
+        result = get_weighted_text_embeddings_sd3(pipe, "BREAK", "BREAK BREAK")
+
+        assert isinstance(result, tuple)
+        assert len(result) == 4
+        assert isinstance(result[0], torch.Tensor)  # prompt_embeds
+        assert isinstance(result[1], torch.Tensor)  # negative_prompt_embeds
+        assert isinstance(result[2], torch.Tensor)  # pooled_prompt_embeds
+        assert isinstance(result[3], torch.Tensor)  # negative_pooled_prompt_embeds

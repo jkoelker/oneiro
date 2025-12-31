@@ -206,10 +206,8 @@ def group_tokens_into_chunks(
             if current_tokens:
                 # Pad and finalize current chunk
                 padding_len = MAX_TOKENS_PER_CHUNK - len(current_tokens)
-                chunk = (
-                    [BOS_TOKEN_ID] + current_tokens + [EOS_TOKEN_ID] * padding_len + [EOS_TOKEN_ID]
-                )
-                chunk_weights = [1.0] + current_weights + [1.0] * padding_len + [1.0]
+                chunk = [BOS_TOKEN_ID] + current_tokens + [EOS_TOKEN_ID] * (padding_len + 1)
+                chunk_weights = [1.0] + current_weights + [1.0] * (padding_len + 1)
                 new_token_ids.append(chunk)
                 new_weights.append(chunk_weights)
                 current_tokens = []
@@ -232,8 +230,8 @@ def group_tokens_into_chunks(
     if current_tokens:
         if pad_last_block:
             padding_len = MAX_TOKENS_PER_CHUNK - len(current_tokens)
-            chunk = [BOS_TOKEN_ID] + current_tokens + [EOS_TOKEN_ID] * padding_len + [EOS_TOKEN_ID]
-            chunk_weights = [1.0] + current_weights + [1.0] * padding_len + [1.0]
+            chunk = [BOS_TOKEN_ID] + current_tokens + [EOS_TOKEN_ID] * (padding_len + 1)
+            chunk_weights = [1.0] + current_weights + [1.0] * (padding_len + 1)
         else:
             chunk = [BOS_TOKEN_ID] + current_tokens + [EOS_TOKEN_ID]
             chunk_weights = [1.0] + current_weights + [1.0]
@@ -514,6 +512,24 @@ def get_weighted_text_embeddings_sdxl(
         neg_tokens_2, neg_weights_2, pad_last_block=pad_last_block
     )
 
+    # Handle edge case where chunking produces empty lists (e.g., prompt of only BREAK keywords)
+    # Create an empty chunk to ensure encoders have at least one chunk to process
+    empty_chunk = [BOS_TOKEN_ID] + [EOS_TOKEN_ID] * (MAX_TOKENS_PER_CHUNK + 1)
+    empty_weights = [1.0] * 77
+
+    if not prompt_chunks_1:
+        prompt_chunks_1 = [empty_chunk]
+        prompt_chunk_weights_1 = [empty_weights]
+    if not neg_chunks_1:
+        neg_chunks_1 = [empty_chunk]
+        neg_chunk_weights_1 = [empty_weights]
+    if not prompt_chunks_2:
+        prompt_chunks_2 = [empty_chunk]
+        prompt_chunk_weights_2 = [empty_weights]
+    if not neg_chunks_2:
+        neg_chunks_2 = [empty_chunk]
+        neg_chunk_weights_2 = [empty_weights]
+
     # Ensure same number of chunks for each encoder (in case of different BREAK marker counts)
     prompt_chunks_1, prompt_chunk_weights_1, neg_chunks_1, neg_chunk_weights_1 = (
         pad_chunks_to_same_count(
@@ -753,6 +769,24 @@ def get_weighted_text_embeddings_sd3(
     neg_chunks_2, neg_chunk_weights_2 = group_tokens_into_chunks(
         neg_tokens_2, neg_weights_2, pad_last_block=pad_last_block
     )
+
+    # Handle edge case where chunking produces empty lists (e.g., prompt of only BREAK keywords)
+    # Create an empty chunk to ensure encoders have at least one chunk to process
+    empty_chunk = [BOS_TOKEN_ID] + [EOS_TOKEN_ID] * (MAX_TOKENS_PER_CHUNK + 1)
+    empty_weights = [1.0] * 77
+
+    if not prompt_chunks_1:
+        prompt_chunks_1 = [empty_chunk]
+        prompt_chunk_weights_1 = [empty_weights]
+    if not neg_chunks_1:
+        neg_chunks_1 = [empty_chunk]
+        neg_chunk_weights_1 = [empty_weights]
+    if not prompt_chunks_2:
+        prompt_chunks_2 = [empty_chunk]
+        prompt_chunk_weights_2 = [empty_weights]
+    if not neg_chunks_2:
+        neg_chunks_2 = [empty_chunk]
+        neg_chunk_weights_2 = [empty_weights]
 
     # Ensure same number of chunks for each encoder (in case of different BREAK marker counts)
     prompt_chunks_1, prompt_chunk_weights_1, neg_chunks_1, neg_chunk_weights_1 = (
