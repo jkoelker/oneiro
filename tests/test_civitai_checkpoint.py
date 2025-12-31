@@ -556,8 +556,9 @@ class TestCivitaiCheckpointPipelineGenerate:
         ):
             pipeline.generate("test prompt", negative_prompt="bad quality")
 
-        # Negative prompt is handled in _encode_prompts_to_embeddings for CLIP pipelines
-        # Just verify generate() completed successfully
+        # SDXL handles negative prompts via embeddings (negative_prompt_embeds,
+        # negative_pooled_prompt_embeds) computed in _encode_prompts_to_embeddings,
+        # not via direct negative_prompt kwarg. Verify the mock was called correctly.
         mock_pipe.assert_called_once()
 
     def test_generate_omits_negative_prompt_for_flux(self):
