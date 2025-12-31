@@ -819,7 +819,13 @@ def get_weighted_text_embeddings_sd3(
     negative_pooled_prompt_embeds_1 = None
     negative_pooled_prompt_embeds_2 = None
 
-    dtype = pipe.text_encoder.dtype
+    # Determine dtype - use text_encoder if available, otherwise use text_encoder_2's dtype
+    if hasattr(pipe, "text_encoder") and pipe.text_encoder is not None:
+        dtype = pipe.text_encoder.dtype
+    elif hasattr(pipe, "text_encoder_2") and pipe.text_encoder_2 is not None:
+        dtype = pipe.text_encoder_2.dtype
+    else:
+        dtype = torch.float32  # Fallback default
 
     for i in range(len(prompt_chunks_1)):
         # Positive - encoder 1
