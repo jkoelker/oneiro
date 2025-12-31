@@ -40,6 +40,7 @@ Config uses layered TOML with hot-reload:
 | `HF_HOME` | No | Hugging Face cache directory |
 | `CIVITAI_API_KEY` | No | Civitai API key for downloading restricted models |
 | `CIVITAI_CACHE_DIR` | No | Civitai cache directory (default: `~/.cache/civitai`) |
+| `ENABLE_PROGRESS_BARS` | No | Set to `1` to enable tqdm progress bars (disabled by default) |
 
 ## Discord Commands
 
