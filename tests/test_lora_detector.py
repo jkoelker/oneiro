@@ -421,13 +421,13 @@ class TestPipelineBaseModelMap:
 
     def test_sdxl_compatible_with_pony(self):
         """SDXL pipeline is compatible with Pony LoRAs."""
-        from oneiro.lora_detector import PIPELINE_BASE_MODEL_MAP
+        from oneiro.pipelines.lora import PIPELINE_BASE_MODEL_MAP
 
         assert "Pony" in PIPELINE_BASE_MODEL_MAP["sdxl"]
 
     def test_flux_compatible_variants(self):
         """Flux1 pipeline is compatible with various Flux.1 variants."""
-        from oneiro.lora_detector import PIPELINE_BASE_MODEL_MAP
+        from oneiro.pipelines.lora import PIPELINE_BASE_MODEL_MAP
 
         flux_bases = PIPELINE_BASE_MODEL_MAP["flux1"]
         assert "Flux.1" in flux_bases

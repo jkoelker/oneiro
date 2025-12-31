@@ -9,8 +9,6 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from oneiro.pipelines.lora import LoraConfig
 
-# Re-export PIPELINE_BASE_MODEL_MAP from lora.py for backward compatibility
-# The canonical definition is in lora.py to avoid duplication
 from oneiro.pipelines.lora import PIPELINE_BASE_MODEL_MAP
 
 
