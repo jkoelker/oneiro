@@ -175,7 +175,11 @@ def group_tokens_into_chunks(
 ) -> tuple[list[list[int]], list[list[float]]]:
     """Group tokens into 77-token chunks with BOS/EOS tokens.
 
-    Each chunk is structured as: [BOS] + 75 tokens + [EOS]
+    Each chunk is structured as: [BOS] + content tokens + [EOS padding] + [EOS]
+    where content tokens are up to 75 tokens and EOS padding fills the remaining
+    space to reach 77 total tokens. For a full chunk: [BOS] + 75 tokens + [EOS].
+    For a partial chunk with N tokens (N < 75): [BOS] + N tokens + (75-N) EOS + [EOS].
+
     BREAK markers (-1) force a new chunk boundary.
 
     Args:
