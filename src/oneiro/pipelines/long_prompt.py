@@ -648,14 +648,21 @@ def get_weighted_text_embeddings_flux(
         - prompt_embeds: T5 embeddings with weights applied
         - pooled_prompt_embeds: Averaged CLIP pooled embeddings
     """
-    # Determine device from pipeline, falling back to text_encoder's device
+    # Determine device from pipeline, falling back to encoder devices
     if hasattr(pipe, "device"):
         device = pipe.device
     elif hasattr(pipe, "text_encoder") and hasattr(pipe.text_encoder, "device"):
         device = pipe.text_encoder.device
+    elif hasattr(pipe, "text_encoder_2") and hasattr(pipe.text_encoder_2, "device"):
+        device = pipe.text_encoder_2.device
     else:
-        # Last resort fallback
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        # Last resort fallback - check all common device types
+        if torch.cuda.is_available():
+            device = "cuda"
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            device = "mps"
+        else:
+            device = "cpu"
 
     # Use "empty" placeholder for empty prompts (consistent with get_tokens_and_weights)
     effective_prompt = prompt if prompt else "empty"
