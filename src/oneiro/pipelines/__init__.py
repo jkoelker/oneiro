@@ -152,6 +152,30 @@ class PipelineManager:
         if self.pipeline is None:
             raise RuntimeError("No pipeline loaded")
 
+        loras: list[LoraConfig] | None = kwargs.pop("loras", None)
+        if loras:
+            pipeline_type = None
+            if self.current_model:
+                model_config = self.config.get("models", self.current_model)
+                if model_config:
+                    pipeline_type = model_config.get("type")
+
+            resolved_loras: list[LoraConfig] = []
+            for lora in loras:
+                try:
+                    await resolve_lora_path(
+                        lora,
+                        civitai_client=self._civitai_client,
+                        pipeline_type=pipeline_type,
+                        validate_compatibility=True,
+                    )
+                    resolved_loras.append(lora)
+                except Exception as e:
+                    print(f"Warning: Failed to resolve LoRA {lora.name}: {e}")
+
+            if resolved_loras:
+                kwargs["loras"] = resolved_loras
+
         return await asyncio.to_thread(
             self.pipeline.generate,
             prompt,

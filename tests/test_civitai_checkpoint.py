@@ -1,5 +1,6 @@
 """Tests for CivitAI checkpoint pipeline."""
 
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -14,6 +15,7 @@ from oneiro.pipelines.civitai_checkpoint import (
     get_diffusers_pipeline_class,
     get_pipeline_config_for_base_model,
 )
+from oneiro.pipelines.lora import LoraConfig, LoraSource
 
 
 class TestPipelineConfig:
@@ -1156,3 +1158,166 @@ class TestEncodePromptsToEmbeddings:
         mock_func.assert_called_once()
         assert result["prompt_embeds"] is mock_prompt
         assert result["negative_prompt_embeds"] is mock_neg_prompt
+
+
+class TestDynamicLoraGeneration:
+    """Tests for dynamic LoRA loading during generation."""
+
+    def _create_pipeline_with_mocks(self):
+        """Create a pipeline with common mocks for dynamic LoRA tests."""
+        pipeline = CivitaiCheckpointPipeline()
+        pipeline._pipeline_config = PipelineConfig(
+            pipeline_class="StableDiffusionXLPipeline",
+            default_steps=25,
+            default_guidance_scale=7.0,
+            default_width=1024,
+            default_height=1024,
+        )
+        mock_pipe = MagicMock()
+        mock_image = MagicMock()
+        mock_image.width = 1024
+        mock_image.height = 1024
+        mock_pipe.return_value.images = [mock_image]
+        pipeline.pipe = mock_pipe
+        pipeline._cpu_offload = False
+        return pipeline
+
+    def test_generate_with_dynamic_loras(self):
+        """generate() loads dynamic LoRAs passed via kwargs."""
+        pipeline = self._create_pipeline_with_mocks()
+
+        lora = LoraConfig(name="test-lora", source=LoraSource.LOCAL, path="/fake/path.safetensors")
+        lora._resolved_path = Path("/fake/path.safetensors")
+
+        with (
+            patch("oneiro.pipelines.civitai_checkpoint.torch"),
+            patch.object(pipeline, "_encode_prompts_to_embeddings"),
+            patch.object(pipeline, "_load_dynamic_loras") as mock_load,
+            patch.object(pipeline, "_restore_static_loras") as mock_restore,
+        ):
+            pipeline.generate("test prompt", loras=[lora])
+
+        mock_load.assert_called_once_with([lora])
+        mock_restore.assert_called_once()
+
+    def test_generate_restores_static_loras_after_dynamic(self):
+        """generate() restores static LoRAs after using dynamic ones."""
+        pipeline = self._create_pipeline_with_mocks()
+
+        static_lora = LoraConfig(
+            name="static-lora", source=LoraSource.LOCAL, path="/static.safetensors"
+        )
+        pipeline._static_lora_configs = [static_lora]
+
+        dynamic_lora = LoraConfig(
+            name="dynamic-lora", source=LoraSource.LOCAL, path="/dynamic.safetensors"
+        )
+        dynamic_lora._resolved_path = Path("/dynamic.safetensors")
+
+        with (
+            patch("oneiro.pipelines.civitai_checkpoint.torch"),
+            patch.object(pipeline, "_encode_prompts_to_embeddings"),
+            patch.object(pipeline, "unload_loras") as mock_unload,
+            patch.object(pipeline, "load_single_lora", return_value="dynamic-lora"),
+            patch.object(pipeline, "set_lora_adapters"),
+            patch.object(pipeline, "load_loras_sync") as mock_load_sync,
+        ):
+            pipeline.generate("test prompt", loras=[dynamic_lora])
+
+        assert mock_unload.call_count == 2
+        mock_load_sync.assert_called_once_with([static_lora])
+
+    def test_generate_handles_dynamic_lora_loading_failure(self):
+        """generate() restores static LoRAs when dynamic loading fails."""
+        pipeline = self._create_pipeline_with_mocks()
+
+        static_lora = LoraConfig(
+            name="static-lora", source=LoraSource.LOCAL, path="/static.safetensors"
+        )
+        pipeline._static_lora_configs = [static_lora]
+
+        dynamic_lora = LoraConfig(name="bad-lora", source=LoraSource.LOCAL, path="/bad.safetensors")
+        dynamic_lora._resolved_path = Path("/bad.safetensors")
+
+        with (
+            patch("oneiro.pipelines.civitai_checkpoint.torch"),
+            patch.object(pipeline, "_encode_prompts_to_embeddings"),
+            patch.object(pipeline, "_load_dynamic_loras", side_effect=RuntimeError("Load failed")),
+            patch.object(pipeline, "_restore_static_loras") as mock_restore,
+        ):
+            with pytest.raises(RuntimeError, match="Load failed"):
+                pipeline.generate("test prompt", loras=[dynamic_lora])
+
+        mock_restore.assert_called_once()
+
+    def test_generate_cleanup_on_generation_failure(self):
+        """generate() cleans up dynamic LoRAs even if generation fails."""
+        pipeline = self._create_pipeline_with_mocks()
+
+        dynamic_lora = LoraConfig(
+            name="dynamic-lora", source=LoraSource.LOCAL, path="/dynamic.safetensors"
+        )
+        dynamic_lora._resolved_path = Path("/dynamic.safetensors")
+
+        pipeline.pipe.side_effect = RuntimeError("Generation failed")
+
+        with (
+            patch("oneiro.pipelines.civitai_checkpoint.torch"),
+            patch.object(pipeline, "_encode_prompts_to_embeddings"),
+            patch.object(pipeline, "_load_dynamic_loras"),
+            patch.object(pipeline, "_restore_static_loras") as mock_restore,
+        ):
+            with pytest.raises(RuntimeError, match="Generation failed"):
+                pipeline.generate("test prompt", loras=[dynamic_lora])
+
+        mock_restore.assert_called_once()
+
+    def test_generate_without_dynamic_loras_skips_lora_handling(self):
+        """generate() skips LoRA handling when no dynamic LoRAs provided."""
+        pipeline = self._create_pipeline_with_mocks()
+
+        with (
+            patch("oneiro.pipelines.civitai_checkpoint.torch"),
+            patch.object(pipeline, "_encode_prompts_to_embeddings"),
+            patch.object(pipeline, "_load_dynamic_loras") as mock_load,
+            patch.object(pipeline, "_restore_static_loras") as mock_restore,
+        ):
+            pipeline.generate("test prompt")
+
+        mock_load.assert_not_called()
+        mock_restore.assert_not_called()
+
+    def test_load_dynamic_loras_respects_cpu_offload(self):
+        """_load_dynamic_loras() skips .to(device) when cpu_offload enabled."""
+        pipeline = self._create_pipeline_with_mocks()
+        pipeline._cpu_offload = True
+
+        lora = LoraConfig(name="test-lora", source=LoraSource.LOCAL, path="/fake.safetensors")
+        lora._resolved_path = Path("/fake.safetensors")
+
+        with (
+            patch.object(pipeline, "unload_loras"),
+            patch.object(pipeline, "load_single_lora", return_value="test-lora"),
+            patch.object(pipeline, "set_lora_adapters"),
+        ):
+            pipeline._load_dynamic_loras([lora])
+
+        pipeline.pipe.to.assert_not_called()
+
+    def test_load_dynamic_loras_moves_to_device_without_cpu_offload(self):
+        """_load_dynamic_loras() calls .to(device) when cpu_offload disabled."""
+        pipeline = self._create_pipeline_with_mocks()
+        pipeline._cpu_offload = False
+        pipeline._device = "cuda"
+
+        lora = LoraConfig(name="test-lora", source=LoraSource.LOCAL, path="/fake.safetensors")
+        lora._resolved_path = Path("/fake.safetensors")
+
+        with (
+            patch.object(pipeline, "unload_loras"),
+            patch.object(pipeline, "load_single_lora", return_value="test-lora"),
+            patch.object(pipeline, "set_lora_adapters"),
+        ):
+            pipeline._load_dynamic_loras([lora])
+
+        pipeline.pipe.to.assert_called_once_with("cuda")

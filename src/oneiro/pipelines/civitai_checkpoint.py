@@ -20,7 +20,7 @@ from oneiro.pipelines.long_prompt import (
     get_weighted_text_embeddings_sd15,
     get_weighted_text_embeddings_sdxl,
 )
-from oneiro.pipelines.lora import LoraLoaderMixin, parse_loras_from_model_config
+from oneiro.pipelines.lora import LoraConfig, LoraLoaderMixin, parse_loras_from_model_config
 
 if TYPE_CHECKING:
     from oneiro.civitai import CivitaiClient, ModelVersion
@@ -518,6 +518,8 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
         self._base_model: str | None = None
         self._full_config: dict[str, Any] | None = None
         self._current_scheduler: str | None = None
+        self._static_lora_configs: list[LoraConfig] = []
+        self._cpu_offload: bool = False
 
     def load(self, model_config: dict[str, Any], full_config: dict[str, Any] | None = None) -> None:
         """Load checkpoint from config (synchronous, requires checkpoint_path).
@@ -631,7 +633,8 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
 
         # Apply optimizations
         cpu_offload = model_config.get("cpu_offload", True)
-        if cpu_offload and self._device == "cuda":
+        self._cpu_offload = cpu_offload and self._device == "cuda"
+        if self._cpu_offload:
             self.pipe.enable_model_cpu_offload()
         elif self._device == "cuda":
             self.pipe.to("cuda")
@@ -643,11 +646,13 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
             if hasattr(self.pipe.vae, "enable_slicing"):
                 self.pipe.vae.enable_slicing()
 
-        # Load LoRAs if configured
         loras = parse_loras_from_model_config(model_config)
         if loras:
             print(f"  Loading {len(loras)} LoRA(s)...")
             self.load_loras_sync(loras)
+            self._static_lora_configs = list(loras)
+        else:
+            self._static_lora_configs = []
 
         # Load embeddings if full_config provided
         if self._full_config:
@@ -743,6 +748,8 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
               pass the resulting image to the pipeline.
             - ``strength``: Strength parameter for img2img generation, used
               when ``init_image`` is provided. Defaults to ``0.75``.
+            - ``loras``: List of LoraConfig objects for dynamic LoRA loading.
+              These are loaded before generation and unloaded after.
 
             Any other keyword arguments are passed through unchanged to the
             underlying diffusers pipeline call and may be used to control
@@ -765,7 +772,50 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
         if scheduler_override:
             self.configure_scheduler(scheduler_override)
 
-        # Use defaults from pipeline config
+        dynamic_loras = kwargs.pop("loras", None)
+        has_dynamic_loras = False
+        if dynamic_loras:
+            # Mark that we are entering a dynamic LoRA context before loading,
+            # so that failures during loading can be properly rolled back.
+            has_dynamic_loras = True
+            try:
+                self._load_dynamic_loras(dynamic_loras)
+            except Exception:
+                # If loading dynamic LoRAs fails after modifying the pipeline
+                # state (for example, after unloading static LoRAs), attempt
+                # to restore the original static LoRAs before propagating
+                # the error.
+                self._restore_static_loras()
+                has_dynamic_loras = False
+                raise
+
+        try:
+            return self._run_generation(
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+                width=width,
+                height=height,
+                seed=seed,
+                steps=steps,
+                guidance_scale=guidance_scale,
+                **kwargs,
+            )
+        finally:
+            if has_dynamic_loras:
+                self._restore_static_loras()
+
+    def _run_generation(
+        self,
+        prompt: str,
+        negative_prompt: str | None,
+        width: int | None,
+        height: int | None,
+        seed: int,
+        steps: int | None,
+        guidance_scale: float | None,
+        **kwargs: Any,
+    ) -> GenerationResult:
+        assert self._pipeline_config is not None
         width = width or self._pipeline_config.default_width
         height = height or self._pipeline_config.default_height
         steps = steps or self._pipeline_config.default_steps
@@ -823,6 +873,47 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
             steps=steps,
             guidance_scale=guidance_scale,
         )
+
+    def _load_dynamic_loras(self, loras: list[LoraConfig]) -> None:
+        if self.pipe is None or not loras:
+            return
+
+        lora_configs: list[LoraConfig] = [cfg for cfg in loras if isinstance(cfg, LoraConfig)]
+        if not lora_configs:
+            return
+
+        self.unload_loras()
+
+        # Only move pipeline to device manually when CPU offload is not enabled.
+        # With CPU offload, diffusers manages device placement automatically.
+        if not self._cpu_offload:
+            self.pipe.to(self._device)
+
+        loaded_names: list[str] = []
+        loaded_weights: list[float] = []
+
+        for lora in lora_configs:
+            try:
+                name = self.load_single_lora(lora)
+                loaded_names.append(name)
+                loaded_weights.append(lora.weight)
+                print(f"Loaded dynamic LoRA: {lora.name} (weight={lora.weight})")
+            except Exception as e:
+                print(f"Warning: Failed to load LoRA {lora.name}: {e}")
+
+        if loaded_names:
+            self.set_lora_adapters(loaded_names, loaded_weights)
+
+    def _restore_static_loras(self) -> None:
+        self.unload_loras()
+
+        if not self._static_lora_configs:
+            return
+
+        if not self._cpu_offload:
+            self.pipe.to(self._device)
+        self.load_loras_sync(self._static_lora_configs)
+        print(f"Restored {len(self._static_lora_configs)} static LoRA(s)")
 
     @property
     def pipeline_config(self) -> PipelineConfig | None:
