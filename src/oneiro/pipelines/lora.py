@@ -489,8 +489,10 @@ def parse_loras_from_config(
 
 
 # Pipeline type to Civitai base model mapping
+# FLUX.1 and FLUX.2 are NOT LoRA-compatible due to different transformer architectures
 PIPELINE_BASE_MODEL_MAP: dict[str, list[str]] = {
-    "flux2": ["Flux.1 D", "Flux.1 S", "Flux.1", "Flux.2", "Flux.1 Dev", "Flux.1 Schnell"],
+    "flux1": ["Flux.1 D", "Flux.1 S", "Flux.1", "Flux.1 Dev", "Flux.1 Schnell"],
+    "flux2": ["Flux.2"],
     "zimage": ["ZImageTurbo", "ZImageBase", "Z-Image"],
     "qwen": ["Qwen", "Qwen-Image"],
     "sdxl": ["SDXL 1.0", "SDXL Turbo", "SDXL Lightning", "Pony", "Illustrious"],

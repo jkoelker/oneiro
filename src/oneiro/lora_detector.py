@@ -10,7 +10,11 @@ if TYPE_CHECKING:
     from oneiro.pipelines.lora import LoraConfig
 
 PIPELINE_BASE_MODEL_MAP: dict[str, list[str]] = {
-    "flux2": ["Flux.1 D", "Flux.1 S", "Flux.1", "Flux.2", "Flux.1 Dev", "Flux.1 Schnell", "Flux"],
+    # FLUX.1 and FLUX.2 use different transformer architectures and are NOT LoRA-compatible:
+    # - FLUX.1: FluxTransformer2DModel (19 double-stream + 38 single-stream blocks, T5+CLIP encoders)
+    # - FLUX.2: Flux2Transformer2DModel (8 double-stream + 48 single-stream blocks, Mistral encoder)
+    "flux1": ["Flux.1 D", "Flux.1 S", "Flux.1", "Flux.1 Dev", "Flux.1 Schnell"],
+    "flux2": ["Flux.2"],
     "zimage": ["ZImageTurbo", "ZImageBase", "Z-Image"],
     "qwen": ["Qwen", "Qwen-Image"],
     "sdxl": ["SDXL 1.0", "SDXL Turbo", "SDXL Lightning", "Pony", "Illustrious"],

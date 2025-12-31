@@ -615,10 +615,12 @@ class TestIsLoraCompatible:
     """Tests for is_lora_compatible function."""
 
     def test_flux_compatible(self):
-        """Flux.1 LoRAs compatible with flux2 pipeline."""
-        assert is_lora_compatible("flux2", "Flux.1 Dev")
-        assert is_lora_compatible("flux2", "Flux.1 Schnell")
-        assert is_lora_compatible("flux2", "Flux.1 D")
+        """Flux.1 LoRAs compatible with flux1 pipeline (not flux2)."""
+        assert is_lora_compatible("flux1", "Flux.1 Dev")
+        assert is_lora_compatible("flux1", "Flux.1 Schnell")
+        assert is_lora_compatible("flux1", "Flux.1 D")
+        assert is_lora_compatible("flux2", "Flux.2")
+        assert not is_lora_compatible("flux2", "Flux.1 Dev")
 
     def test_sdxl_compatible(self):
         """SDXL LoRAs compatible with sdxl pipeline."""
@@ -642,8 +644,8 @@ class TestIsLoraCompatible:
 
     def test_case_insensitive(self):
         """Comparison is case-insensitive."""
-        assert is_lora_compatible("flux2", "flux.1 dev")
-        assert is_lora_compatible("flux2", "FLUX.1 DEV")
+        assert is_lora_compatible("flux1", "flux.1 dev")
+        assert is_lora_compatible("flux1", "FLUX.1 DEV")
 
 
 class TestLoraIncompatibleError:

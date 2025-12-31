@@ -124,8 +124,8 @@ class TestAutoLoraDetector:
         assert len(matches) == 0
 
     def test_match_flux_pipeline(self, detector):
-        """Matches Flux LoRAs for flux pipeline."""
-        matches = detector.match("photorealistic portrait", "flux2")
+        """Matches Flux.1 LoRAs for flux1 pipeline."""
+        matches = detector.match("photorealistic portrait", "flux1")
         assert len(matches) == 1
         assert matches[0].lora.name == "realism-flux"
 
@@ -372,9 +372,9 @@ class TestPipelineBaseModelMap:
         assert "Pony" in PIPELINE_BASE_MODEL_MAP["sdxl"]
 
     def test_flux_compatible_variants(self):
-        """Flux pipeline is compatible with various Flux variants."""
+        """Flux1 pipeline is compatible with various Flux.1 variants."""
         from oneiro.lora_detector import PIPELINE_BASE_MODEL_MAP
 
-        flux_bases = PIPELINE_BASE_MODEL_MAP["flux2"]
+        flux_bases = PIPELINE_BASE_MODEL_MAP["flux1"]
         assert "Flux.1" in flux_bases
         assert "Flux.1 Dev" in flux_bases
