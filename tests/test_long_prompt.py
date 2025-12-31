@@ -771,6 +771,35 @@ class TestGetWeightedTextEmbeddingsFlux:
 
         assert pooled.shape[-1] == 768
 
+    def test_break_only_prompt_creates_fallback_chunk(self):
+        """Should handle BREAK-only prompts by creating fallback empty chunk.
+
+        When a prompt consists only of BREAK keywords, clip_chunks would be empty,
+        which would cause torch.stack to fail. The function should create a fallback
+        empty chunk in this case.
+        """
+        pipe = self._create_mock_pipe()
+
+        # BREAK-only prompt would result in empty clip_chunks without the fix
+        result = get_weighted_text_embeddings_flux(pipe, "BREAK")
+
+        # Should not raise and should return valid tensors
+        assert isinstance(result, tuple)
+        assert len(result) == 2
+        assert isinstance(result[0], torch.Tensor)  # prompt_embeds
+        assert isinstance(result[1], torch.Tensor)  # pooled_prompt_embeds
+
+    def test_multiple_breaks_only_creates_fallback_chunk(self):
+        """Should handle multiple BREAK keywords without other content."""
+        pipe = self._create_mock_pipe()
+
+        result = get_weighted_text_embeddings_flux(pipe, "BREAK BREAK BREAK")
+
+        assert isinstance(result, tuple)
+        assert len(result) == 2
+        assert isinstance(result[0], torch.Tensor)
+        assert isinstance(result[1], torch.Tensor)
+
 
 class TestGetWeightedTextEmbeddingsSD3:
     """Tests for get_weighted_text_embeddings_sd3 function."""

@@ -642,6 +642,14 @@ def get_weighted_text_embeddings_flux(
         clip_tokens, clip_weights, pad_last_block=True
     )
 
+    # Handle edge case: if no chunks were produced (e.g., prompt was only BREAK keywords),
+    # create an empty chunk to ensure we have at least one embedding
+    if not clip_chunks:
+        empty_chunk = [BOS_TOKEN_ID] + [EOS_TOKEN_ID] * (MAX_TOKENS_PER_CHUNK + 1)
+        clip_chunks = [empty_chunk]
+        # Note: clip_chunk_weights is not used for pooled embeddings but we maintain
+        # the variable for consistency with the chunking API
+
     # Get T5 tokens for main embeddings (no chunking needed, T5 handles long sequences)
     t5_tokens, t5_weights = get_t5_tokens_and_weights(pipe.tokenizer_2, effective_prompt)
 
