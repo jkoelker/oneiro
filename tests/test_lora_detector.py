@@ -38,7 +38,7 @@ class TestLoraMatch:
     """Tests for LoraMatch dataclass."""
 
     def test_basic_match(self):
-        """LoraMatch stores lora, trigger, and weight."""
+        """LoraMatch stores lora and trigger."""
         lora = LoraConfig(
             name="test-lora",
             source=LoraSource.LOCAL,
@@ -46,10 +46,9 @@ class TestLoraMatch:
             trigger_words=["shinkai"],
             base_model="SDXL 1.0",
         )
-        match = LoraMatch(lora=lora, matched_trigger="shinkai", weight=0.8)
+        match = LoraMatch(lora=lora, matched_trigger="shinkai")
         assert match.lora.name == "test-lora"
         assert match.matched_trigger == "shinkai"
-        assert match.weight == 0.8
 
 
 class TestAutoLoraDetector:

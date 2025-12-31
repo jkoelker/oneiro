@@ -26,7 +26,6 @@ class LoraMatch:
 
     lora: LoraConfig
     matched_trigger: str
-    weight: float = 1.0
 
 
 @dataclass
@@ -152,7 +151,7 @@ class AutoLoraDetector:
                     continue
 
                 seen_loras.add(lora.name)
-                matches.append(LoraMatch(lora=lora, matched_trigger=trigger, weight=lora.weight))
+                matches.append(LoraMatch(lora=lora, matched_trigger=trigger))
 
                 if len(matches) >= self.config.max_per_request:
                     return matches
