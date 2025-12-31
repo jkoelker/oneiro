@@ -110,10 +110,14 @@ def parse_prompt_attention(text: str) -> list[tuple[str, float]]:
     if len(res) == 0:
         res = [["", 1.0]]
 
-    # Merge runs of identical weights
+    # Merge runs of identical weights, but never merge BREAK markers
+    # BREAK markers have weight -1 and must remain separate entries
     i = 0
     while i + 1 < len(res):
-        if res[i][1] == res[i + 1][1]:
+        # Skip merging if either entry is a BREAK marker
+        if res[i][0] == "BREAK" or res[i + 1][0] == "BREAK":
+            i += 1
+        elif res[i][1] == res[i + 1][1]:
             res[i][0] += res[i + 1][0]
             res.pop(i + 1)
         else:

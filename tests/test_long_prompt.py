@@ -73,6 +73,16 @@ class TestParsePromptAttention:
         # Should have BREAK marker with weight -1
         assert any(text == "BREAK" and weight == -1 for text, weight in result)
 
+    def test_multiple_consecutive_breaks_not_merged(self):
+        """Multiple consecutive BREAKs should remain separate entries."""
+        result = parse_prompt_attention("first BREAK BREAK BREAK second")
+        # Count BREAK markers - should be exactly 3
+        break_count = sum(1 for text, weight in result if text == "BREAK" and weight == -1)
+        assert break_count == 3, f"Expected 3 BREAK markers, got {break_count}: {result}"
+        # Ensure BREAKs are not merged into "BREAKBREAKBREAK"
+        merged_breaks = [text for text, _ in result if "BREAKBREAK" in text]
+        assert len(merged_breaks) == 0, f"BREAKs were incorrectly merged: {merged_breaks}"
+
     def test_complex_prompt(self):
         """Complex prompt with multiple features."""
         result = parse_prompt_attention("a (((house:1.3)) [on] a (hill:0.5), sun")
