@@ -137,6 +137,36 @@ class TestLoraConfig:
         assert config.name == "my-lora"
         assert config.adapter_name == "custom_adapter"
 
+    def test_trigger_words_default_empty(self):
+        """trigger_words defaults to empty list."""
+        config = LoraConfig(name="test", source=LoraSource.LOCAL, path="/path")
+        assert config.trigger_words == []
+
+    def test_trigger_words_can_be_set(self):
+        """trigger_words can be explicitly set."""
+        config = LoraConfig(
+            name="test",
+            source=LoraSource.LOCAL,
+            path="/path",
+            trigger_words=["style", "subject"],
+        )
+        assert config.trigger_words == ["style", "subject"]
+
+    def test_auto_trigger_default_true(self):
+        """auto_trigger defaults to True."""
+        config = LoraConfig(name="test", source=LoraSource.LOCAL, path="/path")
+        assert config.auto_trigger is True
+
+    def test_auto_trigger_can_be_disabled(self):
+        """auto_trigger can be set to False."""
+        config = LoraConfig(
+            name="test",
+            source=LoraSource.LOCAL,
+            path="/path",
+            auto_trigger=False,
+        )
+        assert config.auto_trigger is False
+
 
 class TestParseLoraConfig:
     """Tests for parse_lora_config function."""
@@ -245,6 +275,38 @@ class TestParseLoraConfig:
         """Invalid source raises ValueError."""
         with pytest.raises(ValueError, match="Invalid LoRA source"):
             parse_lora_config({"source": "invalid"})
+
+    def test_trigger_words_from_config(self):
+        """Parses trigger_words from dict config."""
+        config = parse_lora_config(
+            {
+                "source": "civitai",
+                "id": 12345,
+                "trigger_words": ["style trigger", "subject"],
+            }
+        )
+        assert config.trigger_words == ["style trigger", "subject"]
+
+    def test_auto_trigger_from_config(self):
+        """Parses auto_trigger from dict config."""
+        config = parse_lora_config(
+            {
+                "source": "civitai",
+                "id": 12345,
+                "auto_trigger": False,
+            }
+        )
+        assert config.auto_trigger is False
+
+    def test_trigger_words_defaults_empty(self):
+        """trigger_words defaults to empty list when not in config."""
+        config = parse_lora_config({"source": "civitai", "id": 12345})
+        assert config.trigger_words == []
+
+    def test_auto_trigger_defaults_true(self):
+        """auto_trigger defaults to True when not in config."""
+        config = parse_lora_config({"source": "civitai", "id": 12345})
+        assert config.auto_trigger is True
 
 
 class TestParseLORAsFromModelConfig:

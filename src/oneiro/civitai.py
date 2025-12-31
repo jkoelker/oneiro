@@ -106,6 +106,7 @@ class ModelVersion:
     files: list[ModelFile] = field(default_factory=list)
     download_url: str | None = None
     created_at: str | None = None
+    trained_words: list[str] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ModelVersion":
@@ -120,6 +121,7 @@ class ModelVersion:
             files=files,
             download_url=data.get("downloadUrl"),
             created_at=data.get("createdAt"),
+            trained_words=data.get("trainedWords", []),
         )
 
     @property

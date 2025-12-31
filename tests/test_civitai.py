@@ -137,6 +137,21 @@ class TestModelVersion:
         assert len(version.files) == 1
         assert version.files[0].name == "test_model.safetensors"
 
+    def test_from_dict_with_trained_words(self):
+        """ModelVersion.from_dict parses trainedWords field."""
+        data = {
+            **SAMPLE_VERSION_RESPONSE,
+            "trainedWords": ["style trigger", "subject trigger"],
+        }
+        version = ModelVersion.from_dict(data)
+
+        assert version.trained_words == ["style trigger", "subject trigger"]
+
+    def test_from_dict_trained_words_empty_by_default(self):
+        """ModelVersion.from_dict has empty trained_words by default."""
+        version = ModelVersion.from_dict(SAMPLE_VERSION_RESPONSE)
+        assert version.trained_words == []
+
     def test_primary_file(self):
         """primary_file returns the file marked as primary."""
         version = ModelVersion.from_dict(SAMPLE_VERSION_RESPONSE)

@@ -508,6 +508,8 @@ def create_bot() -> discord.Bot:
                                 repo=lora_def.get("repo"),
                                 weight_name=lora_def.get("weight_name"),
                                 path=lora_def.get("path"),
+                                trigger_words=lora_def.get("trigger_words", []),
+                                auto_trigger=lora_def.get("auto_trigger", True),
                             )
 
                             # Check compatibility for Civitai LoRAs
@@ -541,8 +543,26 @@ def create_bot() -> discord.Bot:
                     await ctx.followup.send(f"❌ Invalid LoRA specification: {e}", ephemeral=True)
                     return
 
+        auto_inject_triggers = (
+            config.get("loras", "auto_inject_triggers", default=True) if config else True
+        )
+        injected_triggers: list[str] = []
+        effective_prompt = prompt
+
+        if lora_configs and auto_inject_triggers:
+            prompt_lower = prompt.lower()
+            for lora_config in lora_configs:
+                if lora_config.auto_trigger and lora_config.trigger_words:
+                    for trigger in lora_config.trigger_words:
+                        if trigger.lower() not in prompt_lower:
+                            injected_triggers.append(trigger)
+                            prompt_lower = f"{trigger.lower()} {prompt_lower}"
+
+            if injected_triggers:
+                effective_prompt = f"{', '.join(injected_triggers)}, {prompt}"
+
         request: dict[str, Any] = {
-            "prompt": prompt,
+            "prompt": effective_prompt,
             "negative_prompt": negative_prompt,
             "width": width,
             "height": height,
@@ -604,7 +624,7 @@ def create_bot() -> discord.Bot:
                 title="🎨 Dream Generated" + (" (img2img)" if is_img2img else ""),
                 color=discord.Color.purple(),
             )
-            embed.add_field(name="Prompt", value=prompt[:1024], inline=False)
+            embed.add_field(name="Prompt", value=effective_prompt[:1024], inline=False)
             if negative_prompt:
                 embed.add_field(
                     name="Negative Prompt",
@@ -624,6 +644,11 @@ def create_bot() -> discord.Bot:
                 if len(lora_display) > 1024:
                     lora_display = lora_display[:1021] + "..."
                 embed.add_field(name="LoRA", value=lora_display, inline=True)
+            if injected_triggers:
+                triggers_display = ", ".join(f"`{t}`" for t in injected_triggers)
+                if len(triggers_display) > 1024:
+                    triggers_display = triggers_display[:1021] + "..."
+                embed.add_field(name="Auto Triggers", value=triggers_display, inline=True)
             if scheduler:
                 embed.add_field(name="Scheduler", value=f"`{scheduler}`", inline=True)
             embed.set_image(url="attachment://dream.png")

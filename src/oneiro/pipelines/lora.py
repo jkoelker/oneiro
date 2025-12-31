@@ -37,6 +37,8 @@ class LoraConfig:
         repo: HuggingFace repository (for huggingface source)
         weight_name: Filename in HF repo (for huggingface source)
         path: Local file path (for local source)
+        trigger_words: Words to auto-inject into prompt when using this LoRA
+        auto_trigger: Whether to auto-inject trigger words (default: True)
     """
 
     name: str
@@ -55,6 +57,9 @@ class LoraConfig:
 
     # Local-specific
     path: str | None = None
+
+    trigger_words: list[str] = field(default_factory=list)
+    auto_trigger: bool = True
 
     # Resolved path (filled after download)
     _resolved_path: Path | None = field(default=None, repr=False)
@@ -178,6 +183,8 @@ def parse_lora_config(config: dict[str, Any] | str, index: int = 0) -> LoraConfi
     lora_name = config.get("name")
     adapter_name = config.get("adapter_name")
     weight = config.get("weight", 1.0)
+    trigger_words = config.get("trigger_words", [])
+    auto_trigger = config.get("auto_trigger", True)
 
     if source == LoraSource.CIVITAI:
         civitai_id = config.get("id") or config.get("civitai_id")
@@ -199,6 +206,8 @@ def parse_lora_config(config: dict[str, Any] | str, index: int = 0) -> LoraConfi
             civitai_id=civitai_id,
             civitai_version=civitai_version,
             civitai_url=civitai_url,
+            trigger_words=trigger_words,
+            auto_trigger=auto_trigger,
         )
 
     elif source == LoraSource.HUGGINGFACE:
@@ -215,6 +224,8 @@ def parse_lora_config(config: dict[str, Any] | str, index: int = 0) -> LoraConfi
             weight=weight,
             repo=repo,
             weight_name=weight_name,
+            trigger_words=trigger_words,
+            auto_trigger=auto_trigger,
         )
 
     else:  # LOCAL
@@ -229,6 +240,8 @@ def parse_lora_config(config: dict[str, Any] | str, index: int = 0) -> LoraConfi
             adapter_name=adapter_name,
             weight=weight,
             path=path,
+            trigger_words=trigger_words,
+            auto_trigger=auto_trigger,
         )
 
 
@@ -594,6 +607,12 @@ async def resolve_lora_path(
         print(f"Downloading LoRA: {version.name} (base: {version.base_model})")
         path = await civitai_client.download_model_version(version)
         lora._resolved_path = path
+
+        if not lora.trigger_words and version.trained_words:
+            object.__setattr__(lora, "trigger_words", list(version.trained_words))
+            if version.trained_words:
+                print(f"LoRA trigger words: {version.trained_words}")
+
         return path
 
     raise ValueError(f"Unknown LoRA source: {lora.source}")
