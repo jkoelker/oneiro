@@ -556,7 +556,8 @@ class TestCivitaiCheckpointPipelineGenerate:
         ):
             pipeline.generate("test prompt", negative_prompt="bad quality")
 
-        # SDXL handles negative prompts via embeddings (negative_prompt_embeds,
+        # All pipelines using the embedding-based approach (SD 1.x, SD 2.x, SDXL, SD3)
+        # handle negative prompts via embeddings (negative_prompt_embeds, and for SDXL,
         # negative_pooled_prompt_embeds) computed in _encode_prompts_to_embeddings,
         # not via direct negative_prompt kwarg. Verify the mock was called correctly.
         mock_pipe.assert_called_once()
