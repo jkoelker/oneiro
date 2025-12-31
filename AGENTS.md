@@ -6,8 +6,8 @@ Discord bot for image generation with Huggingface Diffusers.
 
 ```bash
 uv pip install -e ".[dev]"           # Install dev dependencies
-uv run --extra dev pytest -v         # Run all tests
-uv run --extra dev pytest tests/test_config.py -v  # Single file
+uv run --extra dev pytest            # Run all tests
+uv run --extra dev pytest tests/test_config.py   # Single file
 ruff check src/ --fix                # Lint + auto-fix
 ruff format src/                     # Format
 ```
@@ -136,4 +136,21 @@ select = ["E", "W", "F", "I", "B", "C4", "UP"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["oneiro"]
+```
+
+## Git Workflow
+
+- **Commits allowed** on atomic work units (single logical change)
+- **Never push** - leave pushing to the user
+- **Never `git add .`** - only stage specific files needed for the commit
+
+```bash
+# CORRECT: Stage specific files
+git add src/oneiro/config.py tests/test_config.py
+git commit -m "Add config hot reload support"
+
+# WRONG: Never do this
+git add .
+git add -A
+git push
 ```

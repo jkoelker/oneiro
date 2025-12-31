@@ -10,8 +10,7 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-import torch
-
+from oneiro.device import DevicePolicy, OffloadMode
 from oneiro.pipelines.base import BasePipeline, GenerationResult
 from oneiro.pipelines.embedding import EmbeddingLoaderMixin, parse_embeddings_from_config
 from oneiro.pipelines.long_prompt import (
@@ -619,25 +618,26 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
         print(f"  Base model: {base_model or 'unknown'}")
         print(f"  Pipeline: {self._pipeline_config.pipeline_class}")
 
+        cpu_offload = model_config.get("cpu_offload", True)
+        self.policy = DevicePolicy.auto_detect(cpu_offload=cpu_offload)
+
         # Get the pipeline class
         pipeline_class = get_diffusers_pipeline_class(self._pipeline_config.pipeline_class)
 
         # Load from single file
         self.pipe = pipeline_class.from_single_file(
             str(checkpoint_path),
-            torch_dtype=self._dtype,
+            torch_dtype=self.policy.dtype,
         )
 
         scheduler_override = model_config.get("scheduler")
         self.configure_scheduler(scheduler_override)
 
-        # Apply optimizations
-        cpu_offload = model_config.get("cpu_offload", True)
-        self._cpu_offload = cpu_offload and self._device == "cuda"
-        if self._cpu_offload:
-            self.pipe.enable_model_cpu_offload()
-        elif self._device == "cuda":
-            self.pipe.to("cuda")
+        self.policy.apply_to_pipeline(self.pipe)
+        # Track whether offload was applied (for dynamic LoRA handling)
+        self._cpu_offload = (
+            self.policy.offload != OffloadMode.NEVER and self.policy.device == "cuda"
+        )
 
         # Enable memory optimizations for VAE if available
         if hasattr(self.pipe, "vae"):
@@ -859,8 +859,7 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
 
         result = self.pipe(**gen_kwargs)
 
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        DevicePolicy.clear_cache()
 
         output_image = result.images[0]
         return GenerationResult(
@@ -887,7 +886,7 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
         # Only move pipeline to device manually when CPU offload is not enabled.
         # With CPU offload, diffusers manages device placement automatically.
         if not self._cpu_offload:
-            self.pipe.to(self._device)
+            self.pipe.to(self.policy.device)
 
         loaded_names: list[str] = []
         loaded_weights: list[float] = []
@@ -911,7 +910,7 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
             return
 
         if not self._cpu_offload:
-            self.pipe.to(self._device)
+            self.pipe.to(self.policy.device)
         self.load_loras_sync(self._static_lora_configs)
         print(f"Restored {len(self._static_lora_configs)} static LoRA(s)")
 

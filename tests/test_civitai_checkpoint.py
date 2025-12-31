@@ -4,7 +4,9 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import torch
 
+from oneiro.device import DevicePolicy, OffloadMode
 from oneiro.pipelines.civitai_checkpoint import (
     CIVITAI_BASE_MODEL_PIPELINE_MAP,
     DEFAULT_PIPELINE_CONFIG,
@@ -315,7 +317,7 @@ class TestCivitaiCheckpointPipelineLoad:
     @patch.object(CivitaiCheckpointPipeline, "configure_scheduler")
     @patch("oneiro.pipelines.civitai_checkpoint.get_diffusers_pipeline_class")
     def test_load_enables_cpu_offload(self, mock_get_class, mock_config_sched, tmp_path):
-        """load() enables CPU offload when configured."""
+        """load() enables CPU offload when configured on CUDA."""
         checkpoint = tmp_path / "model.safetensors"
         checkpoint.write_bytes(b"dummy")
 
@@ -325,13 +327,15 @@ class TestCivitaiCheckpointPipelineLoad:
         mock_get_class.return_value = mock_pipeline_class
 
         pipeline = CivitaiCheckpointPipeline()
-        pipeline._device = "cuda"  # Simulate CUDA availability
-        pipeline.load(
-            {
-                "checkpoint_path": str(checkpoint),
-                "cpu_offload": True,
-            }
-        )
+        # Mock DevicePolicy.auto_detect to return CUDA with AUTO offload
+        mock_policy = DevicePolicy(device="cuda", dtype=torch.float16, offload=OffloadMode.AUTO)
+        with patch.object(DevicePolicy, "auto_detect", return_value=mock_policy):
+            pipeline.load(
+                {
+                    "checkpoint_path": str(checkpoint),
+                    "cpu_offload": True,
+                }
+            )
 
         mock_pipe.enable_model_cpu_offload.assert_called_once()
 
@@ -491,10 +495,7 @@ class TestCivitaiCheckpointPipelineGenerate:
         mock_pipe.return_value.images = [mock_image]
         pipeline.pipe = mock_pipe
 
-        with (
-            patch("oneiro.pipelines.civitai_checkpoint.torch"),
-            patch.object(pipeline, "_encode_prompts_to_embeddings"),
-        ):
+        with patch.object(pipeline, "_encode_prompts_to_embeddings"):
             pipeline.generate("test prompt")
 
         call_kwargs = mock_pipe.call_args.kwargs
@@ -519,10 +520,7 @@ class TestCivitaiCheckpointPipelineGenerate:
         mock_pipe.return_value.images = [mock_image]
         pipeline.pipe = mock_pipe
 
-        with (
-            patch("oneiro.pipelines.civitai_checkpoint.torch"),
-            patch.object(pipeline, "_encode_prompts_to_embeddings"),
-        ):
+        with patch.object(pipeline, "_encode_prompts_to_embeddings"):
             pipeline.generate(
                 "test prompt",
                 steps=10,
@@ -553,7 +551,7 @@ class TestCivitaiCheckpointPipelineGenerate:
         pipeline.pipe = mock_pipe
 
         with (
-            patch("oneiro.pipelines.civitai_checkpoint.torch"),
+            patch.object(DevicePolicy, "clear_cache"),
             patch.object(pipeline, "_encode_prompts_to_embeddings"),
         ):
             pipeline.generate("test prompt", negative_prompt="bad quality")
@@ -580,7 +578,7 @@ class TestCivitaiCheckpointPipelineGenerate:
         pipeline.pipe = mock_pipe
 
         with (
-            patch("oneiro.pipelines.civitai_checkpoint.torch"),
+            patch.object(DevicePolicy, "clear_cache"),
             patch.object(pipeline, "_encode_prompts_to_embeddings"),
         ):
             pipeline.generate("test prompt", negative_prompt="bad quality")
@@ -605,7 +603,7 @@ class TestCivitaiCheckpointPipelineGenerate:
         pipeline.pipe = mock_pipe
 
         with (
-            patch("oneiro.pipelines.civitai_checkpoint.torch"),
+            patch.object(DevicePolicy, "clear_cache"),
             patch.object(pipeline, "_encode_prompts_to_embeddings"),
         ):
             result = pipeline.generate("test prompt", seed=42)
@@ -635,7 +633,7 @@ class TestCivitaiCheckpointPipelineGenerate:
         # Mock init image loading
         mock_init_image = MagicMock()
         with (
-            patch("oneiro.pipelines.civitai_checkpoint.torch"),
+            patch.object(DevicePolicy, "clear_cache"),
             patch.object(pipeline, "_load_init_image", return_value=mock_init_image),
             patch.object(pipeline, "_encode_prompts_to_embeddings"),
         ):
@@ -666,7 +664,7 @@ class TestCivitaiCheckpointPipelineGenerate:
 
         mock_euler = MagicMock()
         with (
-            patch("oneiro.pipelines.civitai_checkpoint.torch"),
+            patch.object(DevicePolicy, "clear_cache"),
             patch("diffusers.EulerAncestralDiscreteScheduler", mock_euler),
             patch.object(pipeline, "_encode_prompts_to_embeddings"),
         ):
@@ -1190,7 +1188,7 @@ class TestDynamicLoraGeneration:
         lora._resolved_path = Path("/fake/path.safetensors")
 
         with (
-            patch("oneiro.pipelines.civitai_checkpoint.torch"),
+            patch.object(DevicePolicy, "clear_cache"),
             patch.object(pipeline, "_encode_prompts_to_embeddings"),
             patch.object(pipeline, "_load_dynamic_loras") as mock_load,
             patch.object(pipeline, "_restore_static_loras") as mock_restore,
@@ -1215,7 +1213,7 @@ class TestDynamicLoraGeneration:
         dynamic_lora._resolved_path = Path("/dynamic.safetensors")
 
         with (
-            patch("oneiro.pipelines.civitai_checkpoint.torch"),
+            patch.object(DevicePolicy, "clear_cache"),
             patch.object(pipeline, "_encode_prompts_to_embeddings"),
             patch.object(pipeline, "unload_loras") as mock_unload,
             patch.object(pipeline, "load_single_lora", return_value="dynamic-lora"),
@@ -1240,7 +1238,7 @@ class TestDynamicLoraGeneration:
         dynamic_lora._resolved_path = Path("/bad.safetensors")
 
         with (
-            patch("oneiro.pipelines.civitai_checkpoint.torch"),
+            patch.object(DevicePolicy, "clear_cache"),
             patch.object(pipeline, "_encode_prompts_to_embeddings"),
             patch.object(pipeline, "_load_dynamic_loras", side_effect=RuntimeError("Load failed")),
             patch.object(pipeline, "_restore_static_loras") as mock_restore,
@@ -1262,7 +1260,7 @@ class TestDynamicLoraGeneration:
         pipeline.pipe.side_effect = RuntimeError("Generation failed")
 
         with (
-            patch("oneiro.pipelines.civitai_checkpoint.torch"),
+            patch.object(DevicePolicy, "clear_cache"),
             patch.object(pipeline, "_encode_prompts_to_embeddings"),
             patch.object(pipeline, "_load_dynamic_loras"),
             patch.object(pipeline, "_restore_static_loras") as mock_restore,
@@ -1277,7 +1275,7 @@ class TestDynamicLoraGeneration:
         pipeline = self._create_pipeline_with_mocks()
 
         with (
-            patch("oneiro.pipelines.civitai_checkpoint.torch"),
+            patch.object(DevicePolicy, "clear_cache"),
             patch.object(pipeline, "_encode_prompts_to_embeddings"),
             patch.object(pipeline, "_load_dynamic_loras") as mock_load,
             patch.object(pipeline, "_restore_static_loras") as mock_restore,
@@ -1308,7 +1306,10 @@ class TestDynamicLoraGeneration:
         """_load_dynamic_loras() calls .to(device) when cpu_offload disabled."""
         pipeline = self._create_pipeline_with_mocks()
         pipeline._cpu_offload = False
-        pipeline._device = "cuda"
+        # Set policy with CUDA device
+        pipeline.policy = DevicePolicy(
+            device="cuda", dtype=torch.float16, offload=OffloadMode.NEVER
+        )
 
         lora = LoraConfig(name="test-lora", source=LoraSource.LOCAL, path="/fake.safetensors")
         lora._resolved_path = Path("/fake.safetensors")
