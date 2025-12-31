@@ -746,3 +746,93 @@ class TestResolveLoraPath:
                 pipeline_type="flux2",
                 validate_compatibility=True,
             )
+
+    async def test_civitai_populates_trigger_words_from_trained_words(self, tmp_path):
+        """Civitai trained_words populates trigger_words when not set."""
+        from oneiro.pipelines.lora import resolve_lora_path
+
+        mock_client = AsyncMock()
+        mock_model = Mock()
+        mock_version = Mock()
+        mock_version.base_model = "Flux.1 Dev"
+        mock_version.name = "Test LoRA"
+        mock_version.trained_words = ["trigger1", "trigger2", "style_name"]
+        mock_model.latest_version = mock_version
+        mock_client.get_model = AsyncMock(return_value=mock_model)
+        mock_client.download_model_version = AsyncMock(return_value=tmp_path / "lora.safetensors")
+
+        config = LoraConfig(
+            name="civitai-lora",
+            source=LoraSource.CIVITAI,
+            civitai_id=12345,
+            trigger_words=[],
+        )
+
+        await resolve_lora_path(
+            config,
+            civitai_client=mock_client,
+            pipeline_type="flux1",
+            validate_compatibility=True,
+        )
+
+        assert config.trigger_words == ["trigger1", "trigger2", "style_name"]
+
+    async def test_civitai_does_not_overwrite_existing_trigger_words(self, tmp_path):
+        """Civitai trained_words does NOT overwrite existing trigger_words."""
+        from oneiro.pipelines.lora import resolve_lora_path
+
+        mock_client = AsyncMock()
+        mock_model = Mock()
+        mock_version = Mock()
+        mock_version.base_model = "Flux.1 Dev"
+        mock_version.name = "Test LoRA"
+        mock_version.trained_words = ["civitai_trigger"]
+        mock_model.latest_version = mock_version
+        mock_client.get_model = AsyncMock(return_value=mock_model)
+        mock_client.download_model_version = AsyncMock(return_value=tmp_path / "lora.safetensors")
+
+        config = LoraConfig(
+            name="civitai-lora",
+            source=LoraSource.CIVITAI,
+            civitai_id=12345,
+            trigger_words=["my_custom_trigger"],
+        )
+
+        await resolve_lora_path(
+            config,
+            civitai_client=mock_client,
+            pipeline_type="flux1",
+            validate_compatibility=True,
+        )
+
+        assert config.trigger_words == ["my_custom_trigger"]
+
+    async def test_civitai_handles_empty_trained_words(self, tmp_path):
+        """Civitai with empty trained_words does not modify trigger_words."""
+        from oneiro.pipelines.lora import resolve_lora_path
+
+        mock_client = AsyncMock()
+        mock_model = Mock()
+        mock_version = Mock()
+        mock_version.base_model = "Flux.1 Dev"
+        mock_version.name = "Test LoRA"
+        mock_version.trained_words = []
+        mock_model.latest_version = mock_version
+        mock_client.get_model = AsyncMock(return_value=mock_model)
+        mock_client.download_model_version = AsyncMock(return_value=tmp_path / "lora.safetensors")
+
+        config = LoraConfig(
+            name="civitai-lora",
+            source=LoraSource.CIVITAI,
+            civitai_id=12345,
+            trigger_words=[],
+        )
+
+        await resolve_lora_path(
+            config,
+            civitai_client=mock_client,
+            pipeline_type="flux1",
+            validate_compatibility=True,
+        )
+
+        assert config.trigger_words == []
