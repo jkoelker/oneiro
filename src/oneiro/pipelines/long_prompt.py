@@ -35,7 +35,7 @@ RE_ATTENTION = re.compile(
     \[|             # opening [
     :([+-]?[.\d]+)\)|  # weight like :1.5)
     \)|             # closing )
-    ]|              # closing ]
+    \]|             # closing ]
     [^\\()\[\]:]+|  # regular text
     :               # colon
     """,
@@ -52,7 +52,7 @@ def parse_prompt_attention(text: str) -> list[tuple[str, float]]:
     Supported syntax:
       (abc) - increases attention by 1.1x
       (abc:1.5) - increases attention by 1.5x
-      [abc] - decreases attention by 1.1x (same as :0.909)
+      [abc] - decreases attention by dividing by 1.1 (multiplies by ~0.909)
       \\( \\) \\[ \\] - literal brackets
       BREAK - forces a new chunk boundary
 
@@ -251,6 +251,48 @@ def pad_to_same_length(
     return tokens_a, weights_a, tokens_b, weights_b
 
 
+def pad_chunks_to_same_count(
+    chunks_a: list[list[int]],
+    weights_a: list[list[float]],
+    chunks_b: list[list[int]],
+    weights_b: list[list[float]],
+) -> tuple[list[list[int]], list[list[float]], list[list[int]], list[list[float]]]:
+    """Pad two chunk lists to the same number of chunks.
+
+    When positive and negative prompts have different numbers of BREAK markers,
+    they will produce different numbers of chunks. This function pads the shorter
+    list with empty (EOS-filled) chunks to ensure they can be processed together.
+
+    Args:
+        chunks_a, weights_a: First chunk/weight list pair
+        chunks_b, weights_b: Second chunk/weight list pair
+
+    Returns:
+        Padded versions of all four lists
+    """
+    len_a = len(chunks_a)
+    len_b = len(chunks_b)
+
+    if len_a == len_b:
+        return chunks_a, weights_a, chunks_b, weights_b
+
+    # Create an empty chunk (all EOS tokens with weight 1.0)
+    # Chunk structure: [BOS] + 75 EOS tokens + [EOS] = 77 tokens
+    empty_chunk = [BOS_TOKEN_ID] + [EOS_TOKEN_ID] * (MAX_TOKENS_PER_CHUNK + 1)
+    empty_weights = [1.0] * 77
+
+    if len_a > len_b:
+        for _ in range(len_a - len_b):
+            chunks_b = chunks_b + [empty_chunk]
+            weights_b = weights_b + [empty_weights]
+    else:
+        for _ in range(len_b - len_a):
+            chunks_a = chunks_a + [empty_chunk]
+            weights_a = weights_a + [empty_weights]
+
+    return chunks_a, weights_a, chunks_b, weights_b
+
+
 def get_weighted_text_embeddings_sd15(
     pipe: Any,
     prompt: str = "",
@@ -285,6 +327,11 @@ def get_weighted_text_embeddings_sd15(
     )
     neg_chunks, neg_chunk_weights = group_tokens_into_chunks(
         neg_tokens, neg_weights, pad_last_block=pad_last_block
+    )
+
+    # Ensure same number of chunks (in case of different BREAK marker counts)
+    prompt_chunks, prompt_chunk_weights, neg_chunks, neg_chunk_weights = pad_chunks_to_same_count(
+        prompt_chunks, prompt_chunk_weights, neg_chunks, neg_chunk_weights
     )
 
     # Encode each chunk and apply weights
@@ -363,11 +410,11 @@ def get_t5_tokens_and_weights(
         text_weights.extend([weight] * len(token_ids))
 
     # Add EOS token at the end (T5's EOS token ID is typically 1)
-    if text_tokens:
-        eos_token_id = tokenizer.eos_token_id
-        if eos_token_id is not None:
-            text_tokens.append(eos_token_id)
-            text_weights.append(1.0)
+    # Always add EOS, even if text_tokens is empty (e.g., prompt was only BREAK keywords)
+    eos_token_id = tokenizer.eos_token_id
+    if eos_token_id is not None:
+        text_tokens.append(eos_token_id)
+        text_weights.append(1.0)
 
     return text_tokens, text_weights
 
@@ -421,6 +468,18 @@ def get_weighted_text_embeddings_sdxl(
     )
     neg_chunks_2, neg_chunk_weights_2 = group_tokens_into_chunks(
         neg_tokens_2, neg_weights_2, pad_last_block=pad_last_block
+    )
+
+    # Ensure same number of chunks for each encoder (in case of different BREAK marker counts)
+    prompt_chunks_1, prompt_chunk_weights_1, neg_chunks_1, neg_chunk_weights_1 = (
+        pad_chunks_to_same_count(
+            prompt_chunks_1, prompt_chunk_weights_1, neg_chunks_1, neg_chunk_weights_1
+        )
+    )
+    prompt_chunks_2, prompt_chunk_weights_2, neg_chunks_2, neg_chunk_weights_2 = (
+        pad_chunks_to_same_count(
+            prompt_chunks_2, prompt_chunk_weights_2, neg_chunks_2, neg_chunk_weights_2
+        )
     )
 
     # Encode and apply weights
@@ -527,9 +586,14 @@ def get_weighted_text_embeddings_flux(
         - prompt_embeds: T5 embeddings with weights applied
         - pooled_prompt_embeds: Averaged CLIP pooled embeddings
     """
-    device = pipe.device if hasattr(pipe, "device") else "cuda"
-    if not str(device).startswith("cuda"):
-        device = "cuda" if torch.cuda.is_available() else device
+    # Determine device from pipeline, falling back to text_encoder's device
+    if hasattr(pipe, "device"):
+        device = pipe.device
+    elif hasattr(pipe, "text_encoder") and hasattr(pipe.text_encoder, "device"):
+        device = pipe.text_encoder.device
+    else:
+        # Last resort fallback
+        device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # Use "empty" placeholder for empty prompts (consistent with get_tokens_and_weights)
     effective_prompt = prompt if prompt else "empty"
@@ -632,6 +696,18 @@ def get_weighted_text_embeddings_sd3(
     )
     neg_chunks_2, neg_chunk_weights_2 = group_tokens_into_chunks(
         neg_tokens_2, neg_weights_2, pad_last_block=pad_last_block
+    )
+
+    # Ensure same number of chunks for each encoder (in case of different BREAK marker counts)
+    prompt_chunks_1, prompt_chunk_weights_1, neg_chunks_1, neg_chunk_weights_1 = (
+        pad_chunks_to_same_count(
+            prompt_chunks_1, prompt_chunk_weights_1, neg_chunks_1, neg_chunk_weights_1
+        )
+    )
+    prompt_chunks_2, prompt_chunk_weights_2, neg_chunks_2, neg_chunk_weights_2 = (
+        pad_chunks_to_same_count(
+            prompt_chunks_2, prompt_chunk_weights_2, neg_chunks_2, neg_chunk_weights_2
+        )
     )
 
     # Encode CLIP chunks
