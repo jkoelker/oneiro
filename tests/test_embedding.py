@@ -381,11 +381,20 @@ class TestParseEmbeddingsFromConfig:
 class TestIsEmbeddingCompatible:
     """Tests for is_embedding_compatible function."""
 
-    def test_flux_compatible(self):
-        """Flux.1 embeddings compatible with flux2 pipeline."""
-        assert is_embedding_compatible("flux2", "Flux.1 Dev")
-        assert is_embedding_compatible("flux2", "Flux.1 Schnell")
-        assert is_embedding_compatible("flux2", "Flux.1 D")
+    def test_flux1_compatible(self):
+        """Flux.1 embeddings compatible with flux1 pipeline."""
+        assert is_embedding_compatible("flux1", "Flux.1 Dev")
+        assert is_embedding_compatible("flux1", "Flux.1 Schnell")
+        assert is_embedding_compatible("flux1", "Flux.1 D")
+
+    def test_flux2_compatible(self):
+        """Flux.2 embeddings compatible with flux2 pipeline."""
+        assert is_embedding_compatible("flux2", "Flux.2")
+
+    def test_flux1_flux2_incompatible(self):
+        """Flux.1 and Flux.2 embeddings are NOT cross-compatible."""
+        assert not is_embedding_compatible("flux1", "Flux.2")
+        assert not is_embedding_compatible("flux2", "Flux.1 Dev")
 
     def test_sdxl_compatible(self):
         """SDXL embeddings compatible with sdxl pipeline."""
@@ -409,8 +418,8 @@ class TestIsEmbeddingCompatible:
 
     def test_case_insensitive(self):
         """Comparison is case-insensitive."""
-        assert is_embedding_compatible("flux2", "flux.1 dev")
-        assert is_embedding_compatible("flux2", "FLUX.1 DEV")
+        assert is_embedding_compatible("flux1", "flux.1 dev")
+        assert is_embedding_compatible("flux1", "FLUX.1 DEV")
 
 
 class TestEmbeddingIncompatibleError:
