@@ -12,6 +12,7 @@ from discord import option
 from oneiro.civitai import CivitaiClient, CivitaiError
 from oneiro.config import Config
 from oneiro.filters import ContentFilter
+from oneiro.lora_detector import AutoLoraDetector, create_detector_from_config
 from oneiro.pipelines import (
     SCHEDULER_CHOICES,
     GenerationResult,
@@ -29,6 +30,7 @@ pipeline_manager: PipelineManager | None = None
 generation_queue: GenerationQueue | None = None
 content_filter: ContentFilter | None = None
 civitai_client: CivitaiClient | None = None
+lora_detector: AutoLoraDetector | None = None
 
 # LoRA weight validation limits
 MIN_LORA_WEIGHT = -2.0
@@ -194,7 +196,7 @@ async def get_model_choices(ctx: discord.AutocompleteContext) -> list[str]:
 
 def create_bot() -> discord.Bot:
     """Create and configure the Discord bot."""
-    global config, pipeline_manager, generation_queue, content_filter, civitai_client
+    global config, pipeline_manager, generation_queue, content_filter, civitai_client, lora_detector
 
     activity = discord.Activity(
         name="Dreaming...",
@@ -207,6 +209,7 @@ def create_bot() -> discord.Bot:
     async def on_ready():
         """Initialize config, pipeline and queue when bot connects."""
         global config, pipeline_manager, generation_queue, content_filter, civitai_client
+        global lora_detector
         print(f"{bot.user} is online!")
 
         # Load configuration
@@ -230,6 +233,10 @@ def create_bot() -> discord.Bot:
         content_filter = ContentFilter(config)
         print("Content filter initialized")
 
+        # Initialize LoRA auto-detector
+        lora_detector = create_detector_from_config(config.data)
+        print("LoRA auto-detector initialized")
+
         # Initialize pipeline manager with config
         pipeline_manager = PipelineManager(config)
         pipeline_manager.set_civitai_client(civitai_client)
@@ -246,7 +253,9 @@ def create_bot() -> discord.Bot:
 
         # Register config change callback
         async def on_config_change(new_config: dict[str, Any]) -> None:
-            """Update queue limits when config changes."""
+            """Update queue limits and LoRA detector when config changes."""
+            global lora_detector
+
             if generation_queue is None:
                 return
 
@@ -261,6 +270,10 @@ def create_bot() -> discord.Bot:
                 generation_queue.max_global = new_max_global
                 generation_queue.max_per_user = new_max_per_user
                 print(f"Queue limits updated: {new_max_global} global, {new_max_per_user} per user")
+
+            # Rebuild LoRA detector with new config
+            lora_detector = create_detector_from_config(new_config)
+            print("LoRA auto-detector rebuilt")
 
         config.on_change(on_config_change)
 
@@ -455,10 +468,13 @@ def create_bot() -> discord.Bot:
         actual_steps = steps if steps is not None else model_steps
         actual_guidance = guidance_scale if guidance_scale is not None else model_guidance
 
-        # Resolve LoRAs if specified
+        # Resolve LoRAs: explicit param OR auto-detect (not both)
         lora_configs: list[LoraConfig] = []
         lora_warnings: list[str] = []
+        auto_detected_loras: list[tuple[str, str]] = []
+
         if lora and config:
+            # Explicit lora parameter provided - skip auto-detection
             parsed_loras = parse_lora_param(lora)
             loras_section = config.get("loras", default={})
 
@@ -540,6 +556,13 @@ def create_bot() -> discord.Bot:
                 except ValueError as e:
                     await ctx.followup.send(f"❌ Invalid LoRA specification: {e}", ephemeral=True)
                     return
+
+        elif lora_detector and pipeline_type:
+            # No explicit lora - run auto-detection
+            matches = lora_detector.match(prompt, pipeline_type)
+            for match in matches:
+                lora_configs.append(match.lora)
+                auto_detected_loras.append((match.lora.name, match.matched_trigger))
 
         request: dict[str, Any] = {
             "prompt": prompt,
@@ -624,6 +647,13 @@ def create_bot() -> discord.Bot:
                 if len(lora_display) > 1024:
                     lora_display = lora_display[:1021] + "..."
                 embed.add_field(name="LoRA", value=lora_display, inline=True)
+            if auto_detected_loras:
+                auto_display = ", ".join(
+                    f'`{name}` (matched "{trigger}")' for name, trigger in auto_detected_loras
+                )
+                if len(auto_display) > 1024:
+                    auto_display = auto_display[:1021] + "..."
+                embed.add_field(name="Auto LoRAs", value=auto_display, inline=False)
             if scheduler:
                 embed.add_field(name="Scheduler", value=f"`{scheduler}`", inline=True)
             embed.set_image(url="attachment://dream.png")

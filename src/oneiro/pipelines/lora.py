@@ -37,6 +37,9 @@ class LoraConfig:
         repo: HuggingFace repository (for huggingface source)
         weight_name: Filename in HF repo (for huggingface source)
         path: Local file path (for local source)
+        trigger_words: List of trigger words that activate this LoRA (for auto-detect)
+        base_model: Base model string (e.g., "SDXL 1.0", "Pony") for compatibility filtering
+        auto_detect: Whether to include in auto-detection (None = auto: true if trigger_words set)
     """
 
     name: str
@@ -53,10 +56,13 @@ class LoraConfig:
     repo: str | None = None
     weight_name: str | None = None
 
-    # Local-specific
     path: str | None = None
 
-    # Resolved path (filled after download)
+    trigger_words: list[str] = field(default_factory=list)
+    base_model: str | None = None
+    auto_detect: bool | None = None
+
+    _resolved_path: Path | None = field(default=None, repr=False)
     _resolved_path: Path | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
@@ -178,6 +184,9 @@ def parse_lora_config(config: dict[str, Any] | str, index: int = 0) -> LoraConfi
     lora_name = config.get("name")
     adapter_name = config.get("adapter_name")
     weight = config.get("weight", 1.0)
+    trigger_words = config.get("trigger_words", [])
+    base_model = config.get("base_model")
+    auto_detect = config.get("auto_detect")
 
     if source == LoraSource.CIVITAI:
         civitai_id = config.get("id") or config.get("civitai_id")
@@ -199,6 +208,9 @@ def parse_lora_config(config: dict[str, Any] | str, index: int = 0) -> LoraConfi
             civitai_id=civitai_id,
             civitai_version=civitai_version,
             civitai_url=civitai_url,
+            trigger_words=trigger_words,
+            base_model=base_model,
+            auto_detect=auto_detect,
         )
 
     elif source == LoraSource.HUGGINGFACE:
@@ -215,6 +227,9 @@ def parse_lora_config(config: dict[str, Any] | str, index: int = 0) -> LoraConfi
             weight=weight,
             repo=repo,
             weight_name=weight_name,
+            trigger_words=trigger_words,
+            base_model=base_model,
+            auto_detect=auto_detect,
         )
 
     else:  # LOCAL
@@ -229,6 +244,9 @@ def parse_lora_config(config: dict[str, Any] | str, index: int = 0) -> LoraConfi
             adapter_name=adapter_name,
             weight=weight,
             path=path,
+            trigger_words=trigger_words,
+            base_model=base_model,
+            auto_detect=auto_detect,
         )
 
 
