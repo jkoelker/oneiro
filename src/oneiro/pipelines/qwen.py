@@ -4,8 +4,7 @@ import math
 import os
 from typing import Any
 
-import torch
-
+from oneiro.device import DevicePolicy
 from oneiro.pipelines.base import BasePipeline, GenerationResult
 from oneiro.pipelines.embedding import EmbeddingLoaderMixin, parse_embeddings_from_config
 from oneiro.pipelines.lora import LoraLoaderMixin, parse_loras_from_model_config
@@ -70,8 +69,8 @@ class QwenPipelineWrapper(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipeline):
             print(f"Loading GGUF transformer from {path}")
             return QwenImageTransformer2DModel.from_single_file(
                 path,
-                quantization_config=GGUFQuantizationConfig(compute_dtype=self._dtype),
-                torch_dtype=self._dtype,
+                quantization_config=GGUFQuantizationConfig(compute_dtype=self.policy.dtype),
+                torch_dtype=self.policy.dtype,
                 config=base_repo,
                 subfolder="transformer",
             )
@@ -79,7 +78,7 @@ class QwenPipelineWrapper(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipeline):
         print(f"Loading transformer from {path}")
         return QwenImageTransformer2DModel.from_single_file(
             path,
-            torch_dtype=self._dtype,
+            torch_dtype=self.policy.dtype,
             config=base_repo,
             subfolder="transformer",
         )
@@ -102,6 +101,8 @@ class QwenPipelineWrapper(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipeline):
         repo = model_config.get("repo", "Qwen/Qwen-Image")
         transformer_path = model_config.get("transformer")
         cpu_offload = model_config.get("cpu_offload", True)
+
+        self.policy = DevicePolicy.auto_detect(cpu_offload=cpu_offload)
 
         print(f"Loading Qwen-Image from {repo}")
 
@@ -129,32 +130,27 @@ class QwenPipelineWrapper(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipeline):
         if transformer_path:
             transformer = self._load_transformer(transformer_path, repo)
 
-        # Build pipeline
         pipeline_kwargs: dict[str, Any] = {
             "scheduler": scheduler,
-            "torch_dtype": self._dtype,
+            "torch_dtype": self.policy.dtype,
         }
         if transformer is not None:
             pipeline_kwargs["transformer"] = transformer
 
         self.pipe = DiffusionPipeline.from_pretrained(repo, **pipeline_kwargs)
 
+        self.policy.apply_to_pipeline(self.pipe)
+
         loras = parse_loras_from_model_config(model_config)
         if loras:
             print(f"  Loading {len(loras)} LoRA(s)...")
             self.load_loras_sync(loras)
 
-        # Load embeddings if full_config provided
         if full_config:
             embeddings = parse_embeddings_from_config(full_config, model_config)
             if embeddings:
                 print(f"  Loading {len(embeddings)} embedding(s)...")
                 self.load_embeddings_sync(embeddings)
-
-        if cpu_offload and self._device == "cuda":
-            self.pipe.enable_model_cpu_offload()
-        elif self._device == "cuda":
-            self.pipe.to("cuda")
 
         print(f"Qwen-Image loaded from {repo}")
 
@@ -214,8 +210,7 @@ class QwenPipelineWrapper(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipeline):
                 num_images_per_prompt=1,
             )
 
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        DevicePolicy.clear_cache()
 
         output_image = result.images[0]
         return GenerationResult(

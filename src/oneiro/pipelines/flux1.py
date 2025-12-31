@@ -2,8 +2,7 @@
 
 from typing import Any
 
-import torch
-
+from oneiro.device import DevicePolicy
 from oneiro.pipelines.base import BasePipeline, GenerationResult
 
 
@@ -49,14 +48,15 @@ class Flux1PipelineWrapper(BasePipeline):
         # Configure CPU threading for text encoder
         self._configure_cpu_threads(cpu_utilization)
 
+        self.policy = DevicePolicy.auto_detect(cpu_offload=cpu_offload)
+
         print("  Creating pipeline...")
         self.pipe = FluxPipeline.from_pretrained(
             repo,
-            torch_dtype=self._dtype,
+            torch_dtype=self.policy.dtype,
         )
 
-        if cpu_offload:
-            self.pipe.enable_model_cpu_offload()
+        self.policy.apply_to_pipeline(self.pipe)
 
         # Memory optimization for large T5 encoder and high-res VAE decoding
         self.pipe.vae.enable_tiling()
@@ -130,8 +130,7 @@ class Flux1PipelineWrapper(BasePipeline):
                 max_sequence_length=512,
             )
 
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        DevicePolicy.clear_cache()
 
         output_image = result.images[0]
         return GenerationResult(

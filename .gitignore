@@ -92,3 +92,6 @@ Thumbs.db
 
 # uv
 uv.lock
+
+.beads
+.gitattributes

@@ -11,6 +11,8 @@ from typing import Any
 import torch
 from PIL import Image
 
+from oneiro.device import DevicePolicy
+
 
 @dataclass
 class GenerationResult:
@@ -29,10 +31,9 @@ class GenerationResult:
 class BasePipeline(ABC):
     """Base class for all pipeline types."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.pipe: Any = None
-        self._device = "cuda" if torch.cuda.is_available() else "cpu"
-        self._dtype = torch.bfloat16 if self._device == "cuda" else torch.float32
+        self.policy: DevicePolicy = DevicePolicy.auto_detect()
 
     @abstractmethod
     def load(self, model_config: dict[str, Any], full_config: dict[str, Any] | None = None) -> None:
@@ -68,11 +69,8 @@ class BasePipeline(ABC):
             del self.pipe
             self.pipe = None
 
-        # Aggressive cleanup
         gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
+        DevicePolicy.clear_cache()
 
     def _prepare_seed(self, seed: int) -> tuple[int, torch.Generator]:
         """Prepare seed and generator for generation."""

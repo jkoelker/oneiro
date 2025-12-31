@@ -2,8 +2,7 @@
 
 from typing import Any
 
-import torch
-
+from oneiro.device import DevicePolicy
 from oneiro.pipelines.base import BasePipeline, GenerationResult
 from oneiro.pipelines.embedding import EmbeddingLoaderMixin, parse_embeddings_from_config
 from oneiro.pipelines.lora import LoraLoaderMixin, parse_loras_from_model_config
@@ -22,15 +21,18 @@ class ZImagePipelineWrapper(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipeline)
         from diffusers import ZImagePipeline
 
         repo = model_config.get("repo", "Tongyi-MAI/Z-Image-Turbo")
+        cpu_offload = model_config.get("cpu_offload", True)
+
+        self.policy = DevicePolicy.auto_detect(cpu_offload=cpu_offload)
+
         print(f"Loading Z-Image from {repo}")
 
         self.pipe = ZImagePipeline.from_pretrained(
             repo,
-            torch_dtype=self._dtype,
+            torch_dtype=self.policy.dtype,
         )
 
-        if self._device == "cuda":
-            self.pipe.enable_model_cpu_offload()
+        self.policy.apply_to_pipeline(self.pipe)
 
         loras = parse_loras_from_model_config(model_config)
         if loras:
@@ -90,8 +92,7 @@ class ZImagePipelineWrapper(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipeline)
                 generator=generator,
             )
 
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        DevicePolicy.clear_cache()
 
         output_image = result.images[0]
         return GenerationResult(

@@ -2,8 +2,7 @@
 
 from typing import Any
 
-import torch
-
+from oneiro.device import DevicePolicy
 from oneiro.pipelines.base import BasePipeline, GenerationResult
 from oneiro.pipelines.embedding import EmbeddingLoaderMixin, parse_embeddings_from_config
 from oneiro.pipelines.lora import LoraLoaderMixin, parse_loras_from_model_config
@@ -31,12 +30,14 @@ class Flux2PipelineWrapper(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipeline):
         # Configure CPU threading for text encoder
         self._configure_cpu_threads(cpu_utilization)
 
+        self.policy = DevicePolicy.auto_detect(cpu_offload=cpu_offload)
+
         # Load transformer and text encoder on CPU first
         print("  Loading transformer on CPU...")
         transformer = Flux2Transformer2DModel.from_pretrained(
             repo,
             subfolder="transformer",
-            torch_dtype=self._dtype,
+            torch_dtype=self.policy.dtype,
             device_map="cpu",
         )
 
@@ -44,7 +45,7 @@ class Flux2PipelineWrapper(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipeline):
         text_encoder = Mistral3ForConditionalGeneration.from_pretrained(
             repo,
             subfolder="text_encoder",
-            torch_dtype=self._dtype,
+            torch_dtype=self.policy.dtype,
             device_map="cpu",
         )
 
@@ -53,11 +54,10 @@ class Flux2PipelineWrapper(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipeline):
             repo,
             transformer=transformer,
             text_encoder=text_encoder,
-            torch_dtype=self._dtype,
+            torch_dtype=self.policy.dtype,
         )
 
-        if cpu_offload:
-            self.pipe.enable_model_cpu_offload()
+        self.policy.apply_to_pipeline(self.pipe)
 
         loras = parse_loras_from_model_config(model_config)
         if loras:
@@ -115,8 +115,7 @@ class Flux2PipelineWrapper(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipeline):
                 generator=generator,
             )
 
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        DevicePolicy.clear_cache()
 
         output_image = result.images[0]
         return GenerationResult(

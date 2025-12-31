@@ -4,8 +4,10 @@ import io
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
+import torch
 from PIL import Image
 
+from oneiro.device import DevicePolicy, OffloadMode
 from oneiro.pipelines import PipelineManager
 from oneiro.pipelines.base import BasePipeline, GenerationResult
 from oneiro.pipelines.lora import LoraConfig, LoraSource
@@ -91,49 +93,52 @@ class TestBasePipelineInit:
         pipeline = ConcretePipeline()
         assert pipeline.pipe is None
 
-    @patch("oneiro.pipelines.base.torch.cuda.is_available", return_value=True)
-    def test_device_cuda_when_available(self, mock_cuda):
+    def test_device_cuda_when_available(self):
         """Device is 'cuda' when CUDA is available."""
-        pipeline = ConcretePipeline()
-        assert pipeline._device == "cuda"
+        mock_policy = DevicePolicy(device="cuda", dtype=torch.float16, offload=OffloadMode.AUTO)
+        with patch.object(DevicePolicy, "auto_detect", return_value=mock_policy):
+            pipeline = ConcretePipeline()
+        assert pipeline.policy.device == "cuda"
 
-    @patch("oneiro.pipelines.base.torch.cuda.is_available", return_value=False)
-    def test_device_cpu_when_no_cuda(self, mock_cuda):
+    def test_device_cpu_when_no_cuda(self):
         """Device is 'cpu' when CUDA is not available."""
-        pipeline = ConcretePipeline()
-        assert pipeline._device == "cpu"
+        mock_policy = DevicePolicy(device="cpu", dtype=torch.float32, offload=OffloadMode.NEVER)
+        with patch.object(DevicePolicy, "auto_detect", return_value=mock_policy):
+            pipeline = ConcretePipeline()
+        assert pipeline.policy.device == "cpu"
 
 
 class TestBasePipelineUnload:
     """Tests for BasePipeline.unload()."""
 
-    @patch("oneiro.pipelines.base.torch.cuda.is_available", return_value=False)
-    def test_unload_clears_pipe(self, mock_cuda):
+    def test_unload_clears_pipe(self):
         """Unload sets pipe to None."""
-        pipeline = ConcretePipeline()
-        pipeline.pipe = Mock()
-        pipeline.unload()
-        assert pipeline.pipe is None
+        mock_policy = DevicePolicy(device="cpu", dtype=torch.float32, offload=OffloadMode.NEVER)
+        with patch.object(DevicePolicy, "auto_detect", return_value=mock_policy):
+            pipeline = ConcretePipeline()
+            pipeline.pipe = Mock()
+            pipeline.unload()
+            assert pipeline.pipe is None
 
-    @patch("oneiro.pipelines.base.torch.cuda.is_available", return_value=False)
-    def test_unload_handles_none_pipe(self, mock_cuda):
+    def test_unload_handles_none_pipe(self):
         """Unload handles pipe being None."""
-        pipeline = ConcretePipeline()
-        pipeline.pipe = None
-        # Should not raise
-        pipeline.unload()
-        assert pipeline.pipe is None
+        mock_policy = DevicePolicy(device="cpu", dtype=torch.float32, offload=OffloadMode.NEVER)
+        with patch.object(DevicePolicy, "auto_detect", return_value=mock_policy):
+            pipeline = ConcretePipeline()
+            pipeline.pipe = None
+            # Should not raise
+            pipeline.unload()
+            assert pipeline.pipe is None
 
-    @patch("oneiro.pipelines.base.torch.cuda.is_available", return_value=True)
-    @patch("oneiro.pipelines.base.torch.cuda.empty_cache")
-    @patch("oneiro.pipelines.base.torch.cuda.synchronize")
-    def test_unload_clears_cuda_cache(self, mock_sync, mock_empty, mock_avail):
-        """Unload clears CUDA cache when available."""
-        pipeline = ConcretePipeline()
-        pipeline.pipe = Mock()
-        pipeline.unload()
-        mock_empty.assert_called_once()
-        mock_sync.assert_called_once()
+    def test_unload_calls_clear_cache(self):
+        """Unload calls DevicePolicy.clear_cache()."""
+        mock_policy = DevicePolicy(device="cpu", dtype=torch.float32, offload=OffloadMode.NEVER)
+        with patch.object(DevicePolicy, "auto_detect", return_value=mock_policy):
+            pipeline = ConcretePipeline()
+            pipeline.pipe = Mock()
+            with patch.object(DevicePolicy, "clear_cache") as mock_clear:
+                pipeline.unload()
+                mock_clear.assert_called_once()
 
 
 class TestBasePipelinePrepareSeed:
