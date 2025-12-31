@@ -172,7 +172,7 @@ class TestQwenGuidanceScaleMapping:
         # Qwen should prefer true_cfg_scale
         guidance_scale = model_config.get("guidance_scale", 0.0)
         if model_config.get("true_cfg_scale"):
-            guidance_scale = model_config.get("true_cfg_scale", 4.0)
+            guidance_scale = model_config["true_cfg_scale"]
 
         assert guidance_scale == 1.3
 
@@ -185,12 +185,12 @@ class TestQwenGuidanceScaleMapping:
         }
         model_overrides = {"guidance_scale": 2.5}  # User set via /model command
 
-        # Simulate the logic from bot.py (lines 430-448):
+        # Simulate the logic from bot.py (lines 438-456):
         # 1. Start with model_config defaults
         model_guidance = model_config.get("guidance_scale", 0.0)
         # 2. Apply Qwen's true_cfg_scale if present
         if model_config.get("true_cfg_scale"):
-            model_guidance = model_config.get("true_cfg_scale", 4.0)
+            model_guidance = model_config["true_cfg_scale"]
         # 3. model_overrides takes priority if set
         if "guidance_scale" in model_overrides:
             model_guidance = model_overrides["guidance_scale"]
@@ -209,7 +209,7 @@ class TestQwenGuidanceScaleMapping:
 
         model_guidance = model_config.get("guidance_scale", 0.0)
         if model_config.get("true_cfg_scale"):
-            model_guidance = model_config.get("true_cfg_scale", 4.0)
+            model_guidance = model_config["true_cfg_scale"]
         if "guidance_scale" in model_overrides:
             model_guidance = model_overrides["guidance_scale"]
 

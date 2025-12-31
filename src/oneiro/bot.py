@@ -359,16 +359,16 @@ def create_bot() -> discord.Bot:
         int,
         description="Number of inference steps (default: model-specific)",
         required=False,
-        min_value=1,
-        max_value=100,
+        min_value=MIN_STEPS,
+        max_value=MAX_STEPS,
     )
     @option(
         "guidance_scale",
         float,
         description="CFG scale - prompt adherence (default: model-specific)",
         required=False,
-        min_value=0.0,
-        max_value=15.0,
+        min_value=MIN_GUIDANCE_SCALE,
+        max_value=MAX_GUIDANCE_SCALE,
     )
     @option(
         "lora",
@@ -441,7 +441,7 @@ def create_bot() -> discord.Bot:
 
         # Handle Qwen's true_cfg_scale
         if model_config.get("true_cfg_scale"):
-            model_guidance = model_config.get("true_cfg_scale", 4.0)
+            model_guidance = model_config["true_cfg_scale"]
 
         # Check for model-specific overrides set via /model command
         model_overrides = config.get("model_overrides", current_model, default={}) if config else {}
@@ -714,16 +714,16 @@ def create_bot() -> discord.Bot:
         int,
         description="Override default steps for this model",
         required=False,
-        min_value=1,
-        max_value=100,
+        min_value=MIN_STEPS,
+        max_value=MAX_STEPS,
     )
     @option(
         "guidance_scale",
         float,
         description="Override default CFG scale for this model",
         required=False,
-        min_value=0.0,
-        max_value=15.0,
+        min_value=MIN_GUIDANCE_SCALE,
+        max_value=MAX_GUIDANCE_SCALE,
     )
     async def model_command(
         ctx: discord.ApplicationContext,
