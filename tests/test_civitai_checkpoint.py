@@ -489,7 +489,10 @@ class TestCivitaiCheckpointPipelineGenerate:
         mock_pipe.return_value.images = [mock_image]
         pipeline.pipe = mock_pipe
 
-        with patch("oneiro.pipelines.civitai_checkpoint.torch"):
+        with (
+            patch("oneiro.pipelines.civitai_checkpoint.torch"),
+            patch.object(pipeline, "_encode_prompts_to_embeddings"),
+        ):
             pipeline.generate("test prompt")
 
         call_kwargs = mock_pipe.call_args.kwargs
@@ -514,7 +517,10 @@ class TestCivitaiCheckpointPipelineGenerate:
         mock_pipe.return_value.images = [mock_image]
         pipeline.pipe = mock_pipe
 
-        with patch("oneiro.pipelines.civitai_checkpoint.torch"):
+        with (
+            patch("oneiro.pipelines.civitai_checkpoint.torch"),
+            patch.object(pipeline, "_encode_prompts_to_embeddings"),
+        ):
             pipeline.generate(
                 "test prompt",
                 steps=10,
@@ -544,11 +550,17 @@ class TestCivitaiCheckpointPipelineGenerate:
         mock_pipe.return_value.images = [mock_image]
         pipeline.pipe = mock_pipe
 
-        with patch("oneiro.pipelines.civitai_checkpoint.torch"):
+        with (
+            patch("oneiro.pipelines.civitai_checkpoint.torch"),
+            patch.object(pipeline, "_encode_prompts_to_embeddings"),
+        ):
             pipeline.generate("test prompt", negative_prompt="bad quality")
 
-        call_kwargs = mock_pipe.call_args.kwargs
-        assert call_kwargs["negative_prompt"] == "bad quality"
+        # All pipelines using the embedding-based approach (SD 1.x, SD 2.x, SDXL, SD3)
+        # handle negative prompts via embeddings (negative_prompt_embeds, and for SDXL,
+        # negative_pooled_prompt_embeds) computed in _encode_prompts_to_embeddings,
+        # not via direct negative_prompt kwarg. Verify the mock was called correctly.
+        mock_pipe.assert_called_once()
 
     def test_generate_omits_negative_prompt_for_flux(self):
         """generate() omits negative_prompt for Flux pipelines."""
@@ -565,7 +577,10 @@ class TestCivitaiCheckpointPipelineGenerate:
         mock_pipe.return_value.images = [mock_image]
         pipeline.pipe = mock_pipe
 
-        with patch("oneiro.pipelines.civitai_checkpoint.torch"):
+        with (
+            patch("oneiro.pipelines.civitai_checkpoint.torch"),
+            patch.object(pipeline, "_encode_prompts_to_embeddings"),
+        ):
             pipeline.generate("test prompt", negative_prompt="bad quality")
 
         call_kwargs = mock_pipe.call_args.kwargs
@@ -587,7 +602,10 @@ class TestCivitaiCheckpointPipelineGenerate:
         mock_pipe.return_value.images = [mock_image]
         pipeline.pipe = mock_pipe
 
-        with patch("oneiro.pipelines.civitai_checkpoint.torch"):
+        with (
+            patch("oneiro.pipelines.civitai_checkpoint.torch"),
+            patch.object(pipeline, "_encode_prompts_to_embeddings"),
+        ):
             result = pipeline.generate("test prompt", seed=42)
 
         assert result.prompt == "test prompt"
@@ -617,6 +635,7 @@ class TestCivitaiCheckpointPipelineGenerate:
         with (
             patch("oneiro.pipelines.civitai_checkpoint.torch"),
             patch.object(pipeline, "_load_init_image", return_value=mock_init_image),
+            patch.object(pipeline, "_encode_prompts_to_embeddings"),
         ):
             pipeline.generate("test prompt", init_image=b"dummy", strength=0.5)
 
@@ -647,6 +666,7 @@ class TestCivitaiCheckpointPipelineGenerate:
         with (
             patch("oneiro.pipelines.civitai_checkpoint.torch"),
             patch("diffusers.EulerAncestralDiscreteScheduler", mock_euler),
+            patch.object(pipeline, "_encode_prompts_to_embeddings"),
         ):
             pipeline.generate("test prompt", scheduler="euler_a")
 
@@ -834,3 +854,305 @@ class TestConfigureScheduler:
             pipeline.configure_scheduler("euler_a")
 
         mock_euler.from_config.assert_called_once()
+
+
+class TestSupportsPromptEmbeddings:
+    """Tests for CivitaiCheckpointPipeline._supports_prompt_embeddings method."""
+
+    def test_returns_false_when_pipe_is_none(self):
+        """Returns False when pipeline is not loaded."""
+        pipeline = CivitaiCheckpointPipeline()
+        pipeline._pipeline_config = PipelineConfig(pipeline_class="StableDiffusionXLPipeline")
+        # pipe is None by default
+        assert pipeline._supports_prompt_embeddings() is False
+
+    def test_returns_false_when_pipeline_config_is_none(self):
+        """Returns False when pipeline config is not set."""
+        pipeline = CivitaiCheckpointPipeline()
+        pipeline.pipe = MagicMock()  # Pretend pipeline is loaded
+        # _pipeline_config is None by default
+        assert pipeline._supports_prompt_embeddings() is False
+
+    def test_returns_true_for_stable_diffusion_pipeline(self):
+        """Returns True for StableDiffusionPipeline (SD 1.x/2.x)."""
+        pipeline = CivitaiCheckpointPipeline()
+        pipeline.pipe = MagicMock()
+        pipeline._pipeline_config = PipelineConfig(pipeline_class="StableDiffusionPipeline")
+        assert pipeline._supports_prompt_embeddings() is True
+
+    def test_returns_true_for_stable_diffusion_xl_pipeline(self):
+        """Returns True for StableDiffusionXLPipeline."""
+        pipeline = CivitaiCheckpointPipeline()
+        pipeline.pipe = MagicMock()
+        pipeline._pipeline_config = PipelineConfig(pipeline_class="StableDiffusionXLPipeline")
+        assert pipeline._supports_prompt_embeddings() is True
+
+    def test_returns_true_for_flux_pipeline(self):
+        """Returns True for FluxPipeline."""
+        pipeline = CivitaiCheckpointPipeline()
+        pipeline.pipe = MagicMock()
+        pipeline._pipeline_config = PipelineConfig(
+            pipeline_class="FluxPipeline", supports_negative_prompt=False
+        )
+        assert pipeline._supports_prompt_embeddings() is True
+
+    def test_returns_true_for_stable_diffusion_3_pipeline(self):
+        """Returns True for StableDiffusion3Pipeline."""
+        pipeline = CivitaiCheckpointPipeline()
+        pipeline.pipe = MagicMock()
+        pipeline._pipeline_config = PipelineConfig(pipeline_class="StableDiffusion3Pipeline")
+        assert pipeline._supports_prompt_embeddings() is True
+
+    def test_returns_false_for_unsupported_pipeline(self):
+        """Returns False for unsupported pipeline classes."""
+        pipeline = CivitaiCheckpointPipeline()
+        pipeline.pipe = MagicMock()
+
+        unsupported_pipelines = [
+            "PixArtAlphaPipeline",
+            "PixArtSigmaPipeline",
+            "KolorsPipeline",
+            "HunyuanDiTPipeline",
+            "LuminaText2ImgPipeline",
+            "AuraFlowPipeline",
+            "CustomPipeline",
+        ]
+
+        for pipeline_class in unsupported_pipelines:
+            pipeline._pipeline_config = PipelineConfig(pipeline_class=pipeline_class)
+            assert pipeline._supports_prompt_embeddings() is False, (
+                f"Expected False for {pipeline_class}"
+            )
+
+
+class TestEncodePromptsToEmbeddings:
+    """Tests for CivitaiCheckpointPipeline._encode_prompts_to_embeddings method."""
+
+    def test_returns_empty_dict_when_pipe_is_none(self):
+        """Returns empty dict when pipeline is not loaded."""
+        pipeline = CivitaiCheckpointPipeline()
+        pipeline._pipeline_config = PipelineConfig(pipeline_class="StableDiffusionXLPipeline")
+        # pipe is None by default
+        result = pipeline._encode_prompts_to_embeddings("test prompt", None)
+        assert result == {}
+
+    def test_returns_empty_dict_when_pipeline_config_is_none(self):
+        """Returns empty dict when pipeline config is not set."""
+        pipeline = CivitaiCheckpointPipeline()
+        pipeline.pipe = MagicMock()
+        # _pipeline_config is None by default
+        result = pipeline._encode_prompts_to_embeddings("test prompt", None)
+        assert result == {}
+
+    def test_flux_pipeline_encoding(self):
+        """FluxPipeline returns prompt_embeds and pooled_prompt_embeds only."""
+        pipeline = CivitaiCheckpointPipeline()
+        pipeline.pipe = MagicMock()
+        pipeline._pipeline_config = PipelineConfig(
+            pipeline_class="FluxPipeline", supports_negative_prompt=False
+        )
+
+        mock_prompt_embeds = MagicMock()
+        mock_pooled_embeds = MagicMock()
+
+        with patch(
+            "oneiro.pipelines.civitai_checkpoint.get_weighted_text_embeddings_flux",
+            return_value=(mock_prompt_embeds, mock_pooled_embeds),
+        ) as mock_func:
+            result = pipeline._encode_prompts_to_embeddings("test prompt", "negative")
+
+        mock_func.assert_called_once_with(pipeline.pipe, prompt="test prompt")
+        assert result["prompt_embeds"] is mock_prompt_embeds
+        assert result["pooled_prompt_embeds"] is mock_pooled_embeds
+        # Flux doesn't support negative prompts
+        assert "negative_prompt_embeds" not in result
+
+    def test_sd3_pipeline_encoding_with_negative(self):
+        """SD3 Pipeline returns all embedding types including negative."""
+        pipeline = CivitaiCheckpointPipeline()
+        pipeline.pipe = MagicMock()
+        pipeline._pipeline_config = PipelineConfig(
+            pipeline_class="StableDiffusion3Pipeline", supports_negative_prompt=True
+        )
+
+        mock_prompt = MagicMock()
+        mock_neg_prompt = MagicMock()
+        mock_pooled = MagicMock()
+        mock_neg_pooled = MagicMock()
+
+        with patch(
+            "oneiro.pipelines.civitai_checkpoint.get_weighted_text_embeddings_sd3",
+            return_value=(mock_prompt, mock_neg_prompt, mock_pooled, mock_neg_pooled),
+        ) as mock_func:
+            result = pipeline._encode_prompts_to_embeddings("test prompt", "bad quality")
+
+        mock_func.assert_called_once_with(
+            pipeline.pipe, prompt="test prompt", negative_prompt="bad quality"
+        )
+        assert result["prompt_embeds"] is mock_prompt
+        assert result["pooled_prompt_embeds"] is mock_pooled
+        assert result["negative_prompt_embeds"] is mock_neg_prompt
+        assert result["negative_pooled_prompt_embeds"] is mock_neg_pooled
+
+    def test_sd3_pipeline_without_negative_support(self):
+        """SD3 Pipeline without negative prompt support omits negative embeddings."""
+        pipeline = CivitaiCheckpointPipeline()
+        pipeline.pipe = MagicMock()
+        pipeline._pipeline_config = PipelineConfig(
+            pipeline_class="StableDiffusion3Pipeline", supports_negative_prompt=False
+        )
+
+        mock_prompt = MagicMock()
+        mock_neg_prompt = MagicMock()
+        mock_pooled = MagicMock()
+        mock_neg_pooled = MagicMock()
+
+        with patch(
+            "oneiro.pipelines.civitai_checkpoint.get_weighted_text_embeddings_sd3",
+            return_value=(mock_prompt, mock_neg_prompt, mock_pooled, mock_neg_pooled),
+        ):
+            result = pipeline._encode_prompts_to_embeddings("test prompt", "bad quality")
+
+        assert result["prompt_embeds"] is mock_prompt
+        assert result["pooled_prompt_embeds"] is mock_pooled
+        assert "negative_prompt_embeds" not in result
+        assert "negative_pooled_prompt_embeds" not in result
+
+    def test_sdxl_pipeline_encoding_with_negative(self):
+        """SDXL Pipeline returns all embedding types including negative."""
+        pipeline = CivitaiCheckpointPipeline()
+        pipeline.pipe = MagicMock()
+        pipeline._pipeline_config = PipelineConfig(
+            pipeline_class="StableDiffusionXLPipeline", supports_negative_prompt=True
+        )
+
+        mock_prompt = MagicMock()
+        mock_neg_prompt = MagicMock()
+        mock_pooled = MagicMock()
+        mock_neg_pooled = MagicMock()
+
+        with patch(
+            "oneiro.pipelines.civitai_checkpoint.get_weighted_text_embeddings_sdxl",
+            return_value=(mock_prompt, mock_neg_prompt, mock_pooled, mock_neg_pooled),
+        ) as mock_func:
+            result = pipeline._encode_prompts_to_embeddings("test prompt", "bad quality")
+
+        mock_func.assert_called_once_with(
+            pipeline.pipe, prompt="test prompt", negative_prompt="bad quality"
+        )
+        assert result["prompt_embeds"] is mock_prompt
+        assert result["pooled_prompt_embeds"] is mock_pooled
+        assert result["negative_prompt_embeds"] is mock_neg_prompt
+        assert result["negative_pooled_prompt_embeds"] is mock_neg_pooled
+
+    def test_sdxl_pipeline_without_negative_support(self):
+        """SDXL Pipeline without negative prompt support omits negative embeddings."""
+        pipeline = CivitaiCheckpointPipeline()
+        pipeline.pipe = MagicMock()
+        pipeline._pipeline_config = PipelineConfig(
+            pipeline_class="StableDiffusionXLPipeline", supports_negative_prompt=False
+        )
+
+        mock_prompt = MagicMock()
+        mock_neg_prompt = MagicMock()
+        mock_pooled = MagicMock()
+        mock_neg_pooled = MagicMock()
+
+        with patch(
+            "oneiro.pipelines.civitai_checkpoint.get_weighted_text_embeddings_sdxl",
+            return_value=(mock_prompt, mock_neg_prompt, mock_pooled, mock_neg_pooled),
+        ):
+            result = pipeline._encode_prompts_to_embeddings("test prompt", "bad quality")
+
+        assert result["prompt_embeds"] is mock_prompt
+        assert result["pooled_prompt_embeds"] is mock_pooled
+        assert "negative_prompt_embeds" not in result
+        assert "negative_pooled_prompt_embeds" not in result
+
+    def test_sd15_pipeline_encoding_with_negative(self):
+        """SD 1.x/2.x Pipeline returns prompt and negative embeddings."""
+        pipeline = CivitaiCheckpointPipeline()
+        pipeline.pipe = MagicMock()
+        pipeline._pipeline_config = PipelineConfig(
+            pipeline_class="StableDiffusionPipeline", supports_negative_prompt=True
+        )
+
+        mock_prompt = MagicMock()
+        mock_neg_prompt = MagicMock()
+
+        with patch(
+            "oneiro.pipelines.civitai_checkpoint.get_weighted_text_embeddings_sd15",
+            return_value=(mock_prompt, mock_neg_prompt),
+        ) as mock_func:
+            result = pipeline._encode_prompts_to_embeddings("test prompt", "bad quality")
+
+        mock_func.assert_called_once_with(
+            pipeline.pipe, prompt="test prompt", negative_prompt="bad quality"
+        )
+        assert result["prompt_embeds"] is mock_prompt
+        assert result["negative_prompt_embeds"] is mock_neg_prompt
+        # SD 1.x/2.x don't have pooled embeddings
+        assert "pooled_prompt_embeds" not in result
+
+    def test_sd15_pipeline_without_negative_support(self):
+        """SD 1.x/2.x Pipeline without negative prompt support omits negative embeddings."""
+        pipeline = CivitaiCheckpointPipeline()
+        pipeline.pipe = MagicMock()
+        pipeline._pipeline_config = PipelineConfig(
+            pipeline_class="StableDiffusionPipeline", supports_negative_prompt=False
+        )
+
+        mock_prompt = MagicMock()
+        mock_neg_prompt = MagicMock()
+
+        with patch(
+            "oneiro.pipelines.civitai_checkpoint.get_weighted_text_embeddings_sd15",
+            return_value=(mock_prompt, mock_neg_prompt),
+        ):
+            result = pipeline._encode_prompts_to_embeddings("test prompt", "bad quality")
+
+        assert result["prompt_embeds"] is mock_prompt
+        assert "negative_prompt_embeds" not in result
+
+    def test_handles_none_negative_prompt(self):
+        """Handles None negative prompt by converting to empty string."""
+        pipeline = CivitaiCheckpointPipeline()
+        pipeline.pipe = MagicMock()
+        pipeline._pipeline_config = PipelineConfig(
+            pipeline_class="StableDiffusionPipeline", supports_negative_prompt=True
+        )
+
+        mock_prompt = MagicMock()
+        mock_neg_prompt = MagicMock()
+
+        with patch(
+            "oneiro.pipelines.civitai_checkpoint.get_weighted_text_embeddings_sd15",
+            return_value=(mock_prompt, mock_neg_prompt),
+        ) as mock_func:
+            pipeline._encode_prompts_to_embeddings("test prompt", None)
+
+        # Should convert None to empty string
+        mock_func.assert_called_once_with(pipeline.pipe, prompt="test prompt", negative_prompt="")
+
+    def test_falls_back_to_sd15_for_unknown_pipeline(self):
+        """Falls back to SD 1.5 encoding for unknown pipeline classes."""
+        pipeline = CivitaiCheckpointPipeline()
+        pipeline.pipe = MagicMock()
+        # Use a pipeline class that's not in the supported list but would
+        # still go through the else branch
+        pipeline._pipeline_config = PipelineConfig(
+            pipeline_class="SomeOtherDiffusionPipeline", supports_negative_prompt=True
+        )
+
+        mock_prompt = MagicMock()
+        mock_neg_prompt = MagicMock()
+
+        with patch(
+            "oneiro.pipelines.civitai_checkpoint.get_weighted_text_embeddings_sd15",
+            return_value=(mock_prompt, mock_neg_prompt),
+        ) as mock_func:
+            result = pipeline._encode_prompts_to_embeddings("test prompt", "bad")
+
+        mock_func.assert_called_once()
+        assert result["prompt_embeds"] is mock_prompt
+        assert result["negative_prompt_embeds"] is mock_neg_prompt

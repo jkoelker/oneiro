@@ -14,6 +14,12 @@ import torch
 
 from oneiro.pipelines.base import BasePipeline, GenerationResult
 from oneiro.pipelines.embedding import EmbeddingLoaderMixin, parse_embeddings_from_config
+from oneiro.pipelines.long_prompt import (
+    get_weighted_text_embeddings_flux,
+    get_weighted_text_embeddings_sd3,
+    get_weighted_text_embeddings_sd15,
+    get_weighted_text_embeddings_sdxl,
+)
 from oneiro.pipelines.lora import LoraLoaderMixin, parse_loras_from_model_config
 
 if TYPE_CHECKING:
@@ -777,15 +783,20 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
 
         # Build generation kwargs
         gen_kwargs: dict[str, Any] = {
-            "prompt": prompt,
             "num_inference_steps": steps,
             "guidance_scale": guidance_scale,
             "generator": generator,
         }
 
-        # Add negative prompt only for pipelines that support it
-        if self._pipeline_config.supports_negative_prompt and negative_prompt:
-            gen_kwargs["negative_prompt"] = negative_prompt
+        # Use embedding-based prompt handling for pipelines that support it
+        # (SD 1.x, SD 2.x, SDXL, Flux, SD3) - enables weight syntax like (word:1.5)
+        if self._supports_prompt_embeddings():
+            gen_kwargs.update(self._encode_prompts_to_embeddings(prompt, negative_prompt))
+        else:
+            # Fallback for unsupported pipelines
+            gen_kwargs["prompt"] = prompt
+            if self._pipeline_config.supports_negative_prompt and negative_prompt:
+                gen_kwargs["negative_prompt"] = negative_prompt
 
         if init_image:
             print(f"CivitAI img2img: '{prompt[:50]}...' seed={actual_seed} strength={strength}")
@@ -822,3 +833,122 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
     def detected_base_model(self) -> str | None:
         """Get the detected/configured base model."""
         return self._base_model
+
+    def _supports_prompt_embeddings(self) -> bool:
+        """Check if this pipeline supports embedding-based prompt handling.
+
+        Returns True for pipelines that support pre-computed embeddings with
+        weight handling (CLIP-based: SD 1.x, SD 2.x, SDXL; flow-based: Flux;
+        and MMDiT-based: SD3).
+
+        Returns:
+            True if the pipeline supports prompt embeddings
+        """
+        if self.pipe is None or self._pipeline_config is None:
+            return False
+
+        # Pipelines that support embedding-based prompt handling
+        pipeline_class = self._pipeline_config.pipeline_class
+        supported_pipelines = {
+            "StableDiffusionPipeline",
+            "StableDiffusionXLPipeline",
+            "FluxPipeline",
+            "StableDiffusion3Pipeline",
+        }
+
+        return pipeline_class in supported_pipelines
+
+    def _encode_prompts_to_embeddings(
+        self,
+        prompt: str,
+        negative_prompt: str | None,
+    ) -> dict[str, Any]:
+        """Encode prompts to embeddings with weight and chunking support.
+
+        Converts text prompts to pre-computed embeddings, supporting:
+        - A1111-style weight syntax like (word:1.5) and [word]
+        - Prompts longer than CLIP's 77-token limit via chunking
+        - BREAK keyword for forcing chunk boundaries
+
+        This method handles all supported pipelines (SD 1.x/2.x, SDXL, Flux, SD3)
+        with appropriate embedding generation for each architecture.
+
+        Args:
+            prompt: The positive prompt
+            negative_prompt: The negative prompt (may be None)
+
+        Returns:
+            Dict of embedding kwargs to pass to the pipeline
+        """
+        if self.pipe is None or self._pipeline_config is None:
+            return {}
+
+        neg_prompt = negative_prompt or ""
+        pipeline_class = self._pipeline_config.pipeline_class
+        result: dict[str, Any] = {}
+
+        if pipeline_class == "FluxPipeline":
+            # Flux uses T5 for main embeddings + CLIP for pooled
+            # Note: Flux does not support negative prompts
+            prompt_embeds, pooled_prompt_embeds = get_weighted_text_embeddings_flux(
+                self.pipe,
+                prompt=prompt,
+            )
+
+            result["prompt_embeds"] = prompt_embeds
+            result["pooled_prompt_embeds"] = pooled_prompt_embeds
+
+        elif pipeline_class == "StableDiffusion3Pipeline":
+            # SD3 uses dual CLIP + T5 encoders
+            (
+                prompt_embeds,
+                negative_prompt_embeds,
+                pooled_prompt_embeds,
+                negative_pooled_prompt_embeds,
+            ) = get_weighted_text_embeddings_sd3(
+                self.pipe,
+                prompt=prompt,
+                negative_prompt=neg_prompt,
+            )
+
+            result["prompt_embeds"] = prompt_embeds
+            result["pooled_prompt_embeds"] = pooled_prompt_embeds
+
+            if self._pipeline_config.supports_negative_prompt:
+                result["negative_prompt_embeds"] = negative_prompt_embeds
+                result["negative_pooled_prompt_embeds"] = negative_pooled_prompt_embeds
+
+        elif pipeline_class == "StableDiffusionXLPipeline":
+            # SDXL uses dual text encoders
+            (
+                prompt_embeds,
+                negative_prompt_embeds,
+                pooled_prompt_embeds,
+                negative_pooled_prompt_embeds,
+            ) = get_weighted_text_embeddings_sdxl(
+                self.pipe,
+                prompt=prompt,
+                negative_prompt=neg_prompt,
+            )
+
+            result["prompt_embeds"] = prompt_embeds
+            result["pooled_prompt_embeds"] = pooled_prompt_embeds
+
+            if self._pipeline_config.supports_negative_prompt:
+                result["negative_prompt_embeds"] = negative_prompt_embeds
+                result["negative_pooled_prompt_embeds"] = negative_pooled_prompt_embeds
+
+        else:
+            # SD 1.x / 2.x use single text encoder
+            prompt_embeds, negative_prompt_embeds = get_weighted_text_embeddings_sd15(
+                self.pipe,
+                prompt=prompt,
+                negative_prompt=neg_prompt,
+            )
+
+            result["prompt_embeds"] = prompt_embeds
+
+            if self._pipeline_config.supports_negative_prompt:
+                result["negative_prompt_embeds"] = negative_prompt_embeds
+
+        return result
