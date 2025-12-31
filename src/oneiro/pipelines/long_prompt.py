@@ -21,9 +21,44 @@ if TYPE_CHECKING:
 BOS_TOKEN_ID = 49406  # Start of text
 EOS_TOKEN_ID = 49407  # End of text
 MAX_TOKENS_PER_CHUNK = 75  # 77 - 2 (BOS + EOS)
+CHUNK_SIZE = 77  # BOS + 75 content tokens + EOS
 
 # T5-XXL embedding dimension
 T5_EMBEDDING_DIM = 4096
+
+
+def _create_empty_chunk() -> tuple[list[int], list[float]]:
+    """Create an empty 77-token chunk with BOS/EOS structure.
+
+    Returns:
+        Tuple of (chunk, weights) where chunk is [BOS] + 76*[EOS]
+        and weights is all 1.0s.
+    """
+    chunk = [BOS_TOKEN_ID] + [EOS_TOKEN_ID] * (MAX_TOKENS_PER_CHUNK + 1)
+    weights = [1.0] * CHUNK_SIZE
+    return chunk, weights
+
+
+def _apply_weights_to_embedding(
+    embedding: torch.Tensor,
+    weights: torch.Tensor,
+) -> torch.Tensor:
+    """Apply per-token weights to embedding tensor in-place.
+
+    Uses vectorized multiplication to efficiently scale each token's
+    embedding vector by its corresponding weight.
+
+    Args:
+        embedding: Token embeddings of shape (num_tokens, hidden_dim)
+        weights: Weight values of shape (num_weights,)
+
+    Returns:
+        The modified embedding tensor (modified in-place)
+    """
+    num_tokens = min(len(weights), embedding.size(0))
+    embedding[:num_tokens] = embedding[:num_tokens] * weights[:num_tokens].unsqueeze(-1)
+    return embedding
+
 
 # Regex for parsing A1111-style attention weights
 RE_ATTENTION = re.compile(
@@ -241,8 +276,7 @@ def group_tokens_into_chunks(
     # Handle edge case: if no chunks were produced (e.g., token_ids was empty or only BREAK markers),
     # create an empty chunk to ensure encoders have at least one chunk to process
     if not new_token_ids:
-        empty_chunk = [BOS_TOKEN_ID] + [EOS_TOKEN_ID] * (MAX_TOKENS_PER_CHUNK + 1)
-        empty_weights = [1.0] * 77
+        empty_chunk, empty_weights = _create_empty_chunk()
         new_token_ids.append(empty_chunk)
         new_weights.append(empty_weights)
 
@@ -304,8 +338,7 @@ def pad_chunks_to_same_count(
 
     # Create an empty chunk (all EOS tokens with weight 1.0)
     # Chunk structure: [BOS] + 75 EOS tokens + [EOS] = 77 tokens
-    empty_chunk = [BOS_TOKEN_ID] + [EOS_TOKEN_ID] * (MAX_TOKENS_PER_CHUNK + 1)
-    empty_weights = [1.0] * 77
+    empty_chunk, empty_weights = _create_empty_chunk()
 
     if len_a > len_b:
         for _ in range(len_a - len_b):
@@ -355,17 +388,8 @@ def get_weighted_text_embeddings_sd15(
         neg_tokens, neg_weights, pad_last_block=pad_last_block
     )
 
-    # Handle edge case where chunking produces empty lists (e.g., prompt of only BREAK keywords)
-    # Create an empty chunk to ensure encoders have at least one chunk to process
-    empty_chunk = [BOS_TOKEN_ID] + [EOS_TOKEN_ID] * (MAX_TOKENS_PER_CHUNK + 1)
-    empty_weights = [1.0] * 77
-
-    if not prompt_chunks:
-        prompt_chunks = [empty_chunk]
-        prompt_chunk_weights = [empty_weights]
-    if not neg_chunks:
-        neg_chunks = [empty_chunk]
-        neg_chunk_weights = [empty_weights]
+    # Note: group_tokens_into_chunks guarantees at least one chunk,
+    # so no need to handle empty chunk lists here
 
     # Ensure same number of chunks (in case of different BREAK marker counts)
     prompt_chunks, prompt_chunk_weights, neg_chunks, neg_chunk_weights = pad_chunks_to_same_count(
@@ -391,11 +415,8 @@ def get_weighted_text_embeddings_sd15(
         with torch.no_grad():
             token_embedding = pipe.text_encoder(token_tensor)[0].squeeze(0)
 
-        # Apply weights using vectorized multiplication
-        num_tokens = min(len(weight_tensor), token_embedding.size(0))
-        token_embedding[:num_tokens] = token_embedding[:num_tokens] * weight_tensor[
-            :num_tokens
-        ].unsqueeze(-1)
+        # Apply weights
+        _apply_weights_to_embedding(token_embedding, weight_tensor)
 
         embeds.append(token_embedding.unsqueeze(0))
 
@@ -406,11 +427,8 @@ def get_weighted_text_embeddings_sd15(
         with torch.no_grad():
             neg_token_embedding = pipe.text_encoder(neg_token_tensor)[0].squeeze(0)
 
-        # Apply weights using vectorized multiplication
-        num_neg_tokens = min(len(neg_weight_tensor), neg_token_embedding.size(0))
-        neg_token_embedding[:num_neg_tokens] = neg_token_embedding[
-            :num_neg_tokens
-        ] * neg_weight_tensor[:num_neg_tokens].unsqueeze(-1)
+        # Apply weights
+        _apply_weights_to_embedding(neg_token_embedding, neg_weight_tensor)
 
         neg_embeds.append(neg_token_embedding.unsqueeze(0))
 
@@ -516,23 +534,8 @@ def get_weighted_text_embeddings_sdxl(
         neg_tokens_2, neg_weights_2, pad_last_block=pad_last_block
     )
 
-    # Handle edge case where chunking produces empty lists (e.g., prompt of only BREAK keywords)
-    # Create an empty chunk to ensure encoders have at least one chunk to process
-    empty_chunk = [BOS_TOKEN_ID] + [EOS_TOKEN_ID] * (MAX_TOKENS_PER_CHUNK + 1)
-    empty_weights = [1.0] * 77
-
-    if not prompt_chunks_1:
-        prompt_chunks_1 = [empty_chunk]
-        prompt_chunk_weights_1 = [empty_weights]
-    if not neg_chunks_1:
-        neg_chunks_1 = [empty_chunk]
-        neg_chunk_weights_1 = [empty_weights]
-    if not prompt_chunks_2:
-        prompt_chunks_2 = [empty_chunk]
-        prompt_chunk_weights_2 = [empty_weights]
-    if not neg_chunks_2:
-        neg_chunks_2 = [empty_chunk]
-        neg_chunk_weights_2 = [empty_weights]
+    # Note: group_tokens_into_chunks guarantees at least one chunk,
+    # so no need to handle empty chunk lists here
 
     # Ensure same number of chunks for each encoder (in case of different BREAK marker counts)
     prompt_chunks_1, prompt_chunk_weights_1, neg_chunks_1, neg_chunk_weights_1 = (
@@ -579,11 +582,8 @@ def get_weighted_text_embeddings_sdxl(
             [prompt_embeds_1_hidden, prompt_embeds_2_hidden], dim=-1
         ).squeeze(0)
 
-        # Apply weights using vectorized multiplication
-        num_tokens = min(len(weight_tensor), token_embedding.size(0))
-        token_embedding[:num_tokens] = token_embedding[:num_tokens] * weight_tensor[
-            :num_tokens
-        ].unsqueeze(-1)
+        # Apply weights
+        _apply_weights_to_embedding(token_embedding, weight_tensor)
 
         embeds.append(token_embedding.unsqueeze(0))
 
@@ -609,11 +609,8 @@ def get_weighted_text_embeddings_sdxl(
             [neg_prompt_embeds_1_hidden, neg_prompt_embeds_2_hidden], dim=-1
         ).squeeze(0)
 
-        # Apply weights using vectorized multiplication
-        num_neg_tokens = min(len(neg_weight_tensor), neg_token_embedding.size(0))
-        neg_token_embedding[:num_neg_tokens] = neg_token_embedding[
-            :num_neg_tokens
-        ] * neg_weight_tensor[:num_neg_tokens].unsqueeze(-1)
+        # Apply weights
+        _apply_weights_to_embedding(neg_token_embedding, neg_weight_tensor)
 
         neg_embeds.append(neg_token_embedding.unsqueeze(0))
 
@@ -673,17 +670,9 @@ def get_weighted_text_embeddings_flux(
 
     # Get CLIP tokens for pooled embeddings (uses chunking for long prompts)
     clip_tokens, clip_weights = get_tokens_and_weights(pipe.tokenizer, effective_prompt)
-    clip_chunks, clip_chunk_weights = group_tokens_into_chunks(
-        clip_tokens, clip_weights, pad_last_block=True
-    )
-
-    # Handle edge case: if no chunks were produced (e.g., prompt was only BREAK keywords),
-    # create an empty chunk to ensure we have at least one embedding
-    if not clip_chunks:
-        empty_chunk = [BOS_TOKEN_ID] + [EOS_TOKEN_ID] * (MAX_TOKENS_PER_CHUNK + 1)
-        clip_chunks = [empty_chunk]
-        # Note: clip_chunk_weights is not used for pooled embeddings but we maintain
-        # the variable for consistency with the chunking API
+    # Note: group_tokens_into_chunks guarantees at least one chunk, and
+    # clip_chunk_weights is not used for pooled embeddings
+    clip_chunks, _ = group_tokens_into_chunks(clip_tokens, clip_weights, pad_last_block=True)
 
     # Get T5 tokens for main embeddings (no chunking needed, T5 handles long sequences)
     t5_tokens, t5_weights = get_t5_tokens_and_weights(pipe.tokenizer_2, effective_prompt)
@@ -706,12 +695,9 @@ def get_weighted_text_embeddings_flux(
         t5_output = pipe.text_encoder_2(t5_token_tensor)
     t5_embeds = t5_output[0].squeeze(0)
 
-    # Apply weights to T5 embeddings using vectorized multiplication
+    # Apply weights to T5 embeddings
     t5_weight_tensor = torch.tensor(t5_weights, dtype=t5_embeds.dtype, device=device)
-    num_t5_tokens = min(len(t5_weight_tensor), t5_embeds.size(0))
-    t5_embeds[:num_t5_tokens] = t5_embeds[:num_t5_tokens] * t5_weight_tensor[
-        :num_t5_tokens
-    ].unsqueeze(-1)
+    _apply_weights_to_embedding(t5_embeds, t5_weight_tensor)
 
     prompt_embeds = t5_embeds.unsqueeze(0)
     prompt_embeds = prompt_embeds.to(dtype=pipe.text_encoder_2.dtype, device=device)
@@ -781,23 +767,8 @@ def get_weighted_text_embeddings_sd3(
         neg_tokens_2, neg_weights_2, pad_last_block=pad_last_block
     )
 
-    # Handle edge case where chunking produces empty lists (e.g., prompt of only BREAK keywords)
-    # Create an empty chunk to ensure encoders have at least one chunk to process
-    empty_chunk = [BOS_TOKEN_ID] + [EOS_TOKEN_ID] * (MAX_TOKENS_PER_CHUNK + 1)
-    empty_weights = [1.0] * 77
-
-    if not prompt_chunks_1:
-        prompt_chunks_1 = [empty_chunk]
-        prompt_chunk_weights_1 = [empty_weights]
-    if not neg_chunks_1:
-        neg_chunks_1 = [empty_chunk]
-        neg_chunk_weights_1 = [empty_weights]
-    if not prompt_chunks_2:
-        prompt_chunks_2 = [empty_chunk]
-        prompt_chunk_weights_2 = [empty_weights]
-    if not neg_chunks_2:
-        neg_chunks_2 = [empty_chunk]
-        neg_chunk_weights_2 = [empty_weights]
+    # Note: group_tokens_into_chunks guarantees at least one chunk,
+    # so no need to handle empty chunk lists here
 
     # Ensure same number of chunks for each encoder (in case of different BREAK marker counts)
     prompt_chunks_1, prompt_chunk_weights_1, neg_chunks_1, neg_chunk_weights_1 = (
@@ -850,11 +821,8 @@ def get_weighted_text_embeddings_sd3(
             [prompt_embeds_1_hidden, prompt_embeds_2_hidden], dim=-1
         ).squeeze(0)
 
-        # Apply weights using vectorized multiplication
-        num_tokens = min(len(weight_tensor), token_embedding.size(0))
-        token_embedding[:num_tokens] = token_embedding[:num_tokens] * weight_tensor[
-            :num_tokens
-        ].unsqueeze(-1)
+        # Apply weights
+        _apply_weights_to_embedding(token_embedding, weight_tensor)
 
         embeds.append(token_embedding.unsqueeze(0))
 
@@ -880,11 +848,8 @@ def get_weighted_text_embeddings_sd3(
             [neg_prompt_embeds_1_hidden, neg_prompt_embeds_2_hidden], dim=-1
         ).squeeze(0)
 
-        # Apply weights using vectorized multiplication
-        num_neg_tokens = min(len(neg_weight_tensor), neg_token_embedding.size(0))
-        neg_token_embedding[:num_neg_tokens] = neg_token_embedding[
-            :num_neg_tokens
-        ] * neg_weight_tensor[:num_neg_tokens].unsqueeze(-1)
+        # Apply weights
+        _apply_weights_to_embedding(neg_token_embedding, neg_weight_tensor)
 
         neg_embeds.append(neg_token_embedding.unsqueeze(0))
 
@@ -903,24 +868,18 @@ def get_weighted_text_embeddings_sd3(
         t5_token_tensor = torch.tensor([prompt_tokens_3], dtype=torch.long, device=device)
         t5_embeds = pipe.text_encoder_3(t5_token_tensor)[0].squeeze(0)
 
-        # Apply weights using vectorized multiplication
+        # Apply weights
         t5_weight_tensor = torch.tensor(prompt_weights_3, dtype=t5_embeds.dtype, device=device)
-        num_t5_tokens = min(len(t5_weight_tensor), t5_embeds.size(0))
-        t5_embeds[:num_t5_tokens] = t5_embeds[:num_t5_tokens] * t5_weight_tensor[
-            :num_t5_tokens
-        ].unsqueeze(-1)
+        _apply_weights_to_embedding(t5_embeds, t5_weight_tensor)
         t5_embeds = t5_embeds.unsqueeze(0)
 
         # Negative T5
         neg_t5_token_tensor = torch.tensor([neg_tokens_3], dtype=torch.long, device=device)
         neg_t5_embeds = pipe.text_encoder_3(neg_t5_token_tensor)[0].squeeze(0)
 
-        # Apply weights using vectorized multiplication
+        # Apply weights
         neg_t5_weight_tensor = torch.tensor(neg_weights_3, dtype=neg_t5_embeds.dtype, device=device)
-        num_neg_t5_tokens = min(len(neg_t5_weight_tensor), neg_t5_embeds.size(0))
-        neg_t5_embeds[:num_neg_t5_tokens] = neg_t5_embeds[
-            :num_neg_t5_tokens
-        ] * neg_t5_weight_tensor[:num_neg_t5_tokens].unsqueeze(-1)
+        _apply_weights_to_embedding(neg_t5_embeds, neg_t5_weight_tensor)
         neg_t5_embeds = neg_t5_embeds.unsqueeze(0)
     else:
         # Create zero tensors if T5 not available
