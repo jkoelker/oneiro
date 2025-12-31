@@ -1,12 +1,11 @@
 """LoRA configuration types and loading utilities."""
 
-import re
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Any
 
-from oneiro.civitai import CivitaiClient
+from oneiro.civitai import CivitaiClient, parse_civitai_url
 
 
 class LoraSource(str, Enum):
@@ -78,38 +77,6 @@ class LoraConfig:
         elif self.source == LoraSource.LOCAL:
             if not self.path:
                 raise ValueError("local source requires path")
-
-
-def parse_civitai_url(url: str) -> tuple[int, int | None]:
-    """Parse Civitai URL to extract model ID and optional version ID.
-
-    Supports formats:
-    - https://civitai.com/models/12345
-    - https://civitai.com/models/12345/model-name
-    - https://civitai.com/models/12345?modelVersionId=67890
-    - https://civitai.com/models/12345/name?modelVersionId=67890
-
-    Args:
-        url: Civitai model URL
-
-    Returns:
-        Tuple of (model_id, version_id or None)
-
-    Raises:
-        ValueError: If URL format is invalid
-    """
-    # Match model ID in path
-    model_match = re.search(r"/models/(\d+)", url)
-    if not model_match:
-        raise ValueError(f"Invalid Civitai URL format: {url}")
-
-    model_id = int(model_match.group(1))
-
-    # Check for version in query string
-    version_match = re.search(r"modelVersionId=(\d+)", url)
-    version_id = int(version_match.group(1)) if version_match else None
-
-    return model_id, version_id
 
 
 def parse_lora_config(config: dict[str, Any] | str, index: int = 0) -> LoraConfig:

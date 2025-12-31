@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import shutil
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -61,6 +62,38 @@ class BaseModel(str, Enum):
     SDXL_1_0 = "SDXL 1.0"
     PONY = "Pony"
     FLUX_1 = "Flux.1"
+
+
+def parse_civitai_url(url: str) -> tuple[int, int | None]:
+    """Parse Civitai URL to extract model ID and optional version ID.
+
+    Supports formats:
+    - https://civitai.com/models/12345
+    - https://civitai.com/models/12345/model-name
+    - https://civitai.com/models/12345?modelVersionId=67890
+    - https://civitai.com/models/12345/name?modelVersionId=67890
+
+    Args:
+        url: Civitai model URL
+
+    Returns:
+        Tuple of (model_id, version_id or None)
+
+    Raises:
+        ValueError: If URL format is invalid
+    """
+    # Match model ID in path
+    model_match = re.search(r"/models/(\d+)", url)
+    if not model_match:
+        raise ValueError(f"Invalid Civitai URL format: {url}")
+
+    model_id = int(model_match.group(1))
+
+    # Check for version in query string
+    version_match = re.search(r"modelVersionId=(\d+)", url)
+    version_id = int(version_match.group(1)) if version_match else None
+
+    return model_id, version_id
 
 
 @dataclass
