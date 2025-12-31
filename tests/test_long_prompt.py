@@ -210,6 +210,67 @@ class TestGetTokensAndWeights:
         assert isinstance(weights, list), "weights should be a list"
         assert len(tokens) == len(weights), "tokens and weights should have same length"
 
+    def test_tokenizer_returns_insufficient_tokens(self):
+        """Should handle tokenizer returning fewer than 2 tokens gracefully."""
+        from unittest.mock import Mock
+
+        tokenizer = Mock()
+        # Return only BOS/EOS with no content (len < 2 after strip would be empty)
+        tokenizer.return_value = Mock(input_ids=[BOS_TOKEN_ID, EOS_TOKEN_ID])
+
+        tokens, weights = get_tokens_and_weights(tokenizer, "test")
+
+        # Should not raise, and return valid (possibly empty) lists
+        assert isinstance(tokens, list)
+        assert isinstance(weights, list)
+        assert len(tokens) == len(weights)
+
+    def test_tokenizer_returns_single_token(self):
+        """Should handle tokenizer returning single token gracefully."""
+        from unittest.mock import Mock
+
+        tokenizer = Mock()
+        # Return only one token (unexpected edge case)
+        tokenizer.return_value = Mock(input_ids=[BOS_TOKEN_ID])
+
+        tokens, weights = get_tokens_and_weights(tokenizer, "test")
+
+        # Should not raise, and return valid (possibly empty) lists
+        assert isinstance(tokens, list)
+        assert isinstance(weights, list)
+        assert len(tokens) == len(weights)
+
+    def test_tokenizer_returns_empty_list(self):
+        """Should handle tokenizer returning empty list gracefully."""
+        from unittest.mock import Mock
+
+        tokenizer = Mock()
+        # Return empty input_ids (very unexpected)
+        tokenizer.return_value = Mock(input_ids=[])
+
+        tokens, weights = get_tokens_and_weights(tokenizer, "test")
+
+        # Should not raise, and return valid (possibly empty) lists
+        assert isinstance(tokens, list)
+        assert isinstance(weights, list)
+        assert len(tokens) == len(weights)
+
+    def test_tokenizer_missing_input_ids_attribute(self):
+        """Should handle tokenizer result missing input_ids attribute gracefully."""
+        from unittest.mock import Mock
+
+        tokenizer = Mock()
+        # Return object without input_ids attribute
+        result = Mock(spec=[])  # Empty spec means no attributes
+        tokenizer.return_value = result
+
+        tokens, weights = get_tokens_and_weights(tokenizer, "test")
+
+        # Should not raise, and return valid (possibly empty) lists
+        assert isinstance(tokens, list)
+        assert isinstance(weights, list)
+        assert len(tokens) == len(weights)
+
 
 class TestIntegration:
     """Integration tests for long prompt handling."""

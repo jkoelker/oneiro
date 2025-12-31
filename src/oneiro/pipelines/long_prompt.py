@@ -150,7 +150,16 @@ def get_tokens_and_weights(
             continue
 
         # Tokenize and discard BOS/EOS tokens
-        token_ids = tokenizer(word, truncation=False).input_ids[1:-1]
+        result = tokenizer(word, truncation=False)
+        input_ids = result.input_ids if hasattr(result, "input_ids") else []
+
+        # Handle edge cases: empty result or insufficient tokens
+        if len(input_ids) < 2:
+            # No content tokens (just BOS/EOS or empty), skip this fragment
+            continue
+
+        # Strip BOS and EOS tokens (first and last)
+        token_ids = input_ids[1:-1]
 
         text_tokens.extend(token_ids)
         # Expand weight for each token
