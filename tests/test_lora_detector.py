@@ -140,6 +140,60 @@ class TestAutoLoraDetector:
         matches = detector.match("a shinkaiX artwork", "sdxl")
         assert len(matches) == 0
 
+    def test_hyphenated_trigger_words(self):
+        """Matches trigger words containing hyphens."""
+        detector = AutoLoraDetector()
+
+        lora = LoraConfig(
+            name="x-ray-lora",
+            source=LoraSource.LOCAL,
+            path="/loras/xray.safetensors",
+            trigger_words=["x-ray", "x-ray style"],
+            base_model="SDXL 1.0",
+        )
+        detector.register_loras([lora])
+
+        matches = detector.match("an x-ray image of a hand", "sdxl")
+        assert len(matches) == 1
+        assert matches[0].matched_trigger == "x-ray"
+
+    def test_hyphenated_trigger_no_partial_match(self):
+        """Hyphenated triggers don't match partial words."""
+        detector = AutoLoraDetector()
+
+        lora = LoraConfig(
+            name="x-ray-lora",
+            source=LoraSource.LOCAL,
+            path="/loras/xray.safetensors",
+            trigger_words=["x-ray"],
+            base_model="SDXL 1.0",
+        )
+        detector.register_loras([lora])
+
+        matches = detector.match("a pixray image", "sdxl")
+        assert len(matches) == 0
+
+    def test_special_char_trigger_words(self):
+        """Matches trigger words with special characters like underscores."""
+        detector = AutoLoraDetector()
+
+        lora = LoraConfig(
+            name="special-lora",
+            source=LoraSource.LOCAL,
+            path="/loras/special.safetensors",
+            trigger_words=["art_style", "foo.bar"],
+            base_model="SDXL 1.0",
+        )
+        detector.register_loras([lora])
+
+        matches = detector.match("generate an image in art_style", "sdxl")
+        assert len(matches) == 1
+        assert matches[0].matched_trigger == "art_style"
+
+        matches = detector.match("generate foo.bar image", "sdxl")
+        assert len(matches) == 1
+        assert matches[0].matched_trigger == "foo.bar"
+
     def test_max_per_request_limit(self):
         """Respects max_per_request limit."""
         config = AutoLoraDetectorConfig(max_per_request=1)

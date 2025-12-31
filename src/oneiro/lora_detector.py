@@ -91,7 +91,9 @@ class AutoLoraDetector:
 
         sorted_triggers = sorted(trigger_to_loras.keys(), key=len, reverse=True)
         escaped = [re.escape(t) for t in sorted_triggers]
-        pattern_str = r"(?<![A-Za-z0-9_])(" + "|".join(escaped) + r")(?![A-Za-z0-9_])"
+        # Use word boundary that handles hyphens and special characters in triggers.
+        # Matches at: start of string, whitespace, or common punctuation (not mid-word).
+        pattern_str = r"(?<![A-Za-z0-9])(" + "|".join(escaped) + r")(?![A-Za-z0-9])"
         pattern = re.compile(pattern_str, re.IGNORECASE)
 
         return TriggerIndex(pattern=pattern, trigger_to_loras=trigger_to_loras)
