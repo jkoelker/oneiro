@@ -791,7 +791,7 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
         # Use embedding-based prompt handling for pipelines that support it
         # (SD 1.x, SD 2.x, SDXL, Flux, SD3) - enables weight syntax like (word:1.5)
         if self._supports_prompt_embeddings():
-            self._encode_prompts_to_embeddings(gen_kwargs, prompt, negative_prompt)
+            gen_kwargs.update(self._encode_prompts_to_embeddings(prompt, negative_prompt))
         else:
             # Fallback for unsupported pipelines
             gen_kwargs["prompt"] = prompt
@@ -859,10 +859,9 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
 
     def _encode_prompts_to_embeddings(
         self,
-        gen_kwargs: dict[str, Any],
         prompt: str,
         negative_prompt: str | None,
-    ) -> None:
+    ) -> dict[str, Any]:
         """Encode prompts to embeddings with weight and chunking support.
 
         Converts text prompts to pre-computed embeddings, supporting:
@@ -874,15 +873,18 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
         with appropriate embedding generation for each architecture.
 
         Args:
-            gen_kwargs: Generation kwargs dict to update (modified in place)
             prompt: The positive prompt
             negative_prompt: The negative prompt (may be None)
+
+        Returns:
+            Dict of embedding kwargs to pass to the pipeline
         """
         if self.pipe is None or self._pipeline_config is None:
-            return
+            return {}
 
         neg_prompt = negative_prompt or ""
         pipeline_class = self._pipeline_config.pipeline_class
+        result: dict[str, Any] = {}
 
         if pipeline_class == "FluxPipeline":
             # Flux uses T5 for main embeddings + CLIP for pooled
@@ -892,8 +894,8 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
                 prompt=prompt,
             )
 
-            gen_kwargs["prompt_embeds"] = prompt_embeds
-            gen_kwargs["pooled_prompt_embeds"] = pooled_prompt_embeds
+            result["prompt_embeds"] = prompt_embeds
+            result["pooled_prompt_embeds"] = pooled_prompt_embeds
 
         elif pipeline_class == "StableDiffusion3Pipeline":
             # SD3 uses dual CLIP + T5 encoders
@@ -908,12 +910,12 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
                 negative_prompt=neg_prompt,
             )
 
-            gen_kwargs["prompt_embeds"] = prompt_embeds
-            gen_kwargs["pooled_prompt_embeds"] = pooled_prompt_embeds
+            result["prompt_embeds"] = prompt_embeds
+            result["pooled_prompt_embeds"] = pooled_prompt_embeds
 
             if self._pipeline_config.supports_negative_prompt:
-                gen_kwargs["negative_prompt_embeds"] = negative_prompt_embeds
-                gen_kwargs["negative_pooled_prompt_embeds"] = negative_pooled_prompt_embeds
+                result["negative_prompt_embeds"] = negative_prompt_embeds
+                result["negative_pooled_prompt_embeds"] = negative_pooled_prompt_embeds
 
         elif pipeline_class == "StableDiffusionXLPipeline":
             # SDXL uses dual text encoders
@@ -928,12 +930,12 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
                 negative_prompt=neg_prompt,
             )
 
-            gen_kwargs["prompt_embeds"] = prompt_embeds
-            gen_kwargs["pooled_prompt_embeds"] = pooled_prompt_embeds
+            result["prompt_embeds"] = prompt_embeds
+            result["pooled_prompt_embeds"] = pooled_prompt_embeds
 
             if self._pipeline_config.supports_negative_prompt:
-                gen_kwargs["negative_prompt_embeds"] = negative_prompt_embeds
-                gen_kwargs["negative_pooled_prompt_embeds"] = negative_pooled_prompt_embeds
+                result["negative_prompt_embeds"] = negative_prompt_embeds
+                result["negative_pooled_prompt_embeds"] = negative_pooled_prompt_embeds
 
         else:
             # SD 1.x / 2.x use single text encoder
@@ -943,7 +945,9 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
                 negative_prompt=neg_prompt,
             )
 
-            gen_kwargs["prompt_embeds"] = prompt_embeds
+            result["prompt_embeds"] = prompt_embeds
 
             if self._pipeline_config.supports_negative_prompt:
-                gen_kwargs["negative_prompt_embeds"] = negative_prompt_embeds
+                result["negative_prompt_embeds"] = negative_prompt_embeds
+
+        return result
