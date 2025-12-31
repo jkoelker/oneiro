@@ -63,7 +63,6 @@ class LoraConfig:
     auto_detect: bool | None = None
 
     _resolved_path: Path | None = field(default=None, repr=False)
-    _resolved_path: Path | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         """Validate configuration and set defaults."""
