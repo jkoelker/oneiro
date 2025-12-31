@@ -345,6 +345,18 @@ def get_weighted_text_embeddings_sd15(
         neg_tokens, neg_weights, pad_last_block=pad_last_block
     )
 
+    # Handle edge case where chunking produces empty lists (e.g., prompt of only BREAK keywords)
+    # Create an empty chunk to ensure encoders have at least one chunk to process
+    empty_chunk = [BOS_TOKEN_ID] + [EOS_TOKEN_ID] * (MAX_TOKENS_PER_CHUNK + 1)
+    empty_weights = [1.0] * 77
+
+    if not prompt_chunks:
+        prompt_chunks = [empty_chunk]
+        prompt_chunk_weights = [empty_weights]
+    if not neg_chunks:
+        neg_chunks = [empty_chunk]
+        neg_chunk_weights = [empty_weights]
+
     # Ensure same number of chunks (in case of different BREAK marker counts)
     prompt_chunks, prompt_chunk_weights, neg_chunks, neg_chunk_weights = pad_chunks_to_same_count(
         prompt_chunks, prompt_chunk_weights, neg_chunks, neg_chunk_weights

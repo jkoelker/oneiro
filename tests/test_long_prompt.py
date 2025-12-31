@@ -519,6 +519,27 @@ class TestGetWeightedTextEmbeddingsSD15:
         assert isinstance(result, tuple)
         assert len(result) == 2
 
+    def test_handles_only_break_keywords(self):
+        """Should handle prompts that are only BREAK keywords (edge case).
+
+        When input is only BREAK keywords, tokenization produces no actual tokens,
+        resulting in empty chunk lists. The function should handle this gracefully
+        by creating at least one valid empty chunk instead of failing at torch.cat.
+        """
+        pipe = self._create_mock_pipe()
+
+        # Configure tokenizer to return only BOS/EOS (no content tokens) for BREAK-only input
+        # This simulates what happens when the prompt text after parsing is empty
+        pipe.tokenizer.return_value = Mock(input_ids=[BOS_TOKEN_ID, EOS_TOKEN_ID])
+
+        # This should not raise - the function should handle empty chunks gracefully
+        result = get_weighted_text_embeddings_sd15(pipe, "BREAK", "BREAK BREAK")
+
+        assert isinstance(result, tuple)
+        assert len(result) == 2
+        assert isinstance(result[0], torch.Tensor)
+        assert isinstance(result[1], torch.Tensor)
+
 
 class TestGetWeightedTextEmbeddingsSDXL:
     """Tests for get_weighted_text_embeddings_sdxl function."""
