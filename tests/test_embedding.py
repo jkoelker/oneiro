@@ -509,8 +509,8 @@ class TestEmbeddingLoaderMixin:
 
         class MockPipeline(EmbeddingLoaderMixin):
             def __init__(self):
+                super().__init__()
                 self.pipe = Mock()
-                self._init_embedding_state()
 
         pipeline = MockPipeline()
         pipeline._loaded_tokens = ["token1", "token2"]
@@ -532,8 +532,8 @@ class TestEmbeddingLoaderMixin:
 
         class MockPipeline(EmbeddingLoaderMixin):
             def __init__(self):
+                super().__init__()
                 self.pipe = Mock()
-                self._init_embedding_state()
 
         pipeline = MockPipeline()
         pipeline._loaded_tokens = ["token1"]
@@ -547,8 +547,8 @@ class TestEmbeddingLoaderMixin:
 
         class MockPipeline(EmbeddingLoaderMixin):
             def __init__(self):
+                super().__init__()
                 self.pipe = None
-                self._init_embedding_state()
 
         pipeline = MockPipeline()
 
@@ -561,8 +561,8 @@ class TestEmbeddingLoaderMixin:
 
         class MockPipeline(EmbeddingLoaderMixin):
             def __init__(self):
+                super().__init__()
                 self.pipe = Mock()
-                self._init_embedding_state()
 
         pipeline = MockPipeline()
         pipeline._loaded_tokens = ["token1", "token2"]
@@ -583,8 +583,8 @@ class TestEmbeddingLoaderMixin:
 
         class MockPipeline(EmbeddingLoaderMixin):
             def __init__(self):
+                super().__init__()
                 self.pipe = Mock()
-                self._init_embedding_state()
 
         pipeline = MockPipeline()
 
@@ -598,8 +598,8 @@ class TestEmbeddingLoaderMixin:
 
         class MockPipeline(EmbeddingLoaderMixin):
             def __init__(self):
+                super().__init__()
                 self.pipe = None
-                self._init_embedding_state()
 
         pipeline = MockPipeline()
         pipeline._loaded_tokens = ["token1"]
@@ -614,9 +614,9 @@ class TestEmbeddingLoaderMixin:
 
         class MockPipeline(EmbeddingLoaderMixin):
             def __init__(self):
+                super().__init__()
                 self.pipe = Mock()
                 self.pipe.unload_textual_inversion.side_effect = RuntimeError("API error")
-                self._init_embedding_state()
 
         pipeline = MockPipeline()
         pipeline._loaded_tokens = ["token1"]
@@ -637,9 +637,9 @@ class TestEmbeddingLoaderMixin:
 
         class MockPipeline(EmbeddingLoaderMixin):
             def __init__(self):
+                super().__init__()
                 self.pipe = Mock()
                 self.pipe.unload_textual_inversion.side_effect = RuntimeError("API error")
-                self._init_embedding_state()
 
         pipeline = MockPipeline()
         pipeline._loaded_tokens = ["token1"]
@@ -660,8 +660,8 @@ class TestEmbeddingLoaderMixin:
 
         class MockPipeline(EmbeddingLoaderMixin):
             def __init__(self):
+                super().__init__()
                 self.pipe = Mock()
-                self._init_embedding_state()
 
         pipeline = MockPipeline()
         pipeline._loaded_tokens = ["my-embedding"]

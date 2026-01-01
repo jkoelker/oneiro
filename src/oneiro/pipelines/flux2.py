@@ -16,8 +16,6 @@ class Flux2PipelineWrapper(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipeline):
 
     def __init__(self) -> None:
         super().__init__()
-        self._init_lora_state()
-        self._init_embedding_state()
 
     def load(self, model_config: dict[str, Any], full_config: dict[str, Any] | None = None) -> None:
         """Load FLUX.2 model with components on CPU for memory efficiency."""

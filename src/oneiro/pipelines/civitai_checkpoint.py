@@ -514,8 +514,6 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
 
     def __init__(self) -> None:
         super().__init__()
-        self._init_lora_state()
-        self._init_embedding_state()
         self._pipeline_config: PipelineConfig | None = None
         self._base_model: str | None = None
         self._full_config: dict[str, Any] | None = None

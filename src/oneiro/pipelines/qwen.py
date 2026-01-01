@@ -18,8 +18,6 @@ class QwenPipelineWrapper(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipeline):
 
     def __init__(self) -> None:
         super().__init__()
-        self._init_lora_state()
-        self._init_embedding_state()
 
     def _parse_transformer_path(self, transformer: str) -> tuple[str, bool]:
         """Parse transformer path, returning (resolved_path, is_gguf).

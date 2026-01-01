@@ -32,6 +32,7 @@ class BasePipeline(ABC):
     """Base class for all pipeline types."""
 
     def __init__(self) -> None:
+        super().__init__()
         self.pipe: Any = None
         self.policy: DevicePolicy = DevicePolicy.auto_detect()
 

@@ -405,8 +405,9 @@ class EmbeddingLoaderMixin:
     _embedding_configs: list[EmbeddingConfig]
     _loaded_tokens: list[str]
 
-    def _init_embedding_state(self) -> None:
-        """Initialize embedding-related state. Call this in __init__."""
+    def __init__(self) -> None:
+        """Initialize embedding state and continue MRO chain."""
+        super().__init__()
         self._embedding_configs = []
         self._loaded_tokens = []
 
@@ -423,9 +424,14 @@ class EmbeddingLoaderMixin:
             Token that was loaded
 
         Raises:
-            RuntimeError: If pipeline not loaded
+            RuntimeError: If pipeline not loaded or mixin not initialized
             ValueError: If embedding configuration is invalid
         """
+        if not hasattr(self, "_embedding_configs"):
+            raise RuntimeError(
+                "EmbeddingLoaderMixin not initialized. "
+                "Ensure pipeline __init__ calls super().__init__()."
+            )
         if self.pipe is None:
             raise RuntimeError("Pipeline not loaded")
 

@@ -602,8 +602,9 @@ class LoraLoaderMixin:
     _lora_configs: list[LoraConfig]
     _loaded_adapters: list[str]
 
-    def _init_lora_state(self) -> None:
-        """Initialize LoRA-related state. Call this in __init__."""
+    def __init__(self) -> None:
+        """Initialize LoRA state and continue MRO chain."""
+        super().__init__()
         self._lora_configs = []
         self._loaded_adapters = []
 
@@ -620,9 +621,14 @@ class LoraLoaderMixin:
             Adapter name that was loaded
 
         Raises:
-            RuntimeError: If pipeline not loaded
+            RuntimeError: If pipeline not loaded or mixin not initialized
             ValueError: If LoRA configuration is invalid
         """
+        if not hasattr(self, "_lora_configs"):
+            raise RuntimeError(
+                "LoraLoaderMixin not initialized. "
+                "Ensure pipeline __init__ calls super().__init__()."
+            )
         if self.pipe is None:
             raise RuntimeError("Pipeline not loaded")
 
