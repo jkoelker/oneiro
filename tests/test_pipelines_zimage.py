@@ -245,3 +245,203 @@ class TestZImagePipelineWrapperImg2Img:
 
             call_kwargs = mock_pipe.call_args[1]
             assert call_kwargs["strength"] == 0.5
+
+
+class TestZImagePipelineWrapperPostGenerate:
+    """Tests for ZImagePipelineWrapper.post_generate() LoRA state reset."""
+
+    def test_post_generate_no_loras_loaded_does_nothing(self):
+        """post_generate with no loaded adapters returns early."""
+        mock_policy = DevicePolicy(device="cpu", dtype=torch.float32, offload=OffloadMode.NEVER)
+        with patch.object(DevicePolicy, "auto_detect", return_value=mock_policy):
+            pipeline = ZImagePipelineWrapper()
+            pipeline.pipe = MagicMock()
+            pipeline._loaded_adapters = []
+            pipeline._static_lora_configs = []
+
+            # Should not raise and not call any pipe methods
+            pipeline.post_generate()
+
+            pipeline.pipe.unload_lora_weights.assert_not_called()
+            pipeline.pipe.set_adapters.assert_not_called()
+
+    def test_post_generate_static_only_resets_weights(self):
+        """post_generate with only static LoRAs resets adapter weights."""
+        from oneiro.pipelines.lora import LoraConfig, LoraSource
+
+        mock_policy = DevicePolicy(device="cpu", dtype=torch.float32, offload=OffloadMode.NEVER)
+        with patch.object(DevicePolicy, "auto_detect", return_value=mock_policy):
+            pipeline = ZImagePipelineWrapper()
+            pipeline.pipe = MagicMock()
+
+            static_lora = LoraConfig(
+                name="static-lora",
+                source=LoraSource.LOCAL,
+                path="/fake/path.safetensors",
+                adapter_name="static-adapter",
+                weight=0.8,
+            )
+            pipeline._loaded_adapters = ["static-adapter"]
+            pipeline._static_lora_configs = [static_lora]
+
+            pipeline.post_generate()
+
+            # Should reset weights without unloading
+            pipeline.pipe.unload_lora_weights.assert_not_called()
+            pipeline.pipe.set_adapters.assert_called_once_with(
+                ["static-adapter"], adapter_weights=[0.8]
+            )
+
+    def test_post_generate_dynamic_loras_unloads_and_restores_static(self):
+        """post_generate unloads dynamic LoRAs and restores static ones."""
+        from oneiro.pipelines.lora import LoraConfig, LoraSource
+
+        mock_policy = DevicePolicy(device="cpu", dtype=torch.float32, offload=OffloadMode.NEVER)
+        with patch.object(DevicePolicy, "auto_detect", return_value=mock_policy):
+            pipeline = ZImagePipelineWrapper()
+            pipeline.pipe = MagicMock()
+
+            static_lora = LoraConfig(
+                name="static-lora",
+                source=LoraSource.LOCAL,
+                path="/fake/static.safetensors",
+                adapter_name="static-adapter",
+                weight=0.7,
+            )
+            static_lora._resolved_path = "/fake/static.safetensors"
+
+            # Simulate dynamic LoRA was added (2 loaded but only 1 static)
+            pipeline._loaded_adapters = ["static-adapter", "dynamic-adapter"]
+            pipeline._lora_configs = [static_lora, MagicMock()]
+            pipeline._static_lora_configs = [static_lora]
+
+            pipeline.post_generate()
+
+            # Should unload all LoRAs
+            pipeline.pipe.unload_lora_weights.assert_called_once()
+            # Should reload static LoRAs
+            pipeline.pipe.load_lora_weights.assert_called()
+
+    def test_post_generate_dynamic_loras_no_static_just_unloads(self):
+        """post_generate with dynamic LoRAs but no static ones just unloads."""
+        mock_policy = DevicePolicy(device="cpu", dtype=torch.float32, offload=OffloadMode.NEVER)
+        with patch.object(DevicePolicy, "auto_detect", return_value=mock_policy):
+            pipeline = ZImagePipelineWrapper()
+            pipeline.pipe = MagicMock()
+
+            # Dynamic LoRA loaded but no static LoRAs
+            pipeline._loaded_adapters = ["dynamic-adapter"]
+            pipeline._lora_configs = [MagicMock()]
+            pipeline._static_lora_configs = []
+
+            pipeline.post_generate()
+
+            # Should unload
+            pipeline.pipe.unload_lora_weights.assert_called_once()
+            # Should NOT try to reload (no static LoRAs)
+            pipeline.pipe.load_lora_weights.assert_not_called()
+
+    def test_post_generate_multiple_static_loras_all_restored(self):
+        """post_generate restores all static LoRAs with correct weights."""
+        from oneiro.pipelines.lora import LoraConfig, LoraSource
+
+        mock_policy = DevicePolicy(device="cpu", dtype=torch.float32, offload=OffloadMode.NEVER)
+        with patch.object(DevicePolicy, "auto_detect", return_value=mock_policy):
+            pipeline = ZImagePipelineWrapper()
+            pipeline.pipe = MagicMock()
+
+            static_lora1 = LoraConfig(
+                name="static-1",
+                source=LoraSource.LOCAL,
+                path="/fake/lora1.safetensors",
+                adapter_name="adapter-1",
+                weight=0.5,
+            )
+            static_lora2 = LoraConfig(
+                name="static-2",
+                source=LoraSource.LOCAL,
+                path="/fake/lora2.safetensors",
+                adapter_name="adapter-2",
+                weight=0.9,
+            )
+
+            # Only static adapters loaded, should reset weights
+            pipeline._loaded_adapters = ["adapter-1", "adapter-2"]
+            pipeline._static_lora_configs = [static_lora1, static_lora2]
+
+            pipeline.post_generate()
+
+            # Should reset weights for both
+            pipeline.pipe.set_adapters.assert_called_once_with(
+                ["adapter-1", "adapter-2"], adapter_weights=[0.5, 0.9]
+            )
+
+    def test_post_generate_prevents_state_leakage_between_generations(self):
+        """post_generate called after each generation prevents state leakage."""
+        from oneiro.pipelines.lora import LoraConfig, LoraSource
+
+        mock_policy = DevicePolicy(device="cpu", dtype=torch.float32, offload=OffloadMode.NEVER)
+        with patch.object(DevicePolicy, "auto_detect", return_value=mock_policy):
+            pipeline = ZImagePipelineWrapper()
+            mock_pipe = MagicMock()
+            mock_image = Image.new("RGB", (1024, 1024))
+            mock_pipe.return_value.images = [mock_image]
+            pipeline.pipe = mock_pipe
+
+            static_lora = LoraConfig(
+                name="static-lora",
+                source=LoraSource.LOCAL,
+                path="/fake/static.safetensors",
+                adapter_name="static-adapter",
+                weight=0.8,
+            )
+            pipeline._loaded_adapters = ["static-adapter"]
+            pipeline._static_lora_configs = [static_lora]
+
+            # First generation
+            pipeline.generate("prompt 1", seed=42)
+
+            # post_generate should have been called and reset weights
+            pipeline.pipe.set_adapters.assert_called()
+
+            # Reset mock to track second generation
+            pipeline.pipe.reset_mock()
+
+            # Second generation - weights should be reset again
+            pipeline.generate("prompt 2", seed=43)
+            pipeline.pipe.set_adapters.assert_called()
+
+    def test_post_generate_uses_adapter_name_over_name(self):
+        """post_generate uses adapter_name when set, falls back to name."""
+        from oneiro.pipelines.lora import LoraConfig, LoraSource
+
+        mock_policy = DevicePolicy(device="cpu", dtype=torch.float32, offload=OffloadMode.NEVER)
+        with patch.object(DevicePolicy, "auto_detect", return_value=mock_policy):
+            pipeline = ZImagePipelineWrapper()
+            pipeline.pipe = MagicMock()
+
+            # LoRA with explicit adapter_name different from name
+            lora_with_adapter_name = LoraConfig(
+                name="lora-display-name",
+                source=LoraSource.LOCAL,
+                path="/fake/path.safetensors",
+                adapter_name="actual-adapter-name",
+                weight=0.6,
+            )
+            # LoRA without adapter_name (should use name)
+            lora_without_adapter_name = LoraConfig(
+                name="fallback-name",
+                source=LoraSource.LOCAL,
+                path="/fake/path2.safetensors",
+                weight=0.4,
+            )
+
+            pipeline._loaded_adapters = ["actual-adapter-name", "fallback-name"]
+            pipeline._static_lora_configs = [lora_with_adapter_name, lora_without_adapter_name]
+
+            pipeline.post_generate()
+
+            # Should use adapter_name when available, name as fallback
+            pipeline.pipe.set_adapters.assert_called_once_with(
+                ["actual-adapter-name", "fallback-name"], adapter_weights=[0.6, 0.4]
+            )
