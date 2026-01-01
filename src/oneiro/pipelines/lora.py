@@ -468,8 +468,8 @@ PIPELINE_BASE_MODEL_MAP: dict[str, list[str]] = {
 }
 
 
-def is_lora_compatible(pipeline_type: str, civitai_base_model: str | None) -> bool:
-    """Check if a Civitai LoRA is compatible with a pipeline type.
+def is_resource_compatible(pipeline_type: str, civitai_base_model: str | None) -> bool:
+    """Check if a Civitai resource (LoRA, embedding, etc.) is compatible with a pipeline type.
 
     Args:
         pipeline_type: Pipeline type (flux2, zimage, qwen, etc.)
@@ -569,7 +569,7 @@ async def resolve_lora_path(
 
         # Validate compatibility
         if validate_compatibility and pipeline_type:
-            if not is_lora_compatible(pipeline_type, version.base_model):
+            if not is_resource_compatible(pipeline_type, version.base_model):
                 raise LoraIncompatibleError(
                     lora.adapter_name or f"civitai_{lora.civitai_id}",
                     pipeline_type,

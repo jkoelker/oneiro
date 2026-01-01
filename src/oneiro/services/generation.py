@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from oneiro.pipelines import LoraConfig, LoraSource
-from oneiro.pipelines.lora import is_lora_compatible
+from oneiro.pipelines.lora import is_resource_compatible
 
 if TYPE_CHECKING:
     from oneiro.civitai import CivitaiClient
@@ -184,7 +184,9 @@ async def resolve_loras(
                     try:
                         model_info = await civitai_client.get_model(civitai_id)
                         version = model_info.latest_version
-                        if version and not is_lora_compatible(pipeline_type, version.base_model):
+                        if version and not is_resource_compatible(
+                            pipeline_type, version.base_model
+                        ):
                             result.warnings.append(
                                 f"⚠️ LoRA `{model_info.name}` (base: {version.base_model}) "
                                 f"may not be compatible with current model ({pipeline_type})"
@@ -219,7 +221,7 @@ async def resolve_loras(
                             try:
                                 model_info = await civitai_client.get_model(civitai_id)
                                 version = model_info.latest_version
-                                if version and not is_lora_compatible(
+                                if version and not is_resource_compatible(
                                     pipeline_type, version.base_model
                                 ):
                                     result.warnings.append(

@@ -10,7 +10,7 @@ from oneiro.civitai import CivitaiError, parse_civitai_url
 from oneiro.discord.handlers import DreamContext, create_dream_callbacks
 from oneiro.pipelines import SCHEDULER_CHOICES
 from oneiro.pipelines.civitai_checkpoint import CivitaiCheckpointPipeline
-from oneiro.pipelines.lora import is_lora_compatible
+from oneiro.pipelines.lora import is_resource_compatible
 from oneiro.queue import QueueStatus
 from oneiro.services.generation import (
     MAX_GUIDANCE_SCALE,
@@ -633,7 +633,7 @@ def register_commands(bot: "OneiroBot") -> None:
             # Check compatibility and prepare warning
             compatibility_warning = ""
             if model_type == "LORA" and pipeline_type and version.base_model:
-                if not is_lora_compatible(pipeline_type, version.base_model):
+                if not is_resource_compatible(pipeline_type, version.base_model):
                     compatibility_warning = (
                         f"\n⚠️ **Note**: This LoRA (base: {version.base_model}) may not be "
                         f"compatible with the current model ({pipeline_type})"

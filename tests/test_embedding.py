@@ -6,14 +6,13 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from oneiro.pipelines.embedding import (
-    PIPELINE_BASE_MODEL_MAP,
     EmbeddingConfig,
     EmbeddingIncompatibleError,
     EmbeddingSource,
-    is_embedding_compatible,
     parse_embedding_config,
     parse_embeddings_from_config,
 )
+from oneiro.pipelines.lora import PIPELINE_BASE_MODEL_MAP, is_resource_compatible
 
 
 class TestEmbeddingConfig:
@@ -341,47 +340,47 @@ class TestParseEmbeddingsFromConfig:
 
 
 class TestIsEmbeddingCompatible:
-    """Tests for is_embedding_compatible function."""
+    """Tests for is_resource_compatible function."""
 
     def test_flux1_compatible(self):
         """Flux.1 embeddings compatible with flux1 pipeline."""
-        assert is_embedding_compatible("flux1", "Flux.1 Dev")
-        assert is_embedding_compatible("flux1", "Flux.1 Schnell")
-        assert is_embedding_compatible("flux1", "Flux.1 D")
+        assert is_resource_compatible("flux1", "Flux.1 Dev")
+        assert is_resource_compatible("flux1", "Flux.1 Schnell")
+        assert is_resource_compatible("flux1", "Flux.1 D")
 
     def test_flux2_compatible(self):
         """Flux.2 embeddings compatible with flux2 pipeline."""
-        assert is_embedding_compatible("flux2", "Flux.2")
+        assert is_resource_compatible("flux2", "Flux.2")
 
     def test_flux1_flux2_incompatible(self):
         """Flux.1 and Flux.2 embeddings are NOT cross-compatible."""
-        assert not is_embedding_compatible("flux1", "Flux.2")
-        assert not is_embedding_compatible("flux2", "Flux.1 Dev")
+        assert not is_resource_compatible("flux1", "Flux.2")
+        assert not is_resource_compatible("flux2", "Flux.1 Dev")
 
     def test_sdxl_compatible(self):
         """SDXL embeddings compatible with sdxl pipeline."""
-        assert is_embedding_compatible("sdxl", "SDXL 1.0")
-        assert is_embedding_compatible("sdxl", "Pony")
-        assert is_embedding_compatible("sdxl", "Illustrious")
+        assert is_resource_compatible("sdxl", "SDXL 1.0")
+        assert is_resource_compatible("sdxl", "Pony")
+        assert is_resource_compatible("sdxl", "Illustrious")
 
     def test_incompatible_base_model(self):
         """Incompatible base model returns False."""
-        assert not is_embedding_compatible("flux2", "SDXL 1.0")
-        assert not is_embedding_compatible("sdxl", "Flux.1 Dev")
-        assert not is_embedding_compatible("flux2", "SD 1.5")
+        assert not is_resource_compatible("flux2", "SDXL 1.0")
+        assert not is_resource_compatible("sdxl", "Flux.1 Dev")
+        assert not is_resource_compatible("flux2", "SD 1.5")
 
     def test_none_base_model_is_compatible(self):
         """None base model assumed compatible."""
-        assert is_embedding_compatible("flux2", None)
+        assert is_resource_compatible("flux2", None)
 
     def test_unknown_pipeline_is_compatible(self):
         """Unknown pipeline type assumed compatible."""
-        assert is_embedding_compatible("unknown", "SDXL 1.0")
+        assert is_resource_compatible("unknown", "SDXL 1.0")
 
     def test_case_insensitive(self):
         """Comparison is case-insensitive."""
-        assert is_embedding_compatible("flux1", "flux.1 dev")
-        assert is_embedding_compatible("flux1", "FLUX.1 DEV")
+        assert is_resource_compatible("flux1", "flux.1 dev")
+        assert is_resource_compatible("flux1", "FLUX.1 DEV")
 
 
 class TestEmbeddingIncompatibleError:

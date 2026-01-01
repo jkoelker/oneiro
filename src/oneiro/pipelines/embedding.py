@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from oneiro.civitai import CivitaiClient, parse_civitai_url
-from oneiro.pipelines.lora import PIPELINE_BASE_MODEL_MAP
+from oneiro.pipelines.lora import is_resource_compatible
 
 
 class EmbeddingSource(str, Enum):
@@ -281,34 +281,6 @@ def parse_embeddings_from_config(
     return embeddings
 
 
-def is_embedding_compatible(pipeline_type: str, civitai_base_model: str | None) -> bool:
-    """Check if a Civitai embedding is compatible with a pipeline type.
-
-    Args:
-        pipeline_type: Pipeline type (flux2, zimage, qwen, etc.)
-        civitai_base_model: Base model string from Civitai API
-
-    Returns:
-        True if compatible, False otherwise
-    """
-    if civitai_base_model is None:
-        # Can't verify, assume compatible
-        return True
-
-    compatible_bases = PIPELINE_BASE_MODEL_MAP.get(pipeline_type, [])
-    if not compatible_bases:
-        # Unknown pipeline type, assume compatible
-        return True
-
-    # Check if any compatible base model matches (case-insensitive substring)
-    civitai_lower = civitai_base_model.lower()
-    for base in compatible_bases:
-        if base.lower() in civitai_lower or civitai_lower in base.lower():
-            return True
-
-    return False
-
-
 class EmbeddingIncompatibleError(Exception):
     """Raised when an embedding is incompatible with the pipeline type."""
 
@@ -382,7 +354,7 @@ async def resolve_embedding_path(
 
         # Validate compatibility
         if validate_compatibility and pipeline_type:
-            if not is_embedding_compatible(pipeline_type, version.base_model):
+            if not is_resource_compatible(pipeline_type, version.base_model):
                 raise EmbeddingIncompatibleError(
                     embedding.name,
                     pipeline_type,
