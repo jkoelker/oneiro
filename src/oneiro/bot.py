@@ -24,13 +24,19 @@ from oneiro.pipelines.civitai_checkpoint import CivitaiCheckpointPipeline
 from oneiro.pipelines.lora import is_lora_compatible
 from oneiro.queue import GenerationQueue, QueueStatus
 
-# Global managers (initialized on bot ready)
-config: Config | None = None
-pipeline_manager: PipelineManager | None = None
-generation_queue: GenerationQueue | None = None
-content_filter: ContentFilter | None = None
-civitai_client: CivitaiClient | None = None
-lora_detector: AutoLoraDetector | None = None
+
+class OneiroBot(discord.Bot):
+    """Oneiro Discord bot with typed state management."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.config: Config | None = None
+        self.pipeline_manager: PipelineManager | None = None
+        self.generation_queue: GenerationQueue | None = None
+        self.content_filter: ContentFilter | None = None
+        self.civitai_client: CivitaiClient | None = None
+        self.lora_detector: AutoLoraDetector | None = None
+
 
 # LoRA weight validation limits
 MIN_LORA_WEIGHT = -2.0
@@ -150,11 +156,10 @@ def parse_lora_param(lora_str: str) -> list[tuple[str, float]]:
 
 async def get_lora_choices(ctx: discord.AutocompleteContext) -> list[str]:
     """Autocomplete function for lora choices."""
-    global config
-    if config is None:
+    if ctx.bot.config is None:
         return []
 
-    loras = config.get("loras", default={})
+    loras = ctx.bot.config.get("loras", default={})
     if not isinstance(loras, dict):
         return []
 
@@ -181,11 +186,10 @@ async def get_lora_choices(ctx: discord.AutocompleteContext) -> list[str]:
 
 async def get_model_choices(ctx: discord.AutocompleteContext) -> list[str]:
     """Autocomplete function for model choices."""
-    global config
-    if config is None:
+    if ctx.bot.config is None:
         return ["zimage-turbo"]
 
-    models = config.get("models", default={})
+    models = ctx.bot.config.get("models", default={})
     if not isinstance(models, dict):
         return ["zimage-turbo"]
 
@@ -194,22 +198,18 @@ async def get_model_choices(ctx: discord.AutocompleteContext) -> list[str]:
     return [name for name in models.keys() if name.lower().startswith(current)]
 
 
-def create_bot() -> discord.Bot:
+def create_bot() -> OneiroBot:
     """Create and configure the Discord bot."""
-    global config, pipeline_manager, generation_queue, content_filter, civitai_client, lora_detector
-
     activity = discord.Activity(
         name="Dreaming...",
         type=discord.ActivityType.custom,
     )
 
-    bot = discord.Bot(activity=activity)
+    bot = OneiroBot(activity=activity)
 
     @bot.event
     async def on_ready():
         """Initialize config, pipeline and queue when bot connects."""
-        global config, pipeline_manager, generation_queue, content_filter, civitai_client
-        global lora_detector
         print(f"{bot.user} is online!")
 
         # Load configuration
@@ -217,46 +217,44 @@ def create_bot() -> discord.Bot:
         overlay_config_path = os.environ.get("CONFIG_OVERLAY_PATH")
         state_path = os.environ.get("STATE_PATH")
 
-        config = Config(
+        bot.config = Config(
             base_path=base_config_path,
             overlay_path=Path(overlay_config_path) if overlay_config_path else None,
             state_path=Path(state_path) if state_path else None,
         )
-        config.load()
+        bot.config.load()
         print(f"Config loaded from {base_config_path}")
 
         # Initialize Civitai client
-        civitai_client = CivitaiClient.from_config(config)
+        bot.civitai_client = CivitaiClient.from_config(bot.config)
         print("Civitai client initialized")
 
         # Initialize content filter
-        content_filter = ContentFilter(config)
+        bot.content_filter = ContentFilter(bot.config)
         print("Content filter initialized")
 
         # Initialize LoRA auto-detector
-        lora_detector = create_detector_from_config(config.data)
+        bot.lora_detector = create_detector_from_config(bot.config.data)
         print("LoRA auto-detector initialized")
 
         # Initialize pipeline manager with config
-        pipeline_manager = PipelineManager(config)
-        pipeline_manager.set_civitai_client(civitai_client)
+        bot.pipeline_manager = PipelineManager(bot.config)
+        bot.pipeline_manager.set_civitai_client(bot.civitai_client)
         print("Loading default model...")
-        await pipeline_manager.load_model()
-        print(f"Model loaded: {pipeline_manager.current_model}")
+        await bot.pipeline_manager.load_model()
+        print(f"Model loaded: {bot.pipeline_manager.current_model}")
 
         # Initialize queue with config values
-        max_global = config.get("queue", "max_global", default=100)
-        max_per_user = config.get("queue", "max_per_user", default=20)
-        generation_queue = GenerationQueue(max_global=max_global, max_per_user=max_per_user)
-        await generation_queue.start(pipeline_manager)
+        max_global = bot.config.get("queue", "max_global", default=100)
+        max_per_user = bot.config.get("queue", "max_per_user", default=20)
+        bot.generation_queue = GenerationQueue(max_global=max_global, max_per_user=max_per_user)
+        await bot.generation_queue.start(bot.pipeline_manager)
         print(f"Queue started: {max_global} global, {max_per_user} per user")
 
         # Register config change callback
         async def on_config_change(new_config: dict[str, Any]) -> None:
             """Update queue limits and LoRA detector when config changes."""
-            global lora_detector
-
-            if generation_queue is None:
+            if bot.generation_queue is None:
                 return
 
             queue_config = new_config.get("queue", {})
@@ -264,21 +262,21 @@ def create_bot() -> discord.Bot:
             new_max_per_user = queue_config.get("max_per_user", 20)
 
             if (
-                new_max_global != generation_queue.max_global
-                or new_max_per_user != generation_queue.max_per_user
+                new_max_global != bot.generation_queue.max_global
+                or new_max_per_user != bot.generation_queue.max_per_user
             ):
-                generation_queue.max_global = new_max_global
-                generation_queue.max_per_user = new_max_per_user
+                bot.generation_queue.max_global = new_max_global
+                bot.generation_queue.max_per_user = new_max_per_user
                 print(f"Queue limits updated: {new_max_global} global, {new_max_per_user} per user")
 
             # Rebuild LoRA detector with new config
-            lora_detector = create_detector_from_config(new_config)
+            bot.lora_detector = create_detector_from_config(new_config)
             print("LoRA auto-detector rebuilt")
 
-        config.on_change(on_config_change)
+        bot.config.on_change(on_config_change)
 
         # Start config file watching
-        await config.start_watching()
+        await bot.config.start_watching()
 
         # Sync slash commands to all guilds for instant availability
         # (global commands can take up to 1 hour to propagate)
@@ -415,15 +413,13 @@ def create_bot() -> discord.Bot:
         scheduler: str | None = None,
     ):
         """Generate an image from a text prompt."""
-        global config, pipeline_manager, generation_queue, content_filter, civitai_client
-
-        if generation_queue is None or pipeline_manager is None:
+        if ctx.bot.generation_queue is None or ctx.bot.pipeline_manager is None:
             await ctx.respond("❌ Bot is still initializing, please wait...", ephemeral=True)
             return
 
         # Check content filter
-        if content_filter is not None:
-            allowed, blocked_word = content_filter.check(prompt, negative_prompt or "")
+        if ctx.bot.content_filter is not None:
+            allowed, blocked_word = ctx.bot.content_filter.check(prompt, negative_prompt or "")
             if not allowed:
                 await ctx.respond(
                     f"❌ Your prompt contains a blocked word: `{blocked_word}`",
@@ -444,8 +440,10 @@ def create_bot() -> discord.Bot:
                 return
 
         # Get model-specific defaults from config
-        current_model = pipeline_manager.current_model or "zimage-turbo"
-        model_config = config.get("models", current_model, default={}) if config else {}
+        current_model = ctx.bot.pipeline_manager.current_model or "zimage-turbo"
+        model_config = (
+            ctx.bot.config.get("models", current_model, default={}) if ctx.bot.config else {}
+        )
         pipeline_type = model_config.get("type") if model_config else None
 
         # Get model config defaults
@@ -457,7 +455,11 @@ def create_bot() -> discord.Bot:
             model_guidance = model_config["true_cfg_scale"]
 
         # Check for model-specific overrides set via /model command
-        model_overrides = config.get("model_overrides", current_model, default={}) if config else {}
+        model_overrides = (
+            ctx.bot.config.get("model_overrides", current_model, default={})
+            if ctx.bot.config
+            else {}
+        )
         if model_overrides:
             if "steps" in model_overrides:
                 model_steps = model_overrides["steps"]
@@ -473,10 +475,10 @@ def create_bot() -> discord.Bot:
         lora_warnings: list[str] = []
         auto_detected_loras: list[tuple[str, str]] = []
 
-        if lora and config:
+        if lora and ctx.bot.config:
             # Explicit lora parameter provided - skip auto-detection
             parsed_loras = parse_lora_param(lora)
-            loras_section = config.get("loras", default={})
+            loras_section = ctx.bot.config.get("loras", default={})
 
             for lora_ref, weight in parsed_loras:
                 try:
@@ -491,9 +493,9 @@ def create_bot() -> discord.Bot:
                         )
 
                         # Check compatibility (soft warning)
-                        if civitai_client and pipeline_type:
+                        if ctx.bot.civitai_client and pipeline_type:
                             try:
-                                model_info = await civitai_client.get_model(civitai_id)
+                                model_info = await ctx.bot.civitai_client.get_model(civitai_id)
                                 version = model_info.latest_version
                                 if version and not is_lora_compatible(
                                     pipeline_type, version.base_model
@@ -527,11 +529,17 @@ def create_bot() -> discord.Bot:
                             )
 
                             # Check compatibility for Civitai LoRAs
-                            if source == LoraSource.CIVITAI and civitai_client and pipeline_type:
+                            if (
+                                source == LoraSource.CIVITAI
+                                and ctx.bot.civitai_client
+                                and pipeline_type
+                            ):
                                 civitai_id = lora_config.civitai_id
                                 if civitai_id:
                                     try:
-                                        model_info = await civitai_client.get_model(civitai_id)
+                                        model_info = await ctx.bot.civitai_client.get_model(
+                                            civitai_id
+                                        )
                                         version = model_info.latest_version
                                         if version and not is_lora_compatible(
                                             pipeline_type, version.base_model
@@ -557,9 +565,9 @@ def create_bot() -> discord.Bot:
                     await ctx.followup.send(f"❌ Invalid LoRA specification: {e}", ephemeral=True)
                     return
 
-        elif lora_detector and pipeline_type:
+        elif ctx.bot.lora_detector and pipeline_type:
             # No explicit lora - run auto-detection
-            matches = lora_detector.match(prompt, pipeline_type)
+            matches = ctx.bot.lora_detector.match(prompt, pipeline_type)
             for match in matches:
                 lora_configs.append(match.lora)
                 auto_detected_loras.append((match.lora.name, match.matched_trigger))
@@ -620,7 +628,7 @@ def create_bot() -> discord.Bot:
                 return
 
             elapsed = time.time() - start_time
-            image_buffer = pipeline_manager.image_to_bytes(result.image)  # type: ignore
+            image_buffer = ctx.bot.pipeline_manager.image_to_bytes(result.image)  # type: ignore
             file = discord.File(image_buffer, filename="dream.png")
 
             embed = discord.Embed(
@@ -684,7 +692,7 @@ def create_bot() -> discord.Bot:
             warning_text = "\n".join(lora_warnings)
             await ctx.followup.send(warning_text, ephemeral=True)
 
-        queue_result = generation_queue.add(
+        queue_result = ctx.bot.generation_queue.add(
             user_id=ctx.author.id,
             request=request,
             callback=on_complete,
@@ -705,22 +713,21 @@ def create_bot() -> discord.Bot:
     @bot.slash_command(name="queue", description="Check your queue status")
     async def queue_status(ctx: discord.ApplicationContext):
         """Show queue status for the user."""
-        global generation_queue
-
-        if generation_queue is None:
+        if ctx.bot.generation_queue is None:
             await ctx.respond("❌ Bot is still initializing...", ephemeral=True)
             return
 
-        user_count = generation_queue.user_count(ctx.author.id)
-        total_count = generation_queue.size
+        user_count = ctx.bot.generation_queue.user_count(ctx.author.id)
+        total_count = ctx.bot.generation_queue.size
 
         if user_count == 0:
             await ctx.respond("✅ You have no pending requests.", ephemeral=True)
         else:
             await ctx.respond(
                 f"📊 **Queue Status**\n"
-                f"Your pending requests: **{user_count}** / {generation_queue.max_per_user}\n"
-                f"Total queue size: **{total_count}** / {generation_queue.max_global}",
+                f"Your pending requests: **{user_count}** / "
+                f"{ctx.bot.generation_queue.max_per_user}\n"
+                f"Total queue size: **{total_count}** / {ctx.bot.generation_queue.max_global}",
                 ephemeral=True,
             )
 
@@ -769,16 +776,14 @@ def create_bot() -> discord.Bot:
         applied after the model is loaded. The selected model may also be stored as
         the default in the persistent configuration if a state path is configured.
         """
-        global config, pipeline_manager
-
-        if pipeline_manager is None or config is None:
+        if ctx.bot.pipeline_manager is None or ctx.bot.config is None:
             await ctx.respond("❌ Bot is still initializing...", ephemeral=True)
             return
 
         # Validate model exists in config
-        model_config = config.get("models", model)
+        model_config = ctx.bot.config.get("models", model)
         if not model_config:
-            available = pipeline_manager.get_available_models()
+            available = ctx.bot.pipeline_manager.get_available_models()
             await ctx.respond(
                 f"❌ Unknown model: `{model}`\n"
                 f"Available models: {', '.join(f'`{m}`' for m in available)}",
@@ -787,13 +792,13 @@ def create_bot() -> discord.Bot:
             return
 
         # Check if already loaded
-        if pipeline_manager.current_model == model:
+        if ctx.bot.pipeline_manager.current_model == model:
             # Model is already active - handle overrides only
             overrides_applied = []
 
-            if scheduler and pipeline_manager.pipeline is not None:
-                if isinstance(pipeline_manager.pipeline, CivitaiCheckpointPipeline):
-                    pipeline_manager.pipeline.configure_scheduler(scheduler)
+            if scheduler and ctx.bot.pipeline_manager.pipeline is not None:
+                if isinstance(ctx.bot.pipeline_manager.pipeline, CivitaiCheckpointPipeline):
+                    ctx.bot.pipeline_manager.pipeline.configure_scheduler(scheduler)
                     overrides_applied.append(f"scheduler=`{scheduler}`")
                 else:
                     await ctx.respond(
@@ -804,12 +809,14 @@ def create_bot() -> discord.Bot:
                     return
 
             # Save steps/guidance_scale overrides to state
-            if config.state_path:
+            if ctx.bot.config.state_path:
                 if steps is not None:
-                    config.set("model_overrides", model, "steps", value=steps)
+                    ctx.bot.config.set("model_overrides", model, "steps", value=steps)
                     overrides_applied.append(f"steps={steps}")
                 if guidance_scale is not None:
-                    config.set("model_overrides", model, "guidance_scale", value=guidance_scale)
+                    ctx.bot.config.set(
+                        "model_overrides", model, "guidance_scale", value=guidance_scale
+                    )
                     overrides_applied.append(f"guidance_scale={guidance_scale}")
 
             if overrides_applied:
@@ -829,19 +836,21 @@ def create_bot() -> discord.Bot:
 
         try:
             loading_msg = await ctx.followup.send(f"⏳ Loading model `{model}`...")
-            await pipeline_manager.load_model(model)
+            await ctx.bot.pipeline_manager.load_model(model)
 
-            if scheduler and pipeline_manager.pipeline is not None:
-                if isinstance(pipeline_manager.pipeline, CivitaiCheckpointPipeline):
-                    pipeline_manager.pipeline.configure_scheduler(scheduler)
+            if scheduler and ctx.bot.pipeline_manager.pipeline is not None:
+                if isinstance(ctx.bot.pipeline_manager.pipeline, CivitaiCheckpointPipeline):
+                    ctx.bot.pipeline_manager.pipeline.configure_scheduler(scheduler)
 
-            if config.state_path:
-                config.set("defaults", "model", value=model)
+            if ctx.bot.config.state_path:
+                ctx.bot.config.set("defaults", "model", value=model)
                 # Save steps/guidance_scale overrides to state
                 if steps is not None:
-                    config.set("model_overrides", model, "steps", value=steps)
+                    ctx.bot.config.set("model_overrides", model, "steps", value=steps)
                 if guidance_scale is not None:
-                    config.set("model_overrides", model, "guidance_scale", value=guidance_scale)
+                    ctx.bot.config.set(
+                        "model_overrides", model, "guidance_scale", value=guidance_scale
+                    )
 
             msg = f"✅ Switched to model `{model}`"
             overrides = []
@@ -860,16 +869,16 @@ def create_bot() -> discord.Bot:
     @bot.slash_command(name="config", description="Show current configuration")
     async def config_command(ctx: discord.ApplicationContext):
         """Show current configuration values."""
-        global config, pipeline_manager
-
-        if config is None:
+        if ctx.bot.config is None:
             await ctx.respond("❌ Config not loaded", ephemeral=True)
             return
 
-        defaults = config.get("defaults", default={})
-        queue = config.get("queue", default={})
-        models = list(config.get("models", default={}).keys())
-        current_model = pipeline_manager.current_model if pipeline_manager else "N/A"
+        defaults = ctx.bot.config.get("defaults", default={})
+        queue = ctx.bot.config.get("queue", default={})
+        models = list(ctx.bot.config.get("models", default={}).keys())
+        current_model = (
+            ctx.bot.pipeline_manager.current_model if ctx.bot.pipeline_manager else "N/A"
+        )
 
         embed = discord.Embed(
             title="⚙️ Current Configuration",
@@ -919,13 +928,11 @@ def create_bot() -> discord.Bot:
         name: str | None = None,
     ):
         """Fetch a model from Civitai and auto-configure it."""
-        global config, civitai_client, pipeline_manager
-
-        if config is None or civitai_client is None:
+        if ctx.bot.config is None or ctx.bot.civitai_client is None:
             await ctx.respond("❌ Bot is still initializing...", ephemeral=True)
             return
 
-        if not config.state_path:
+        if not ctx.bot.config.state_path:
             await ctx.respond(
                 "❌ State persistence not configured. Cannot save fetched resources.",
                 ephemeral=True,
@@ -950,7 +957,7 @@ def create_bot() -> discord.Bot:
             # Fetch model info
             status_msg = await ctx.followup.send(f"⏳ Fetching model info for ID {model_id}...")
 
-            model = await civitai_client.get_model(model_id)
+            model = await ctx.bot.civitai_client.get_model(model_id)
 
             # Get the specific version or latest
             if version_id:
@@ -960,7 +967,7 @@ def create_bot() -> discord.Bot:
                         version = v
                         break
                 if version is None:
-                    version = await civitai_client.get_model_version(version_id)
+                    version = await ctx.bot.civitai_client.get_model_version(version_id)
             else:
                 version = model.latest_version
 
@@ -974,9 +981,9 @@ def create_bot() -> discord.Bot:
             # Ensure unique name by appending number if needed
             base_name = resource_name
             counter = 1
-            existing_loras = config.get("loras", default={})
-            existing_models = config.get("models", default={})
-            existing_embeddings = config.get("embeddings", default={})
+            existing_loras = ctx.bot.config.get("loras", default={})
+            existing_models = ctx.bot.config.get("models", default={})
+            existing_embeddings = ctx.bot.config.get("embeddings", default={})
             while (
                 resource_name in existing_loras
                 or resource_name in existing_models
@@ -993,12 +1000,12 @@ def create_bot() -> discord.Bot:
             )
 
             # Download the model
-            downloaded_path = await civitai_client.download_model_version(version)
+            downloaded_path = await ctx.bot.civitai_client.download_model_version(version)
 
             # Get current pipeline type for compatibility info
             pipeline_type = None
-            if pipeline_manager and pipeline_manager.current_model:
-                model_config = config.get("models", pipeline_manager.current_model)
+            if ctx.bot.pipeline_manager and ctx.bot.pipeline_manager.current_model:
+                model_config = ctx.bot.config.get("models", ctx.bot.pipeline_manager.current_model)
                 if model_config:
                     pipeline_type = model_config.get("type")
 
@@ -1013,7 +1020,7 @@ def create_bot() -> discord.Bot:
 
             # Save to config based on type
             if model_type == "LORA":
-                config.set(
+                ctx.bot.config.set(
                     "loras",
                     resource_name,
                     value={
@@ -1052,7 +1059,7 @@ def create_bot() -> discord.Bot:
 
             elif model_type == "CHECKPOINT":
                 # For checkpoints, we need to add to models section
-                config.set(
+                ctx.bot.config.set(
                     "models",
                     resource_name,
                     value={
@@ -1082,7 +1089,7 @@ def create_bot() -> discord.Bot:
                 )
 
             elif model_type == "TEXTUALINVERSION":
-                config.set(
+                ctx.bot.config.set(
                     "embeddings",
                     resource_name,
                     value={
