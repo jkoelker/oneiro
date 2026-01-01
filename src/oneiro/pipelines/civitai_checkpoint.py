@@ -10,6 +10,9 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+import torch
+from PIL import Image
+
 from oneiro.device import DevicePolicy, OffloadMode
 from oneiro.pipelines.base import BasePipeline, GenerationResult
 from oneiro.pipelines.embedding import EmbeddingLoaderMixin, parse_embeddings_from_config
@@ -519,6 +522,7 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
         self._current_scheduler: str | None = None
         self._static_lora_configs: list[LoraConfig] = []
         self._cpu_offload: bool = False
+        self._has_dynamic_loras: bool = False
 
     def load(self, model_config: dict[str, Any], full_config: dict[str, Any] | None = None) -> None:
         """Load checkpoint from config (synchronous, requires checkpoint_path).
@@ -692,6 +696,12 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
         self._current_scheduler = scheduler_name
         print(f"  Scheduler: {scheduler_name}")
 
+    def validate_pipeline(self) -> None:
+        """Validate pipeline and config are ready for generation."""
+        super().validate_pipeline()
+        if self._pipeline_config is None:
+            raise RuntimeError("Pipeline config not initialized")
+
     def generate(
         self,
         prompt: str,
@@ -762,76 +772,63 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
             as the actual seed used, prompts, final image size, number of
             steps, and guidance scale.
         """
-        if self.pipe is None:
-            raise RuntimeError("Pipeline not loaded")
+        # Apply defaults from pipeline config (validation happens in super().generate())
+        # Note: We need to check _pipeline_config here before applying defaults,
+        # but full validation happens in validate_pipeline() called by super()
+        if self._pipeline_config is not None:
+            width = width if width is not None else self._pipeline_config.default_width
+            height = height if height is not None else self._pipeline_config.default_height
+            steps = steps if steps is not None else self._pipeline_config.default_steps
+            guidance_scale = (
+                guidance_scale
+                if guidance_scale is not None
+                else self._pipeline_config.default_guidance_scale
+            )
 
-        if self._pipeline_config is None:
-            raise RuntimeError("Pipeline config not initialized")
+        return super().generate(
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            width=width or 1024,
+            height=height or 1024,
+            seed=seed,
+            steps=steps or 20,
+            guidance_scale=guidance_scale if guidance_scale is not None else 7.0,
+            **kwargs,
+        )
 
+    def pre_generate(self, **kwargs: Any) -> None:
+        """Pre-generation setup: scheduler override and dynamic LoRA loading."""
         scheduler_override = kwargs.pop("scheduler", None)
         if scheduler_override:
             self.configure_scheduler(scheduler_override)
 
         dynamic_loras = kwargs.pop("loras", None)
-        has_dynamic_loras = False
+        self._has_dynamic_loras = False
         if dynamic_loras:
-            # Mark that we are entering a dynamic LoRA context before loading,
-            # so that failures during loading can be properly rolled back.
-            has_dynamic_loras = True
+            self._has_dynamic_loras = True
             try:
                 self._load_dynamic_loras(dynamic_loras)
             except Exception:
-                # If loading dynamic LoRAs fails after modifying the pipeline
-                # state (for example, after unloading static LoRAs), attempt
-                # to restore the original static LoRAs before propagating
-                # the error.
                 self._restore_static_loras()
-                has_dynamic_loras = False
+                self._has_dynamic_loras = False
                 raise
 
-        try:
-            return self._run_generation(
-                prompt=prompt,
-                negative_prompt=negative_prompt,
-                width=width,
-                height=height,
-                seed=seed,
-                steps=steps,
-                guidance_scale=guidance_scale,
-                **kwargs,
-            )
-        finally:
-            if has_dynamic_loras:
-                self._restore_static_loras()
-
-    def _run_generation(
+    def build_generation_kwargs(
         self,
         prompt: str,
         negative_prompt: str | None,
-        width: int | None,
-        height: int | None,
-        seed: int,
-        steps: int | None,
-        guidance_scale: float | None,
+        width: int,
+        height: int,
+        steps: int,
+        guidance_scale: float,
+        generator: "torch.Generator",
+        init_image: "Image.Image | None",
+        strength: float,
         **kwargs: Any,
-    ) -> GenerationResult:
+    ) -> dict[str, Any]:
+        """Build generation kwargs with embedding support."""
         assert self._pipeline_config is not None
-        width = width or self._pipeline_config.default_width
-        height = height or self._pipeline_config.default_height
-        steps = steps or self._pipeline_config.default_steps
-        guidance_scale = (
-            guidance_scale
-            if guidance_scale is not None
-            else self._pipeline_config.default_guidance_scale
-        )
 
-        actual_seed, generator = self._prepare_seed(seed)
-
-        # Handle img2img
-        init_image = self._load_init_image(kwargs.get("init_image"))
-        strength = kwargs.get("strength", 0.75)
-
-        # Build generation kwargs
         gen_kwargs: dict[str, Any] = {
             "num_inference_steps": steps,
             "guidance_scale": guidance_scale,
@@ -839,7 +836,6 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
         }
 
         # Use embedding-based prompt handling for pipelines that support it
-        # (SD 1.x, SD 2.x, SDXL, Flux, SD3) - enables weight syntax like (word:1.5)
         if self._supports_prompt_embeddings():
             gen_kwargs.update(self._encode_prompts_to_embeddings(prompt, negative_prompt))
         else:
@@ -849,29 +845,21 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
                 gen_kwargs["negative_prompt"] = negative_prompt
 
         if init_image:
-            print(f"CivitAI img2img: '{prompt[:50]}...' seed={actual_seed} strength={strength}")
+            print(f"CivitAI img2img: '{prompt[:50]}...' strength={strength}")
             gen_kwargs["image"] = init_image
             gen_kwargs["strength"] = strength
         else:
-            print(f"CivitAI generating: '{prompt[:50]}...' seed={actual_seed}")
+            print(f"CivitAI generating: '{prompt[:50]}...'")
             gen_kwargs["height"] = height
             gen_kwargs["width"] = width
 
-        result = self.pipe(**gen_kwargs)
+        return gen_kwargs
 
-        DevicePolicy.clear_cache()
-
-        output_image = result.images[0]
-        return GenerationResult(
-            image=output_image,
-            seed=actual_seed,
-            prompt=prompt,
-            negative_prompt=negative_prompt,
-            width=output_image.width,
-            height=output_image.height,
-            steps=steps,
-            guidance_scale=guidance_scale,
-        )
+    def post_generate(self, **kwargs: Any) -> None:
+        """Post-generation cleanup: restore static LoRAs if dynamic were used."""
+        if self._has_dynamic_loras:
+            self._restore_static_loras()
+            self._has_dynamic_loras = False
 
     def _load_dynamic_loras(self, loras: list[LoraConfig]) -> None:
         if self.pipe is None or not loras:

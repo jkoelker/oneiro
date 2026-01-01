@@ -2,6 +2,9 @@
 
 from typing import Any
 
+import torch
+from PIL import Image
+
 from oneiro.device import DevicePolicy
 from oneiro.pipelines.base import BasePipeline, GenerationResult
 from oneiro.pipelines.embedding import EmbeddingLoaderMixin, parse_embeddings_from_config
@@ -48,60 +51,61 @@ class ZImagePipelineWrapper(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipeline)
 
         print(f"Z-Image loaded from {repo}")
 
-    def generate(
+    def build_generation_kwargs(
         self,
         prompt: str,
-        negative_prompt: str | None = None,
-        width: int = 1024,
-        height: int = 1024,
-        seed: int = -1,
-        steps: int = 9,
-        guidance_scale: float = 0.0,
+        negative_prompt: str | None,
+        width: int,
+        height: int,
+        steps: int,
+        guidance_scale: float,  # Ignored - always 0.0 for Turbo
+        generator: torch.Generator,
+        init_image: Image.Image | None,
+        strength: float,
         **kwargs: Any,
-    ) -> GenerationResult:
-        """Generate image with Z-Image-Turbo."""
-        if self.pipe is None:
-            raise RuntimeError("Pipeline not loaded")
-
-        actual_seed, generator = self._prepare_seed(seed)
-
-        # Handle img2img
-        init_image = self._load_init_image(kwargs.get("init_image"))
-        strength = kwargs.get("strength", 0.75)
-
+    ) -> dict[str, Any]:
+        """Build Z-Image generation kwargs. Forces guidance_scale=0.0 for Turbo."""
         if init_image:
-            print(f"Z-Image img2img: '{prompt[:50]}...' seed={actual_seed} strength={strength}")
-            result = self.pipe(
-                prompt=prompt,
-                negative_prompt=negative_prompt,
-                image=init_image,
-                strength=strength,
-                num_inference_steps=steps,
-                guidance_scale=0.0,  # Always 0.0 for Turbo
-                generator=generator,
-            )
+            print(f"Z-Image img2img: '{prompt[:50]}...' strength={strength}")
+            return {
+                "prompt": prompt,
+                "negative_prompt": negative_prompt,
+                "image": init_image,
+                "strength": strength,
+                "num_inference_steps": steps,
+                "guidance_scale": 0.0,  # Always 0.0 for Turbo
+                "generator": generator,
+            }
         else:
-            print(f"Z-Image generating: '{prompt[:50]}...' seed={actual_seed}")
-            result = self.pipe(
-                prompt=prompt,
-                negative_prompt=negative_prompt,
-                height=height,
-                width=width,
-                num_inference_steps=steps,
-                guidance_scale=0.0,  # Always 0.0 for Turbo
-                generator=generator,
-            )
+            print(f"Z-Image generating: '{prompt[:50]}...'")
+            return {
+                "prompt": prompt,
+                "negative_prompt": negative_prompt,
+                "height": height,
+                "width": width,
+                "num_inference_steps": steps,
+                "guidance_scale": 0.0,  # Always 0.0 for Turbo
+                "generator": generator,
+            }
 
-        DevicePolicy.clear_cache()
-
+    def build_result(
+        self,
+        result: Any,
+        seed: int,
+        prompt: str,
+        negative_prompt: str | None,
+        steps: int,
+        guidance_scale: float,  # Ignored - always 0.0 for Turbo
+    ) -> GenerationResult:
+        """Build result with forced guidance_scale=0.0."""
         output_image = result.images[0]
         return GenerationResult(
             image=output_image,
-            seed=actual_seed,
+            seed=seed,
             prompt=prompt,
             negative_prompt=negative_prompt,
             width=output_image.width,
             height=output_image.height,
             steps=steps,
-            guidance_scale=0.0,
+            guidance_scale=0.0,  # Always 0.0 for Turbo
         )

@@ -4,6 +4,9 @@ import math
 import os
 from typing import Any
 
+import torch
+from PIL import Image
+
 from oneiro.device import DevicePolicy
 from oneiro.pipelines.base import BasePipeline, GenerationResult
 from oneiro.pipelines.embedding import EmbeddingLoaderMixin, parse_embeddings_from_config
@@ -170,56 +173,79 @@ class QwenPipelineWrapper(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipeline):
         Note: Qwen uses true_cfg_scale instead of guidance_scale,
         and requires a negative_prompt (even empty string).
         """
-        if self.pipe is None:
-            raise RuntimeError("Pipeline not loaded")
+        return super().generate(
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            width=width,
+            height=height,
+            seed=seed,
+            steps=steps,
+            guidance_scale=guidance_scale,
+            **kwargs,
+        )
 
-        actual_seed, generator = self._prepare_seed(seed)
-
-        # Qwen requires negative_prompt, default to empty string
+    def build_generation_kwargs(
+        self,
+        prompt: str,
+        negative_prompt: str | None,
+        width: int,
+        height: int,
+        steps: int,
+        guidance_scale: float,
+        generator: torch.Generator,
+        init_image: Image.Image | None,
+        strength: float,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """Build Qwen generation kwargs. Uses true_cfg_scale, requires neg_prompt."""
+        # Qwen requires negative_prompt, default to single space
         neg_prompt = negative_prompt if negative_prompt else " "
-
-        # Use true_cfg_scale for Qwen (passed via kwargs or use guidance_scale)
+        # Use true_cfg_scale for Qwen (from kwargs or use guidance_scale)
         true_cfg_scale = kwargs.get("true_cfg_scale", guidance_scale)
 
-        # Handle img2img
-        init_image = self._load_init_image(kwargs.get("init_image"))
-        strength = kwargs.get("strength", 0.75)
-
         if init_image:
-            print(f"Qwen img2img: '{prompt[:50]}...' seed={actual_seed} strength={strength}")
-            result = self.pipe(
-                prompt=prompt,
-                negative_prompt=neg_prompt,
-                image=init_image,
-                strength=strength,
-                num_inference_steps=steps,
-                true_cfg_scale=true_cfg_scale,
-                generator=generator,
-                num_images_per_prompt=1,
-            )
+            print(f"Qwen img2img: '{prompt[:50]}...' strength={strength}")
+            return {
+                "prompt": prompt,
+                "negative_prompt": neg_prompt,
+                "image": init_image,
+                "strength": strength,
+                "num_inference_steps": steps,
+                "true_cfg_scale": true_cfg_scale,
+                "generator": generator,
+                "num_images_per_prompt": 1,
+            }
         else:
-            print(f"Qwen-Image generating: '{prompt[:50]}...' seed={actual_seed}")
-            result = self.pipe(
-                prompt=prompt,
-                negative_prompt=neg_prompt,
-                height=height,
-                width=width,
-                num_inference_steps=steps,
-                true_cfg_scale=true_cfg_scale,
-                generator=generator,
-                num_images_per_prompt=1,
-            )
+            print(f"Qwen-Image generating: '{prompt[:50]}...'")
+            return {
+                "prompt": prompt,
+                "negative_prompt": neg_prompt,
+                "height": height,
+                "width": width,
+                "num_inference_steps": steps,
+                "true_cfg_scale": true_cfg_scale,
+                "generator": generator,
+                "num_images_per_prompt": 1,
+            }
 
-        DevicePolicy.clear_cache()
-
+    def build_result(
+        self,
+        result: Any,
+        seed: int,
+        prompt: str,
+        negative_prompt: str | None,
+        steps: int,
+        guidance_scale: float,
+    ) -> GenerationResult:
+        """Build result with true_cfg_scale as guidance_scale."""
         output_image = result.images[0]
         return GenerationResult(
             image=output_image,
-            seed=actual_seed,
+            seed=seed,
             prompt=prompt,
             negative_prompt=negative_prompt,
             width=output_image.width,
             height=output_image.height,
             steps=steps,
-            guidance_scale=true_cfg_scale,
+            guidance_scale=guidance_scale,
         )
