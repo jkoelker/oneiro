@@ -180,7 +180,7 @@ class BasePipeline(ABC):
             guidance_scale=guidance_scale,
         )
 
-    def post_generate(self, **kwargs: Any) -> None:  # noqa: B027
+    def post_generate(self, **kwargs: Any) -> None:
         """Post-generation cleanup hook called after generation completes.
 
         This base implementation resets stateful model caches using the diffusers
