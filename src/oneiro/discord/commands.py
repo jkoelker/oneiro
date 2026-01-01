@@ -1,71 +1,28 @@
-"""Oneiro Discord Bot - Image generation with Diffusers."""
+"""Slash command definitions for Oneiro Discord bot."""
 
-import os
 import re
-import time
-from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import discord
 from discord import option
 
-from oneiro.civitai import CivitaiClient, CivitaiError, parse_civitai_url
-from oneiro.config import Config
-from oneiro.filters import ContentFilter
-from oneiro.lora_detector import AutoLoraDetector, create_detector_from_config
-from oneiro.pipelines import (
-    SCHEDULER_CHOICES,
-    GenerationResult,
-    LoraConfig,
-    LoraSource,
-    PipelineManager,
-)
+from oneiro.civitai import CivitaiError, parse_civitai_url
+from oneiro.discord.handlers import DreamContext, create_dream_callbacks
+from oneiro.pipelines import SCHEDULER_CHOICES
 from oneiro.pipelines.civitai_checkpoint import CivitaiCheckpointPipeline
 from oneiro.pipelines.lora import is_lora_compatible
-from oneiro.queue import GenerationQueue, QueueStatus
+from oneiro.queue import QueueStatus
+from oneiro.services.generation import (
+    MAX_GUIDANCE_SCALE,
+    MAX_STEPS,
+    MIN_GUIDANCE_SCALE,
+    MIN_STEPS,
+    LoraNotFoundError,
+    resolve_loras,
+)
 
-
-class OneiroBot(discord.Bot):
-    """Oneiro Discord bot with typed state management."""
-
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        super().__init__(*args, **kwargs)
-        self.config: Config | None = None
-        self.pipeline_manager: PipelineManager | None = None
-        self.generation_queue: GenerationQueue | None = None
-        self.content_filter: ContentFilter | None = None
-        self.civitai_client: CivitaiClient | None = None
-        self.lora_detector: AutoLoraDetector | None = None
-
-
-# LoRA weight validation limits
-MIN_LORA_WEIGHT = -2.0
-MAX_LORA_WEIGHT = 2.0
-
-# Steps validation limits (for /dream and /model commands)
-MIN_STEPS = 1
-MAX_STEPS = 100
-
-# Guidance scale validation limits (for /dream and /model commands)
-MIN_GUIDANCE_SCALE = 0.0
-MAX_GUIDANCE_SCALE = 15.0
-
-
-def validate_lora_weight(weight: float, lora_name: str) -> None:
-    """Validate that a LoRA weight is within acceptable bounds.
-
-    Args:
-        weight: The LoRA weight value to validate
-        lora_name: Name/identifier of the LoRA (for error messages)
-
-    Raises:
-        ValueError: If weight is outside the valid range [-2.0, 2.0]
-    """
-    if weight < MIN_LORA_WEIGHT or weight > MAX_LORA_WEIGHT:
-        raise ValueError(
-            f"LoRA weight {weight} for '{lora_name}' is out of range. "
-            f"Valid range is [{MIN_LORA_WEIGHT}, {MAX_LORA_WEIGHT}]."
-        )
+if TYPE_CHECKING:
+    from oneiro.app import OneiroBot
 
 
 def slugify(text: str) -> str:
@@ -87,71 +44,6 @@ def slugify(text: str) -> str:
     # Remove leading/trailing hyphens
     slug = slug.strip("-")
     return slug or "unnamed"
-
-
-def parse_lora_param(lora_str: str) -> list[tuple[str, float]]:
-    """Parse lora parameter string into list of (name/id, weight) tuples.
-
-    Supports formats:
-    - "lora-name" -> ("lora-name", 1.0)
-    - "lora-name:0.8" -> ("lora-name", 0.8)
-    - "civitai:12345" -> ("civitai:12345", 1.0)
-    - "civitai:12345:0.7" -> ("civitai:12345", 0.7)
-    - "lora1:0.8,lora2:0.5" -> [("lora1", 0.8), ("lora2", 0.5)]
-
-    Args:
-        lora_str: Comma-separated lora specifications
-
-    Returns:
-        List of (identifier, weight) tuples
-
-    Raises:
-        ValueError: If a weight is outside the valid range [-2.0, 2.0]
-    """
-    results: list[tuple[str, float]] = []
-    if not lora_str:
-        return results
-
-    for part in lora_str.split(","):
-        part = part.strip()
-        if not part:
-            continue
-
-        # Check if it's a civitai: reference
-        if part.startswith("civitai:"):
-            # civitai:12345 or civitai:12345:0.8
-            segments = part.split(":")
-            if len(segments) == 2:
-                # civitai:12345
-                results.append((part, 1.0))
-            elif len(segments) >= 3:
-                # civitai:12345:0.8
-                try:
-                    weight = float(segments[2])
-                except ValueError:
-                    # Couldn't parse weight as float, treat whole thing as name
-                    results.append((part, 1.0))
-                else:
-                    lora_name = f"civitai:{segments[1]}"
-                    validate_lora_weight(weight, lora_name)
-                    results.append((lora_name, weight))
-        else:
-            # Regular name or name:weight
-            if ":" in part:
-                name, weight_str = part.rsplit(":", 1)
-                try:
-                    weight = float(weight_str)
-                except ValueError:
-                    # Couldn't parse weight as float, treat whole thing as name
-                    results.append((part, 1.0))
-                else:
-                    lora_name = name.strip()
-                    validate_lora_weight(weight, lora_name)
-                    results.append((lora_name, weight))
-            else:
-                results.append((part, 1.0))
-
-    return results
 
 
 async def get_lora_choices(ctx: discord.AutocompleteContext) -> list[str]:
@@ -198,125 +90,12 @@ async def get_model_choices(ctx: discord.AutocompleteContext) -> list[str]:
     return [name for name in models.keys() if name.lower().startswith(current)]
 
 
-def create_bot() -> OneiroBot:
-    """Create and configure the Discord bot."""
-    activity = discord.Activity(
-        name="Dreaming...",
-        type=discord.ActivityType.custom,
-    )
+def register_commands(bot: "OneiroBot") -> None:
+    """Register all slash commands on the bot.
 
-    bot = OneiroBot(activity=activity)
-
-    @bot.event
-    async def on_ready():
-        """Initialize config, pipeline and queue when bot connects."""
-        print(f"{bot.user} is online!")
-
-        # Load configuration
-        base_config_path = Path(os.environ.get("CONFIG_PATH", "config.toml"))
-        overlay_config_path = os.environ.get("CONFIG_OVERLAY_PATH")
-        state_path = os.environ.get("STATE_PATH")
-
-        bot.config = Config(
-            base_path=base_config_path,
-            overlay_path=Path(overlay_config_path) if overlay_config_path else None,
-            state_path=Path(state_path) if state_path else None,
-        )
-        bot.config.load()
-        print(f"Config loaded from {base_config_path}")
-
-        # Initialize Civitai client
-        bot.civitai_client = CivitaiClient.from_config(bot.config)
-        print("Civitai client initialized")
-
-        # Initialize content filter
-        bot.content_filter = ContentFilter(bot.config)
-        print("Content filter initialized")
-
-        # Initialize LoRA auto-detector
-        bot.lora_detector = create_detector_from_config(bot.config.data)
-        print("LoRA auto-detector initialized")
-
-        # Initialize pipeline manager with config
-        bot.pipeline_manager = PipelineManager(bot.config)
-        bot.pipeline_manager.set_civitai_client(bot.civitai_client)
-        print("Loading default model...")
-        await bot.pipeline_manager.load_model()
-        print(f"Model loaded: {bot.pipeline_manager.current_model}")
-
-        # Initialize queue with config values
-        max_global = bot.config.get("queue", "max_global", default=100)
-        max_per_user = bot.config.get("queue", "max_per_user", default=20)
-        bot.generation_queue = GenerationQueue(max_global=max_global, max_per_user=max_per_user)
-        await bot.generation_queue.start(bot.pipeline_manager)
-        print(f"Queue started: {max_global} global, {max_per_user} per user")
-
-        # Register config change callback
-        async def on_config_change(new_config: dict[str, Any]) -> None:
-            """Update queue limits and LoRA detector when config changes."""
-            if bot.generation_queue is None:
-                return
-
-            queue_config = new_config.get("queue", {})
-            new_max_global = queue_config.get("max_global", 100)
-            new_max_per_user = queue_config.get("max_per_user", 20)
-
-            if (
-                new_max_global != bot.generation_queue.max_global
-                or new_max_per_user != bot.generation_queue.max_per_user
-            ):
-                bot.generation_queue.max_global = new_max_global
-                bot.generation_queue.max_per_user = new_max_per_user
-                print(f"Queue limits updated: {new_max_global} global, {new_max_per_user} per user")
-
-            # Rebuild LoRA detector with new config
-            bot.lora_detector = create_detector_from_config(new_config)
-            print("LoRA auto-detector rebuilt")
-
-        bot.config.on_change(on_config_change)
-
-        # Start config file watching
-        await bot.config.start_watching()
-
-        # Sync slash commands to all guilds for instant availability
-        # (global commands can take up to 1 hour to propagate)
-        if bot.guilds:
-            guild_ids = [g.id for g in bot.guilds]
-            await bot.sync_commands(guild_ids=guild_ids)
-            print(f"Commands synced to {len(guild_ids)} guild(s): {[g.name for g in bot.guilds]}")
-
-        print("Ready to generate images!")
-
-    @bot.event
-    async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
-        """Handle ❌ reaction to delete generated images."""
-        # Only handle ❌ reactions
-        if str(payload.emoji) != "❌":
-            return
-
-        # Don't process bot's own reactions
-        if payload.user_id == bot.user.id:  # type: ignore
-            return
-
-        # Fetch the message
-        channel = bot.get_channel(payload.channel_id)
-        if channel is None:
-            return
-
-        try:
-            message = await channel.fetch_message(payload.message_id)  # type: ignore
-        except discord.errors.NotFound:
-            return
-
-        # Only process bot's messages with embeds
-        if message.author != bot.user or not message.embeds:
-            return
-
-        # Delete the message - anyone can delete by clicking ❌
-        try:
-            await message.delete()
-        except discord.errors.Forbidden:
-            pass  # Can't delete in this channel
+    Args:
+        bot: The OneiroBot instance to register commands on
+    """
 
     @bot.slash_command(name="dream", description="Generate an image from a prompt")
     @option(
@@ -411,7 +190,7 @@ def create_bot() -> OneiroBot:
         guidance_scale: float | None = None,
         lora: str | None = None,
         scheduler: str | None = None,
-    ):
+    ) -> None:
         """Generate an image from a text prompt."""
         if ctx.bot.generation_queue is None or ctx.bot.pipeline_manager is None:
             await ctx.respond("❌ Bot is still initializing, please wait...", ephemeral=True)
@@ -471,106 +250,28 @@ def create_bot() -> OneiroBot:
         actual_guidance = guidance_scale if guidance_scale is not None else model_guidance
 
         # Resolve LoRAs: explicit param OR auto-detect (not both)
-        lora_configs: list[LoraConfig] = []
-        lora_warnings: list[str] = []
-        auto_detected_loras: list[tuple[str, str]] = []
+        try:
+            lora_result = await resolve_loras(
+                lora_param=lora,
+                prompt=prompt,
+                config=ctx.bot.config,
+                civitai_client=ctx.bot.civitai_client,
+                lora_detector=ctx.bot.lora_detector,
+                pipeline_type=pipeline_type,
+            )
+        except LoraNotFoundError as e:
+            await ctx.followup.send(
+                f"❌ {e}. Use `/fetch` to download it first, or use `civitai:<id>` format.",
+                ephemeral=True,
+            )
+            return
+        except ValueError as e:
+            await ctx.followup.send(f"❌ Invalid LoRA specification: {e}", ephemeral=True)
+            return
 
-        if lora and ctx.bot.config:
-            # Explicit lora parameter provided - skip auto-detection
-            parsed_loras = parse_lora_param(lora)
-            loras_section = ctx.bot.config.get("loras", default={})
-
-            for lora_ref, weight in parsed_loras:
-                try:
-                    if lora_ref.startswith("civitai:"):
-                        # Direct Civitai reference - on-demand download
-                        civitai_id = int(lora_ref.split(":")[1])
-                        lora_config = LoraConfig(
-                            name=f"civitai_{civitai_id}",
-                            source=LoraSource.CIVITAI,
-                            civitai_id=civitai_id,
-                            weight=weight,
-                        )
-
-                        # Check compatibility (soft warning)
-                        if ctx.bot.civitai_client and pipeline_type:
-                            try:
-                                model_info = await ctx.bot.civitai_client.get_model(civitai_id)
-                                version = model_info.latest_version
-                                if version and not is_lora_compatible(
-                                    pipeline_type, version.base_model
-                                ):
-                                    lora_warnings.append(
-                                        f"⚠️ LoRA `{model_info.name}` (base: {version.base_model}) "
-                                        f"may not be compatible with current model ({pipeline_type})"
-                                    )
-                            except CivitaiError as e:
-                                lora_warnings.append(f"⚠️ Could not verify LoRA {civitai_id}: {e}")
-
-                        lora_configs.append(lora_config)
-                    else:
-                        # Named reference from config
-                        if lora_ref in loras_section and isinstance(loras_section[lora_ref], dict):
-                            lora_def = loras_section[lora_ref]
-                            source_str = lora_def.get("source", "civitai")
-                            source = LoraSource(source_str)
-
-                            lora_config = LoraConfig(
-                                name=lora_ref,
-                                source=source,
-                                weight=weight,
-                                civitai_id=lora_def.get("id") or lora_def.get("civitai_id"),
-                                civitai_version=lora_def.get("version")
-                                or lora_def.get("civitai_version"),
-                                civitai_url=lora_def.get("url") or lora_def.get("civitai_url"),
-                                repo=lora_def.get("repo"),
-                                weight_name=lora_def.get("weight_name"),
-                                path=lora_def.get("path"),
-                            )
-
-                            # Check compatibility for Civitai LoRAs
-                            if (
-                                source == LoraSource.CIVITAI
-                                and ctx.bot.civitai_client
-                                and pipeline_type
-                            ):
-                                civitai_id = lora_config.civitai_id
-                                if civitai_id:
-                                    try:
-                                        model_info = await ctx.bot.civitai_client.get_model(
-                                            civitai_id
-                                        )
-                                        version = model_info.latest_version
-                                        if version and not is_lora_compatible(
-                                            pipeline_type, version.base_model
-                                        ):
-                                            lora_warnings.append(
-                                                f"⚠️ LoRA `{lora_ref}` (base: {version.base_model}) "
-                                                f"may not be compatible with current model ({pipeline_type})"
-                                            )
-                                    except CivitaiError as e:
-                                        lora_warnings.append(
-                                            f"⚠️ Could not verify LoRA `{lora_ref}`: {e}"
-                                        )
-
-                            lora_configs.append(lora_config)
-                        else:
-                            await ctx.followup.send(
-                                f"❌ Unknown LoRA: `{lora_ref}`. "
-                                f"Use `/fetch` to download it first, or use `civitai:<id>` format.",
-                                ephemeral=True,
-                            )
-                            return
-                except ValueError as e:
-                    await ctx.followup.send(f"❌ Invalid LoRA specification: {e}", ephemeral=True)
-                    return
-
-        elif ctx.bot.lora_detector and pipeline_type:
-            # No explicit lora - run auto-detection
-            matches = ctx.bot.lora_detector.match(prompt, pipeline_type)
-            for match in matches:
-                lora_configs.append(match.lora)
-                auto_detected_loras.append((match.lora.name, match.matched_trigger))
+        lora_configs = lora_result.configs
+        lora_warnings = lora_result.warnings
+        auto_detected_loras = lora_result.auto_detected
 
         request: dict[str, Any] = {
             "prompt": prompt,
@@ -593,99 +294,19 @@ def create_bot() -> OneiroBot:
             request["init_image"] = init_image_bytes
             request["strength"] = strength
 
-        start_time = time.time()
-        is_img2img = init_image_bytes is not None
-        status_message: discord.Message | None = None
-
-        async def on_start() -> None:
-            nonlocal status_message
-            if status_message:
-                try:
-                    await status_message.edit(content=f"🎨 Generating for **{ctx.author.name}**...")
-                except discord.errors.NotFound:
-                    pass
-
-        async def on_position_update(position: int) -> None:
-            nonlocal status_message
-            if status_message:
-                try:
-                    await status_message.edit(
-                        content=f"⏳ Queued at position **{position}**. Please wait..."
-                    )
-                except discord.errors.NotFound:
-                    pass
-
-        async def on_complete(result: GenerationResult | Exception) -> None:
-            nonlocal status_message
-            if isinstance(result, Exception):
-                if status_message:
-                    try:
-                        await status_message.edit(content=f"❌ Generation failed: {result}")
-                    except discord.errors.NotFound:
-                        await ctx.followup.send(f"❌ Generation failed: {result}")
-                else:
-                    await ctx.followup.send(f"❌ Generation failed: {result}")
-                return
-
-            elapsed = time.time() - start_time
-            image_buffer = ctx.bot.pipeline_manager.image_to_bytes(result.image)  # type: ignore
-            file = discord.File(image_buffer, filename="dream.png")
-
-            embed = discord.Embed(
-                title="🎨 Dream Generated" + (" (img2img)" if is_img2img else ""),
-                color=discord.Color.purple(),
-            )
-            embed.add_field(name="Prompt", value=prompt[:1024], inline=False)
-            if negative_prompt:
-                embed.add_field(
-                    name="Negative Prompt",
-                    value=negative_prompt[:1024],
-                    inline=False,
-                )
-            embed.add_field(name="Size", value=f"{result.width}×{result.height}", inline=True)
-            embed.add_field(name="Seed", value=str(result.seed), inline=True)
-            embed.add_field(name="Time", value=f"{elapsed:.1f}s", inline=True)
-            embed.add_field(name="Model", value=f"`{current_model}`", inline=True)
-            embed.add_field(name="Steps", value=str(result.steps), inline=True)
-            embed.add_field(name="CFG", value=f"{result.guidance_scale:.1f}", inline=True)
-            if is_img2img:
-                embed.add_field(name="Strength", value=f"{strength:.2f}", inline=True)
-            if lora_configs:
-                lora_display = ", ".join(f"`{lc.name}`:{lc.weight}" for lc in lora_configs)
-                if len(lora_display) > 1024:
-                    lora_display = lora_display[:1021] + "..."
-                embed.add_field(name="LoRA", value=lora_display, inline=True)
-            if auto_detected_loras:
-                auto_display = ", ".join(
-                    f'`{name}` (matched "{trigger}")' for name, trigger in auto_detected_loras
-                )
-                if len(auto_display) > 1024:
-                    auto_display = auto_display[:1021] + "..."
-                embed.add_field(name="Auto LoRAs", value=auto_display, inline=False)
-            if scheduler:
-                embed.add_field(name="Scheduler", value=f"`{scheduler}`", inline=True)
-            embed.set_image(url="attachment://dream.png")
-            embed.set_footer(
-                text=f"Requested by {ctx.author.name} • React ❌ to delete",
-                icon_url=ctx.author.avatar.url if ctx.author.avatar else None,
-            )
-
-            if status_message:
-                try:
-                    await status_message.edit(content=None, embed=embed, file=file)
-                    await status_message.add_reaction("❌")
-                except discord.errors.NotFound:
-                    msg = await ctx.followup.send(embed=embed, file=file)
-                    try:
-                        await msg.add_reaction("❌")
-                    except discord.errors.Forbidden:
-                        pass
-            else:
-                msg = await ctx.followup.send(embed=embed, file=file)
-                try:
-                    await msg.add_reaction("❌")
-                except discord.errors.Forbidden:
-                    pass
+        dream_context = DreamContext(
+            ctx=ctx,
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            current_model=current_model,
+            scheduler=scheduler,
+            lora_configs=lora_configs,
+            auto_detected_loras=auto_detected_loras,
+            is_img2img=init_image_bytes is not None,
+            strength=strength,
+            pipeline_manager=ctx.bot.pipeline_manager,  # type: ignore[arg-type]
+        )
+        on_start, on_position_update, on_complete = create_dream_callbacks(dream_context)
 
         # Send LoRA compatibility warnings (soft warnings, don't block)
         if lora_warnings:
@@ -702,7 +323,7 @@ def create_bot() -> OneiroBot:
 
         if queue_result.status == QueueStatus.QUEUED:
             if queue_result.position > 1:
-                status_message = await ctx.followup.send(
+                dream_context.status_message = await ctx.followup.send(
                     f"⏳ Queued at position **{queue_result.position}**. Please wait..."
                 )
         elif queue_result.status == QueueStatus.USER_LIMIT:
@@ -711,7 +332,7 @@ def create_bot() -> OneiroBot:
             await ctx.followup.send(f"❌ {queue_result.message}", ephemeral=True)
 
     @bot.slash_command(name="queue", description="Check your queue status")
-    async def queue_status(ctx: discord.ApplicationContext):
+    async def queue_status(ctx: discord.ApplicationContext) -> None:
         """Show queue status for the user."""
         if ctx.bot.generation_queue is None:
             await ctx.respond("❌ Bot is still initializing...", ephemeral=True)
@@ -768,7 +389,7 @@ def create_bot() -> OneiroBot:
         scheduler: str | None = None,
         steps: int | None = None,
         guidance_scale: float | None = None,
-    ):
+    ) -> None:
         """Switch the active diffusion model and optionally override its scheduler.
 
         This command changes which configured model is used for image generation.
@@ -867,7 +488,7 @@ def create_bot() -> OneiroBot:
             await ctx.followup.send(f"❌ Failed to load model: {e}", ephemeral=True)
 
     @bot.slash_command(name="config", description="Show current configuration")
-    async def config_command(ctx: discord.ApplicationContext):
+    async def config_command(ctx: discord.ApplicationContext) -> None:
         """Show current configuration values."""
         if ctx.bot.config is None:
             await ctx.respond("❌ Config not loaded", ephemeral=True)
@@ -926,7 +547,7 @@ def create_bot() -> OneiroBot:
         ctx: discord.ApplicationContext,
         url: str,
         name: str | None = None,
-    ):
+    ) -> None:
         """Fetch a model from Civitai and auto-configure it."""
         if ctx.bot.config is None or ctx.bot.civitai_client is None:
             await ctx.respond("❌ Bot is still initializing...", ephemeral=True)
@@ -1146,5 +767,3 @@ def create_bot() -> OneiroBot:
             await ctx.followup.send(f"❌ Civitai error: {e}", ephemeral=True)
         except Exception as e:
             await ctx.followup.send(f"❌ Failed to fetch: {e}", ephemeral=True)
-
-    return bot

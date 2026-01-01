@@ -2,7 +2,7 @@
 
 import os
 
-from oneiro.bot import create_bot
+from oneiro.app import create_app
 
 
 def main() -> None:
@@ -18,7 +18,7 @@ def main() -> None:
     if not token:
         raise ValueError("TOKEN environment variable required")
 
-    bot = create_bot()
+    bot = create_app()
     bot.run(token)
 
 
