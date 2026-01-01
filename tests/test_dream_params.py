@@ -4,7 +4,7 @@ Tests for issue #51: Exposing steps and guidance_scale parameters in /dream comm
 and setting model defaults via /model command.
 """
 
-from oneiro.bot import (
+from oneiro.services.generation import (
     MAX_GUIDANCE_SCALE,
     MAX_STEPS,
     MIN_GUIDANCE_SCALE,

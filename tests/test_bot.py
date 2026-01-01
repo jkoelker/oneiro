@@ -1,12 +1,12 @@
-"""Tests for bot.py helper functions."""
+"""Tests for bot helper functions."""
 
 import pytest
 
-from oneiro.bot import (
+from oneiro.discord.commands import slugify
+from oneiro.services.generation import (
     MAX_LORA_WEIGHT,
     MIN_LORA_WEIGHT,
     parse_lora_param,
-    slugify,
     validate_lora_weight,
 )
 
