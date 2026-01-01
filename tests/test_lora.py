@@ -10,7 +10,7 @@ from oneiro.pipelines.lora import (
     LoraConfig,
     LoraIncompatibleError,
     LoraSource,
-    is_lora_compatible,
+    is_resource_compatible,
     parse_lora_config,
     parse_loras_from_config,
     parse_loras_from_model_config,
@@ -574,40 +574,40 @@ class TestParseLORAsFromConfig:
 
 
 class TestIsLoraCompatible:
-    """Tests for is_lora_compatible function."""
+    """Tests for is_resource_compatible function."""
 
     def test_flux_compatible(self):
         """Flux.1 LoRAs compatible with flux1 pipeline (not flux2)."""
-        assert is_lora_compatible("flux1", "Flux.1 Dev")
-        assert is_lora_compatible("flux1", "Flux.1 Schnell")
-        assert is_lora_compatible("flux1", "Flux.1 D")
-        assert is_lora_compatible("flux2", "Flux.2")
-        assert not is_lora_compatible("flux2", "Flux.1 Dev")
+        assert is_resource_compatible("flux1", "Flux.1 Dev")
+        assert is_resource_compatible("flux1", "Flux.1 Schnell")
+        assert is_resource_compatible("flux1", "Flux.1 D")
+        assert is_resource_compatible("flux2", "Flux.2")
+        assert not is_resource_compatible("flux2", "Flux.1 Dev")
 
     def test_sdxl_compatible(self):
         """SDXL LoRAs compatible with sdxl pipeline."""
-        assert is_lora_compatible("sdxl", "SDXL 1.0")
-        assert is_lora_compatible("sdxl", "Pony")
-        assert is_lora_compatible("sdxl", "Illustrious")
+        assert is_resource_compatible("sdxl", "SDXL 1.0")
+        assert is_resource_compatible("sdxl", "Pony")
+        assert is_resource_compatible("sdxl", "Illustrious")
 
     def test_incompatible_base_model(self):
         """Incompatible base model returns False."""
-        assert not is_lora_compatible("flux2", "SDXL 1.0")
-        assert not is_lora_compatible("sdxl", "Flux.1 Dev")
-        assert not is_lora_compatible("flux2", "SD 1.5")
+        assert not is_resource_compatible("flux2", "SDXL 1.0")
+        assert not is_resource_compatible("sdxl", "Flux.1 Dev")
+        assert not is_resource_compatible("flux2", "SD 1.5")
 
     def test_none_base_model_is_compatible(self):
         """None base model assumed compatible."""
-        assert is_lora_compatible("flux2", None)
+        assert is_resource_compatible("flux2", None)
 
     def test_unknown_pipeline_is_compatible(self):
         """Unknown pipeline type assumed compatible."""
-        assert is_lora_compatible("unknown", "SDXL 1.0")
+        assert is_resource_compatible("unknown", "SDXL 1.0")
 
     def test_case_insensitive(self):
         """Comparison is case-insensitive."""
-        assert is_lora_compatible("flux1", "flux.1 dev")
-        assert is_lora_compatible("flux1", "FLUX.1 DEV")
+        assert is_resource_compatible("flux1", "flux.1 dev")
+        assert is_resource_compatible("flux1", "FLUX.1 DEV")
 
 
 class TestLoraIncompatibleError:
