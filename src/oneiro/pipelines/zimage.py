@@ -120,18 +120,21 @@ class ZImagePipelineWrapper(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipeline)
         only the LoRAs defined in the model config remain active after each
         generation.
         """
-        if not self._loaded_adapters:
+        # Build expected static adapter names
+        static_names = [lora.adapter_name or lora.name for lora in self._static_lora_configs]
+
+        # Check if current adapters match static config (names and count)
+        adapters_match = self._loaded_adapters == static_names
+
+        if adapters_match:
+            # Adapters match - just reset weights in case they were modified
+            if self._static_lora_configs:
+                adapter_weights = [lora.weight for lora in self._static_lora_configs]
+                self.set_lora_adapters(static_names, adapter_weights)
             return
 
-        # If we have more adapters than static ones, dynamic LoRAs were added
-        if len(self._loaded_adapters) > len(self._static_lora_configs):
-            self.unload_loras()
-            # Reload static LoRAs if any were configured
-            if self._static_lora_configs:
-                self.load_loras_sync(self._static_lora_configs)
-                print(f"Restored {len(self._static_lora_configs)} static LoRA(s)")
-        elif self._static_lora_configs:
-            # Ensure static LoRAs are properly set (weights may have changed)
-            adapter_names = [lora.adapter_name or lora.name for lora in self._static_lora_configs]
-            adapter_weights = [lora.weight for lora in self._static_lora_configs]
-            self.set_lora_adapters(adapter_names, adapter_weights)
+        # Adapters don't match - full reset required
+        self.unload_loras()
+        if self._static_lora_configs:
+            self.load_loras_sync(self._static_lora_configs)
+            print(f"Restored {len(self._static_lora_configs)} static LoRA(s)")
