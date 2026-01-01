@@ -2,6 +2,9 @@
 
 from typing import Any
 
+import torch
+from PIL import Image
+
 from oneiro.device import DevicePolicy
 from oneiro.pipelines.base import BasePipeline, GenerationResult
 
@@ -98,48 +101,50 @@ class Flux1PipelineWrapper(BasePipeline):
         Returns:
             GenerationResult with generated image and metadata.
         """
-        if self.pipe is None:
-            raise RuntimeError("Pipeline not loaded")
-
-        actual_seed, generator = self._prepare_seed(seed)
-
-        # Handle img2img
-        init_image = self._load_init_image(kwargs.get("init_image"))
-        strength = kwargs.get("strength", 0.75)
-
-        if init_image:
-            print(f"FLUX.1 img2img: '{prompt[:50]}...' seed={actual_seed} strength={strength}")
-            result = self.pipe(
-                prompt=prompt,
-                image=init_image,
-                strength=strength,
-                num_inference_steps=steps,
-                guidance_scale=guidance_scale,
-                generator=generator,
-                max_sequence_length=512,
-            )
-        else:
-            print(f"FLUX.1 generating: '{prompt[:50]}...' seed={actual_seed}")
-            result = self.pipe(
-                prompt=prompt,
-                height=height,
-                width=width,
-                num_inference_steps=steps,
-                guidance_scale=guidance_scale,
-                generator=generator,
-                max_sequence_length=512,
-            )
-
-        DevicePolicy.clear_cache()
-
-        output_image = result.images[0]
-        return GenerationResult(
-            image=output_image,
-            seed=actual_seed,
+        return super().generate(
             prompt=prompt,
             negative_prompt=negative_prompt,
-            width=output_image.width,
-            height=output_image.height,
+            width=width,
+            height=height,
+            seed=seed,
             steps=steps,
             guidance_scale=guidance_scale,
+            **kwargs,
         )
+
+    def build_generation_kwargs(
+        self,
+        prompt: str,
+        negative_prompt: str | None,  # Not used by FLUX.1 but accepted for API compatibility
+        width: int,
+        height: int,
+        steps: int,
+        guidance_scale: float,
+        generator: torch.Generator,
+        init_image: Image.Image | None,
+        strength: float,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """Build FLUX.1 generation kwargs. Adds max_sequence_length=512."""
+        if init_image:
+            print(f"FLUX.1 img2img: '{prompt[:50]}...' strength={strength}")
+            return {
+                "prompt": prompt,
+                "image": init_image,
+                "strength": strength,
+                "num_inference_steps": steps,
+                "guidance_scale": guidance_scale,
+                "generator": generator,
+                "max_sequence_length": 512,
+            }
+        else:
+            print(f"FLUX.1 generating: '{prompt[:50]}...'")
+            return {
+                "prompt": prompt,
+                "height": height,
+                "width": width,
+                "num_inference_steps": steps,
+                "guidance_scale": guidance_scale,
+                "generator": generator,
+                "max_sequence_length": 512,
+            }

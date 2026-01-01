@@ -60,29 +60,29 @@ class ConcretePipeline(BasePipeline):
     def load(self, model_config):
         pass
 
-    def generate(
+    def build_generation_kwargs(
         self,
         prompt,
-        negative_prompt=None,
-        width=1024,
-        height=1024,
-        seed=-1,
-        steps=9,
-        guidance_scale=0.0,
+        negative_prompt,
+        width,
+        height,
+        steps,
+        guidance_scale,
+        generator,
+        init_image,
+        strength,
         **kwargs,
     ):
-        img = Image.new("RGB", (width, height))
-        actual_seed, _ = self._prepare_seed(seed)
-        return GenerationResult(
-            image=img,
-            seed=actual_seed,
-            prompt=prompt,
-            negative_prompt=negative_prompt,
-            width=width,
-            height=height,
-            steps=steps,
-            guidance_scale=guidance_scale,
-        )
+        """Build generation kwargs for testing."""
+        return {
+            "prompt": prompt,
+            "negative_prompt": negative_prompt,
+            "width": width,
+            "height": height,
+            "num_inference_steps": steps,
+            "guidance_scale": guidance_scale,
+            "generator": generator,
+        }
 
 
 class TestBasePipelineInit:

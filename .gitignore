@@ -95,3 +95,4 @@ uv.lock
 
 .beads
 .gitattributes
+.beads/artifacts/
