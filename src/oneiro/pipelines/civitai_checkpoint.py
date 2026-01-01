@@ -854,7 +854,8 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
         return gen_kwargs
 
     def post_generate(self, **kwargs: Any) -> None:
-        """Post-generation cleanup: restore static LoRAs if dynamic were used."""
+        """Post-generation cleanup: reset model state and restore static LoRAs."""
+        super().post_generate(**kwargs)
         if self._has_dynamic_loras:
             self._restore_static_loras()
             self._has_dynamic_loras = False

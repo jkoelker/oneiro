@@ -246,6 +246,44 @@ class TestBasePipelineConfigureCpuThreads:
         assert result >= 1  # Should at least be 1
 
 
+class TestBasePipelinePostGenerate:
+    """Tests for BasePipeline.post_generate() and _reset_model_state()."""
+
+    @patch("oneiro.pipelines.base.torch.cuda.is_available", return_value=False)
+    def test_post_generate_calls_reset_model_state(self, mock_cuda):
+        """post_generate() calls _reset_model_state()."""
+        pipeline = ConcretePipeline()
+        pipeline._reset_model_state = Mock()
+        pipeline.post_generate()
+        pipeline._reset_model_state.assert_called_once()
+
+    @patch("oneiro.pipelines.base.torch.cuda.is_available", return_value=False)
+    def test_reset_model_state_calls_maybe_free_model_hooks(self, mock_cuda):
+        """_reset_model_state() calls pipe.maybe_free_model_hooks()."""
+        pipeline = ConcretePipeline()
+        mock_pipe = Mock()
+        pipeline.pipe = mock_pipe
+        pipeline._reset_model_state()
+        mock_pipe.maybe_free_model_hooks.assert_called_once()
+
+    @patch("oneiro.pipelines.base.torch.cuda.is_available", return_value=False)
+    def test_reset_model_state_handles_none_pipe(self, mock_cuda):
+        """_reset_model_state() handles pipe being None."""
+        pipeline = ConcretePipeline()
+        pipeline.pipe = None
+        # Should not raise
+        pipeline._reset_model_state()
+
+    @patch("oneiro.pipelines.base.torch.cuda.is_available", return_value=False)
+    def test_post_generate_accepts_kwargs(self, mock_cuda):
+        """post_generate() accepts arbitrary kwargs."""
+        pipeline = ConcretePipeline()
+        pipeline._reset_model_state = Mock()
+        # Should not raise
+        pipeline.post_generate(some_kwarg="value", another=123)
+        pipeline._reset_model_state.assert_called_once()
+
+
 class TestPipelineManagerLoraResolution:
     """Tests for PipelineManager.generate() LoRA path resolution."""
 
