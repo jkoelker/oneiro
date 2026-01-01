@@ -605,8 +605,9 @@ class LoraLoaderMixin:
     def __init__(self) -> None:
         """Initialize LoRA state and continue MRO chain."""
         super().__init__()
-        self._lora_configs = []
-        self._loaded_adapters = []
+        self._lora_configs: list[LoraConfig] = []
+        self._loaded_adapters: list[str] = []
+        self._static_lora_configs: list[LoraConfig] = []
 
     def load_single_lora(
         self,
@@ -796,3 +797,42 @@ class LoraLoaderMixin:
     def lora_count(self) -> int:
         """Get number of loaded LoRAs."""
         return len(self._loaded_adapters)
+
+    def set_static_loras(self, loras: list[LoraConfig]) -> None:
+        """Store the static LoRA baseline for post-generation restore.
+
+        Call this after loading LoRAs from config in load() to establish
+        which adapters should be preserved between generation requests.
+
+        Args:
+            loras: List of LoRA configurations that represent the static baseline
+        """
+        self._static_lora_configs = list(loras)
+
+    def restore_static_loras(self) -> None:
+        """Restore LoRA state to static adapters loaded from config.
+
+        Call this in post_generate() to prevent state leakage between requests.
+        If dynamic LoRAs were added during a request, this will unload them
+        and restore only the static config LoRAs.
+
+        Behavior:
+        - If no static LoRAs and no loaded adapters: no-op
+        - If adapters match static config: reset weights only
+        - If adapters differ: unload all and reload static LoRAs
+        """
+        static_names = [lora.adapter_name or lora.name for lora in self._static_lora_configs]
+        adapters_match = self._loaded_adapters == static_names
+
+        if adapters_match:
+            # Adapters match - just reset weights if there are static LoRAs
+            if self._static_lora_configs:
+                adapter_weights = [lora.weight for lora in self._static_lora_configs]
+                self.set_lora_adapters(static_names, adapter_weights)
+            return
+
+        # Adapters don't match - need to restore to static baseline
+        self.unload_loras()
+        if self._static_lora_configs:
+            self.load_loras_sync(self._static_lora_configs)
+            print(f"Restored {len(self._static_lora_configs)} static LoRA(s)")

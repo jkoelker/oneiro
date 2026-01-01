@@ -8,7 +8,7 @@ from PIL import Image
 from oneiro.device import DevicePolicy
 from oneiro.pipelines.base import BasePipeline, GenerationResult
 from oneiro.pipelines.embedding import EmbeddingLoaderMixin, parse_embeddings_from_config
-from oneiro.pipelines.lora import LoraConfig, LoraLoaderMixin, parse_loras_from_model_config
+from oneiro.pipelines.lora import LoraLoaderMixin, parse_loras_from_model_config
 
 
 class ZImagePipelineWrapper(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipeline):
@@ -16,7 +16,6 @@ class ZImagePipelineWrapper(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipeline)
 
     def __init__(self) -> None:
         super().__init__()
-        self._static_lora_configs: list[LoraConfig] = []
 
     def load(self, model_config: dict[str, Any], full_config: dict[str, Any] | None = None) -> None:
         """Load Z-Image-Turbo model."""
@@ -40,10 +39,7 @@ class ZImagePipelineWrapper(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipeline)
         if loras:
             print(f"  Loading {len(loras)} LoRA(s)...")
             self.load_loras_sync(loras)
-            # Track static LoRAs loaded from config for post_generate reset
-            self._static_lora_configs = list(loras)
-        else:
-            self._static_lora_configs = []
+            self.set_static_loras(loras)
 
         # Load embeddings if full_config provided
         if full_config:
@@ -114,27 +110,6 @@ class ZImagePipelineWrapper(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipeline)
         )
 
     def post_generate(self, **kwargs: Any) -> None:
-        """Reset LoRA state to static adapters loaded from config.
-
-        This prevents state leakage between generation requests by ensuring
-        only the LoRAs defined in the model config remain active after each
-        generation.
-        """
-        # Build expected static adapter names
-        static_names = [lora.adapter_name or lora.name for lora in self._static_lora_configs]
-
-        # Check if current adapters match static config (names and count)
-        adapters_match = self._loaded_adapters == static_names
-
-        if adapters_match:
-            # Adapters match - just reset weights in case they were modified
-            if self._static_lora_configs:
-                adapter_weights = [lora.weight for lora in self._static_lora_configs]
-                self.set_lora_adapters(static_names, adapter_weights)
-            return
-
-        # Adapters don't match - full reset required
-        self.unload_loras()
-        if self._static_lora_configs:
-            self.load_loras_sync(self._static_lora_configs)
-            print(f"Restored {len(self._static_lora_configs)} static LoRA(s)")
+        """Reset LoRA state after generation to prevent state leakage."""
+        super().post_generate(**kwargs)
+        self.restore_static_loras()

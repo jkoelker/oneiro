@@ -798,3 +798,153 @@ class TestResolveLoraPath:
         )
 
         assert config.trigger_words == []
+
+
+class TestLoraLoaderMixinStaticLoras:
+    """Tests for LoraLoaderMixin static LoRA management methods."""
+
+    def test_set_static_loras_stores_configs(self):
+        """set_static_loras stores a copy of the configs."""
+        from oneiro.pipelines.lora import LoraLoaderMixin
+
+        class TestMixin(LoraLoaderMixin):
+            pass
+
+        mixin = TestMixin()
+        loras = [
+            LoraConfig(name="lora1", source=LoraSource.LOCAL, path="/path/1"),
+            LoraConfig(name="lora2", source=LoraSource.LOCAL, path="/path/2"),
+        ]
+
+        mixin.set_static_loras(loras)
+
+        assert mixin._static_lora_configs == loras
+        # Verify it's a copy, not the same list
+        assert mixin._static_lora_configs is not loras
+
+    def test_set_static_loras_empty_list(self):
+        """set_static_loras handles empty list."""
+        from oneiro.pipelines.lora import LoraLoaderMixin
+
+        class TestMixin(LoraLoaderMixin):
+            pass
+
+        mixin = TestMixin()
+        mixin.set_static_loras([])
+
+        assert mixin._static_lora_configs == []
+
+    def test_restore_static_loras_no_op_when_empty(self):
+        """restore_static_loras is no-op when no static loras and no loaded adapters."""
+        from oneiro.pipelines.lora import LoraLoaderMixin
+
+        class TestMixin(LoraLoaderMixin):
+            pass
+
+        mixin = TestMixin()
+        mixin.unload_loras = Mock()
+        mixin.load_loras_sync = Mock()
+        mixin.set_lora_adapters = Mock()
+
+        mixin.restore_static_loras()
+
+        mixin.unload_loras.assert_not_called()
+        mixin.load_loras_sync.assert_not_called()
+        mixin.set_lora_adapters.assert_not_called()
+
+    def test_restore_static_loras_resets_weights_when_adapters_match(self):
+        """restore_static_loras only resets weights when adapters match static config."""
+        from oneiro.pipelines.lora import LoraLoaderMixin
+
+        class TestMixin(LoraLoaderMixin):
+            pass
+
+        mixin = TestMixin()
+        loras = [
+            LoraConfig(name="lora1", source=LoraSource.LOCAL, path="/path/1", weight=0.8),
+            LoraConfig(name="lora2", source=LoraSource.LOCAL, path="/path/2", weight=0.5),
+        ]
+        mixin.set_static_loras(loras)
+        mixin._loaded_adapters = ["lora1", "lora2"]
+
+        mixin.unload_loras = Mock()
+        mixin.load_loras_sync = Mock()
+        mixin.set_lora_adapters = Mock()
+
+        mixin.restore_static_loras()
+
+        mixin.unload_loras.assert_not_called()
+        mixin.load_loras_sync.assert_not_called()
+        mixin.set_lora_adapters.assert_called_once_with(["lora1", "lora2"], [0.8, 0.5])
+
+    def test_restore_static_loras_reloads_when_adapters_differ(self):
+        """restore_static_loras reloads when loaded adapters differ from static."""
+        from oneiro.pipelines.lora import LoraLoaderMixin
+
+        class TestMixin(LoraLoaderMixin):
+            pass
+
+        mixin = TestMixin()
+        static_loras = [
+            LoraConfig(name="static-lora", source=LoraSource.LOCAL, path="/path/1"),
+        ]
+        mixin.set_static_loras(static_loras)
+        # Simulate dynamic lora was added
+        mixin._loaded_adapters = ["static-lora", "dynamic-lora"]
+
+        mixin.unload_loras = Mock()
+        mixin.load_loras_sync = Mock()
+        mixin.set_lora_adapters = Mock()
+
+        mixin.restore_static_loras()
+
+        mixin.unload_loras.assert_called_once()
+        mixin.load_loras_sync.assert_called_once_with(static_loras)
+        mixin.set_lora_adapters.assert_not_called()
+
+    def test_restore_static_loras_unloads_only_when_no_static(self):
+        """restore_static_loras unloads all when no static but has loaded adapters."""
+        from oneiro.pipelines.lora import LoraLoaderMixin
+
+        class TestMixin(LoraLoaderMixin):
+            pass
+
+        mixin = TestMixin()
+        mixin._loaded_adapters = ["dynamic-lora"]
+
+        mixin.unload_loras = Mock()
+        mixin.load_loras_sync = Mock()
+        mixin.set_lora_adapters = Mock()
+
+        mixin.restore_static_loras()
+
+        mixin.unload_loras.assert_called_once()
+        mixin.load_loras_sync.assert_not_called()
+
+    def test_restore_static_loras_uses_adapter_name_when_set(self):
+        """restore_static_loras uses adapter_name if specified, otherwise name."""
+        from oneiro.pipelines.lora import LoraLoaderMixin
+
+        class TestMixin(LoraLoaderMixin):
+            pass
+
+        mixin = TestMixin()
+        loras = [
+            LoraConfig(
+                name="lora1",
+                source=LoraSource.LOCAL,
+                path="/path/1",
+                adapter_name="custom_adapter",
+                weight=0.7,
+            ),
+        ]
+        mixin.set_static_loras(loras)
+        mixin._loaded_adapters = ["custom_adapter"]
+
+        mixin.unload_loras = Mock()
+        mixin.load_loras_sync = Mock()
+        mixin.set_lora_adapters = Mock()
+
+        mixin.restore_static_loras()
+
+        mixin.set_lora_adapters.assert_called_once_with(["custom_adapter"], [0.7])
