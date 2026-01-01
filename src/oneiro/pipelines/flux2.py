@@ -64,6 +64,7 @@ class Flux2PipelineWrapper(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipeline):
         if loras:
             print(f"  Loading {len(loras)} LoRA(s)...")
             self.load_loras_sync(loras)
+            self.set_static_loras(loras)
 
         # Load embeddings if full_config provided
         if full_config:
@@ -131,3 +132,8 @@ class Flux2PipelineWrapper(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipeline):
                 "guidance_scale": guidance_scale,
                 "generator": generator,
             }
+
+    def post_generate(self, **kwargs: Any) -> None:
+        """Reset LoRA state after generation to prevent state leakage."""
+        super().post_generate(**kwargs)
+        self.restore_static_loras()

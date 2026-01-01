@@ -146,6 +146,7 @@ class QwenPipelineWrapper(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipeline):
         if loras:
             print(f"  Loading {len(loras)} LoRA(s)...")
             self.load_loras_sync(loras)
+            self.set_static_loras(loras)
 
         if full_config:
             embeddings = parse_embeddings_from_config(full_config, model_config)
@@ -247,3 +248,8 @@ class QwenPipelineWrapper(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipeline):
             steps=steps,
             guidance_scale=guidance_scale,
         )
+
+    def post_generate(self, **kwargs: Any) -> None:
+        """Reset LoRA state after generation to prevent state leakage."""
+        super().post_generate(**kwargs)
+        self.restore_static_loras()

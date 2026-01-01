@@ -39,6 +39,7 @@ class ZImagePipelineWrapper(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipeline)
         if loras:
             print(f"  Loading {len(loras)} LoRA(s)...")
             self.load_loras_sync(loras)
+            self.set_static_loras(loras)
 
         # Load embeddings if full_config provided
         if full_config:
@@ -107,3 +108,8 @@ class ZImagePipelineWrapper(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipeline)
             steps=steps,
             guidance_scale=0.0,  # Always 0.0 for Turbo
         )
+
+    def post_generate(self, **kwargs: Any) -> None:
+        """Reset LoRA state after generation to prevent state leakage."""
+        super().post_generate(**kwargs)
+        self.restore_static_loras()

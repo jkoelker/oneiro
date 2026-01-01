@@ -352,3 +352,164 @@ class TestQwenPipelineWrapperImg2Img:
 
             call_kwargs = mock_pipe.call_args[1]
             assert call_kwargs["strength"] == 0.5
+
+
+class TestQwenPipelineWrapperPostGenerate:
+    """Tests for QwenPipelineWrapper.post_generate() LoRA state reset."""
+
+    def test_post_generate_noop_when_no_adapters_loaded(self):
+        """post_generate does nothing when no LoRA adapters are loaded."""
+        mock_policy = DevicePolicy(device="cpu", dtype=torch.float32, offload=OffloadMode.NEVER)
+        with patch.object(DevicePolicy, "auto_detect", return_value=mock_policy):
+            pipeline = QwenPipelineWrapper()
+            pipeline.pipe = MagicMock()
+            # No adapters loaded
+            pipeline._loaded_adapters = []
+            pipeline._static_lora_configs = []
+
+            # Should not raise and not call any methods
+            pipeline.post_generate()
+
+            pipeline.pipe.unload_lora_weights.assert_not_called()
+            pipeline.pipe.set_adapters.assert_not_called()
+
+    def test_post_generate_preserves_static_loras_when_no_dynamic_added(self):
+        """post_generate preserves static LoRAs when no dynamic LoRAs were added."""
+        from oneiro.pipelines.lora import LoraConfig, LoraSource
+
+        mock_policy = DevicePolicy(device="cpu", dtype=torch.float32, offload=OffloadMode.NEVER)
+        with patch.object(DevicePolicy, "auto_detect", return_value=mock_policy):
+            pipeline = QwenPipelineWrapper()
+            pipeline.pipe = MagicMock()
+
+            # Setup static LoRA config
+            static_lora = LoraConfig(
+                name="static-lora",
+                source=LoraSource.LOCAL,
+                path="/path/to/lora.safetensors",
+                weight=0.8,
+            )
+            pipeline._static_lora_configs = [static_lora]
+            pipeline._loaded_adapters = ["static-lora"]
+            pipeline._lora_configs = [static_lora]
+
+            pipeline.post_generate()
+
+            # Should reset weights to static config, NOT unload
+            pipeline.pipe.unload_lora_weights.assert_not_called()
+            pipeline.pipe.set_adapters.assert_called_once()
+            call_args = pipeline.pipe.set_adapters.call_args
+            assert call_args[0][0] == ["static-lora"]
+            assert call_args[1]["adapter_weights"] == [0.8]
+
+    def test_post_generate_unloads_dynamic_loras_and_restores_static(self):
+        """post_generate unloads dynamic LoRAs and restores static LoRAs."""
+        from oneiro.pipelines.lora import LoraConfig, LoraSource
+
+        mock_policy = DevicePolicy(device="cpu", dtype=torch.float32, offload=OffloadMode.NEVER)
+        with patch.object(DevicePolicy, "auto_detect", return_value=mock_policy):
+            pipeline = QwenPipelineWrapper()
+            pipeline.pipe = MagicMock()
+
+            # Setup: 1 static LoRA configured
+            static_lora = LoraConfig(
+                name="static-lora",
+                source=LoraSource.LOCAL,
+                path="/path/to/static.safetensors",
+                weight=0.8,
+            )
+            static_lora._resolved_path = MagicMock()
+            pipeline._static_lora_configs = [static_lora]
+
+            # But 2 adapters currently loaded (1 static + 1 dynamic)
+            pipeline._loaded_adapters = ["static-lora", "dynamic-lora"]
+            pipeline._lora_configs = [static_lora, MagicMock()]
+
+            pipeline.post_generate()
+
+            # Should unload all and reload static
+            pipeline.pipe.unload_lora_weights.assert_called_once()
+            # After unload, load_loras_sync is called which calls load_lora_weights
+            pipeline.pipe.load_lora_weights.assert_called()
+
+    def test_post_generate_unloads_all_when_no_static_loras(self):
+        """post_generate unloads all when dynamic LoRAs exist but no static configured."""
+        mock_policy = DevicePolicy(device="cpu", dtype=torch.float32, offload=OffloadMode.NEVER)
+        with patch.object(DevicePolicy, "auto_detect", return_value=mock_policy):
+            pipeline = QwenPipelineWrapper()
+            pipeline.pipe = MagicMock()
+
+            # No static LoRAs configured
+            pipeline._static_lora_configs = []
+
+            # But dynamic LoRAs were loaded during generation
+            pipeline._loaded_adapters = ["dynamic-lora"]
+            pipeline._lora_configs = [MagicMock()]
+
+            pipeline.post_generate()
+
+            # Should unload all (more loaded than static = 0)
+            pipeline.pipe.unload_lora_weights.assert_called_once()
+
+    def test_post_generate_resets_weights_for_static_only(self):
+        """post_generate resets weights when only static LoRAs exist (weights may have changed)."""
+        from oneiro.pipelines.lora import LoraConfig, LoraSource
+
+        mock_policy = DevicePolicy(device="cpu", dtype=torch.float32, offload=OffloadMode.NEVER)
+        with patch.object(DevicePolicy, "auto_detect", return_value=mock_policy):
+            pipeline = QwenPipelineWrapper()
+            pipeline.pipe = MagicMock()
+
+            # Setup multiple static LoRAs with specific weights
+            static_lora1 = LoraConfig(
+                name="style-lora",
+                source=LoraSource.LOCAL,
+                path="/path/to/style.safetensors",
+                weight=0.5,
+            )
+            static_lora2 = LoraConfig(
+                name="detail-lora",
+                source=LoraSource.LOCAL,
+                path="/path/to/detail.safetensors",
+                weight=0.7,
+            )
+            pipeline._static_lora_configs = [static_lora1, static_lora2]
+            pipeline._loaded_adapters = ["style-lora", "detail-lora"]
+            pipeline._lora_configs = [static_lora1, static_lora2]
+
+            pipeline.post_generate()
+
+            # Should reset weights without unloading
+            pipeline.pipe.unload_lora_weights.assert_not_called()
+            pipeline.pipe.set_adapters.assert_called_once()
+            call_args = pipeline.pipe.set_adapters.call_args
+            assert call_args[0][0] == ["style-lora", "detail-lora"]
+            assert call_args[1]["adapter_weights"] == [0.5, 0.7]
+
+    def test_post_generate_uses_adapter_name_over_name(self):
+        """post_generate uses adapter_name when different from name."""
+        from oneiro.pipelines.lora import LoraConfig, LoraSource
+
+        mock_policy = DevicePolicy(device="cpu", dtype=torch.float32, offload=OffloadMode.NEVER)
+        with patch.object(DevicePolicy, "auto_detect", return_value=mock_policy):
+            pipeline = QwenPipelineWrapper()
+            pipeline.pipe = MagicMock()
+
+            # LoRA with different name and adapter_name
+            static_lora = LoraConfig(
+                name="my-lora",
+                source=LoraSource.LOCAL,
+                path="/path/to/lora.safetensors",
+                adapter_name="custom_adapter",
+                weight=0.9,
+            )
+            pipeline._static_lora_configs = [static_lora]
+            pipeline._loaded_adapters = ["custom_adapter"]
+            pipeline._lora_configs = [static_lora]
+
+            pipeline.post_generate()
+
+            # Should use adapter_name, not name
+            call_args = pipeline.pipe.set_adapters.call_args
+            assert call_args[0][0] == ["custom_adapter"]
+            assert call_args[1]["adapter_weights"] == [0.9]
