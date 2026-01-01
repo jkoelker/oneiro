@@ -402,6 +402,89 @@ def pad_chunks_to_same_count(
     return chunks_a, weights_a, chunks_b, weights_b
 
 
+def _prepare_clip_chunks(
+    tokenizer: Any,
+    prompt: str,
+    negative_prompt: str,
+    pad_last_block: bool = True,
+) -> tuple[list[list[int]], list[list[float]], list[list[int]], list[list[float]]]:
+    """Prepare aligned token chunks for prompt and negative prompt.
+
+    Performs the full tokenization pipeline:
+    1. Tokenize prompt and negative with weights
+    2. Pad to same length
+    3. Group into 77-token chunks
+    4. Align chunk counts between prompt and negative
+
+    Args:
+        tokenizer: CLIP tokenizer instance
+        prompt: Positive prompt with optional weight syntax
+        negative_prompt: Negative prompt with optional weight syntax
+        pad_last_block: Whether to pad the last chunk to 77 tokens
+
+    Returns:
+        Tuple of (prompt_chunks, prompt_weights, neg_chunks, neg_weights)
+        where each is a list of lists (one per chunk)
+    """
+    prompt_tokens, prompt_weights = get_tokens_and_weights(tokenizer, prompt)
+    neg_tokens, neg_weights = get_tokens_and_weights(tokenizer, negative_prompt)
+
+    prompt_tokens, prompt_weights, neg_tokens, neg_weights = pad_to_same_length(
+        prompt_tokens, prompt_weights, neg_tokens, neg_weights
+    )
+
+    prompt_chunks, prompt_chunk_weights = group_tokens_into_chunks(
+        prompt_tokens, prompt_weights, pad_last_block=pad_last_block
+    )
+    neg_chunks, neg_chunk_weights = group_tokens_into_chunks(
+        neg_tokens, neg_weights, pad_last_block=pad_last_block
+    )
+
+    return pad_chunks_to_same_count(
+        prompt_chunks, prompt_chunk_weights, neg_chunks, neg_chunk_weights
+    )
+
+
+def _encode_clip_chunk(
+    encoder: Any,
+    chunk: list[int],
+    weights: list[float],
+    device: torch.device | str,
+    dtype: torch.dtype,
+    use_penultimate: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Encode a single CLIP chunk and apply per-token weights.
+
+    Args:
+        encoder: CLIP text encoder
+        chunk: Token IDs for one 77-token chunk
+        weights: Per-token weights matching chunk length
+        device: Target device for tensors
+        dtype: Target dtype for weight tensor
+        use_penultimate: If True, extract hidden_states[-2] (for SDXL/SD3).
+                        If False, use direct output[0] (for SD15).
+
+    Returns:
+        Tuple of (weighted_embedding, pooled_output)
+        - weighted_embedding: Shape [seq_len, hidden_dim] with weights applied
+        - pooled_output: Pooled embedding if use_penultimate, else None
+    """
+    token_tensor = torch.tensor([chunk], dtype=torch.long, device=device)
+    weight_tensor = torch.tensor(weights, dtype=dtype, device=device)
+
+    with torch.no_grad():
+        if use_penultimate:
+            output = encoder(token_tensor, output_hidden_states=True)
+            embedding = output.hidden_states[-2].squeeze(0)
+            pooled = output[0]
+        else:
+            embedding = encoder(token_tensor)[0].squeeze(0)
+            pooled = None
+
+    _apply_weights_to_embedding(embedding, weight_tensor)
+    return embedding, pooled
+
+
 def get_weighted_text_embeddings_sd15(
     pipe: Any,
     prompt: str = "",
@@ -421,32 +504,10 @@ def get_weighted_text_embeddings_sd15(
     Returns:
         Tuple of (prompt_embeds, negative_prompt_embeds)
     """
-    # Get tokens and weights
-    prompt_tokens, prompt_weights = get_tokens_and_weights(pipe.tokenizer, prompt)
-    neg_tokens, neg_weights = get_tokens_and_weights(pipe.tokenizer, negative_prompt)
-
-    # Pad to same length
-    prompt_tokens, prompt_weights, neg_tokens, neg_weights = pad_to_same_length(
-        prompt_tokens, prompt_weights, neg_tokens, neg_weights
+    prompt_chunks, prompt_weights, neg_chunks, neg_weights = _prepare_clip_chunks(
+        pipe.tokenizer, prompt, negative_prompt, pad_last_block
     )
 
-    # Group into chunks
-    prompt_chunks, prompt_chunk_weights = group_tokens_into_chunks(
-        prompt_tokens, prompt_weights, pad_last_block=pad_last_block
-    )
-    neg_chunks, neg_chunk_weights = group_tokens_into_chunks(
-        neg_tokens, neg_weights, pad_last_block=pad_last_block
-    )
-
-    # Note: group_tokens_into_chunks guarantees at least one chunk,
-    # so no need to handle empty chunk lists here
-
-    # Ensure same number of chunks (in case of different BREAK marker counts)
-    prompt_chunks, prompt_chunk_weights, neg_chunks, neg_chunk_weights = pad_chunks_to_same_count(
-        prompt_chunks, prompt_chunk_weights, neg_chunks, neg_chunk_weights
-    )
-
-    # Encode each chunk and apply weights
     embeds = []
     neg_embeds = []
 
@@ -458,31 +519,26 @@ def get_weighted_text_embeddings_sd15(
     )
 
     for i in range(len(prompt_chunks)):
-        # Positive prompt
-        token_tensor = torch.tensor([prompt_chunks[i]], dtype=torch.long, device=device)
-        weight_tensor = torch.tensor(prompt_chunk_weights[i], dtype=dtype, device=device)
+        embedding, _ = _encode_clip_chunk(
+            pipe.text_encoder,
+            prompt_chunks[i],
+            prompt_weights[i],
+            device,
+            dtype,
+            use_penultimate=False,
+        )
+        embeds.append(embedding.unsqueeze(0))
 
-        with torch.no_grad():
-            token_embedding = pipe.text_encoder(token_tensor)[0].squeeze(0)
+        neg_embedding, _ = _encode_clip_chunk(
+            pipe.text_encoder,
+            neg_chunks[i],
+            neg_weights[i],
+            device,
+            dtype,
+            use_penultimate=False,
+        )
+        neg_embeds.append(neg_embedding.unsqueeze(0))
 
-        # Apply weights
-        _apply_weights_to_embedding(token_embedding, weight_tensor)
-
-        embeds.append(token_embedding.unsqueeze(0))
-
-        # Negative prompt
-        neg_token_tensor = torch.tensor([neg_chunks[i]], dtype=torch.long, device=device)
-        neg_weight_tensor = torch.tensor(neg_chunk_weights[i], dtype=dtype, device=device)
-
-        with torch.no_grad():
-            neg_token_embedding = pipe.text_encoder(neg_token_tensor)[0].squeeze(0)
-
-        # Apply weights
-        _apply_weights_to_embedding(neg_token_embedding, neg_weight_tensor)
-
-        neg_embeds.append(neg_token_embedding.unsqueeze(0))
-
-    # Concatenate all chunks
     prompt_embeds = torch.cat(embeds, dim=1)
     negative_prompt_embeds = torch.cat(neg_embeds, dim=1)
 
@@ -554,52 +610,12 @@ def get_weighted_text_embeddings_sdxl(
         Tuple of (prompt_embeds, negative_prompt_embeds,
                   pooled_prompt_embeds, negative_pooled_prompt_embeds)
     """
-    # Tokenizer 1 (CLIP-L)
-    prompt_tokens_1, prompt_weights_1 = get_tokens_and_weights(pipe.tokenizer, prompt)
-    neg_tokens_1, neg_weights_1 = get_tokens_and_weights(pipe.tokenizer, negative_prompt)
-
-    # Tokenizer 2 (CLIP-G)
-    prompt_tokens_2, prompt_weights_2 = get_tokens_and_weights(pipe.tokenizer_2, prompt)
-    neg_tokens_2, neg_weights_2 = get_tokens_and_weights(pipe.tokenizer_2, negative_prompt)
-
-    # Pad positive and negative to same length (per tokenizer)
-    prompt_tokens_1, prompt_weights_1, neg_tokens_1, neg_weights_1 = pad_to_same_length(
-        prompt_tokens_1, prompt_weights_1, neg_tokens_1, neg_weights_1
+    prompt_chunks_1, prompt_weights_1, neg_chunks_1, neg_weights_1 = _prepare_clip_chunks(
+        pipe.tokenizer, prompt, negative_prompt, pad_last_block
     )
-    prompt_tokens_2, prompt_weights_2, neg_tokens_2, neg_weights_2 = pad_to_same_length(
-        prompt_tokens_2, prompt_weights_2, neg_tokens_2, neg_weights_2
+    prompt_chunks_2, prompt_weights_2, neg_chunks_2, neg_weights_2 = _prepare_clip_chunks(
+        pipe.tokenizer_2, prompt, negative_prompt, pad_last_block
     )
-
-    # Group into chunks
-    prompt_chunks_1, prompt_chunk_weights_1 = group_tokens_into_chunks(
-        prompt_tokens_1, prompt_weights_1, pad_last_block=pad_last_block
-    )
-    neg_chunks_1, neg_chunk_weights_1 = group_tokens_into_chunks(
-        neg_tokens_1, neg_weights_1, pad_last_block=pad_last_block
-    )
-    prompt_chunks_2, prompt_chunk_weights_2 = group_tokens_into_chunks(
-        prompt_tokens_2, prompt_weights_2, pad_last_block=pad_last_block
-    )
-    neg_chunks_2, neg_chunk_weights_2 = group_tokens_into_chunks(
-        neg_tokens_2, neg_weights_2, pad_last_block=pad_last_block
-    )
-
-    # Note: group_tokens_into_chunks guarantees at least one chunk,
-    # so no need to handle empty chunk lists here
-
-    # Ensure same number of chunks for each encoder (in case of different BREAK marker counts)
-    prompt_chunks_1, prompt_chunk_weights_1, neg_chunks_1, neg_chunk_weights_1 = (
-        pad_chunks_to_same_count(
-            prompt_chunks_1, prompt_chunk_weights_1, neg_chunks_1, neg_chunk_weights_1
-        )
-    )
-    prompt_chunks_2, prompt_chunk_weights_2, neg_chunks_2, neg_chunk_weights_2 = (
-        pad_chunks_to_same_count(
-            prompt_chunks_2, prompt_chunk_weights_2, neg_chunks_2, neg_chunk_weights_2
-        )
-    )
-
-    # Encode and apply weights
     embeds = []
     neg_embeds = []
     pooled_prompt_embeds = None
@@ -609,59 +625,42 @@ def get_weighted_text_embeddings_sdxl(
     dtype = pipe.text_encoder.dtype
 
     for i in range(len(prompt_chunks_1)):
-        # Positive prompt - encoder 1
         token_tensor_1 = torch.tensor([prompt_chunks_1[i]], dtype=torch.long, device=device)
-        weight_tensor = torch.tensor(prompt_chunk_weights_1[i], dtype=dtype, device=device)
+        weight_tensor = torch.tensor(prompt_weights_1[i], dtype=dtype, device=device)
 
         prompt_embeds_1 = pipe.text_encoder(token_tensor_1, output_hidden_states=True)
-        # Use penultimate layer for SDXL
         prompt_embeds_1_hidden = prompt_embeds_1.hidden_states[-2]
 
-        # Positive prompt - encoder 2
         token_tensor_2 = torch.tensor([prompt_chunks_2[i]], dtype=torch.long, device=device)
-
         prompt_embeds_2 = pipe.text_encoder_2(token_tensor_2, output_hidden_states=True)
         prompt_embeds_2_hidden = prompt_embeds_2.hidden_states[-2]
 
-        # Pooled embeddings from encoder 2 (only from first chunk)
         if i == 0:
             pooled_prompt_embeds = prompt_embeds_2[0]
 
-        # Concatenate encoders along feature dimension
         token_embedding = torch.cat(
             [prompt_embeds_1_hidden, prompt_embeds_2_hidden], dim=-1
         ).squeeze(0)
-
-        # Apply weights
         _apply_weights_to_embedding(token_embedding, weight_tensor)
-
         embeds.append(token_embedding.unsqueeze(0))
 
-        # Negative prompt - encoder 1
         neg_token_tensor_1 = torch.tensor([neg_chunks_1[i]], dtype=torch.long, device=device)
-        neg_weight_tensor = torch.tensor(neg_chunk_weights_1[i], dtype=dtype, device=device)
+        neg_weight_tensor = torch.tensor(neg_weights_1[i], dtype=dtype, device=device)
 
         neg_prompt_embeds_1 = pipe.text_encoder(neg_token_tensor_1, output_hidden_states=True)
         neg_prompt_embeds_1_hidden = neg_prompt_embeds_1.hidden_states[-2]
 
-        # Negative prompt - encoder 2
         neg_token_tensor_2 = torch.tensor([neg_chunks_2[i]], dtype=torch.long, device=device)
-
         neg_prompt_embeds_2 = pipe.text_encoder_2(neg_token_tensor_2, output_hidden_states=True)
         neg_prompt_embeds_2_hidden = neg_prompt_embeds_2.hidden_states[-2]
 
-        # Pooled embeddings from encoder 2 (only from first chunk)
         if i == 0:
             negative_pooled_prompt_embeds = neg_prompt_embeds_2[0]
 
-        # Concatenate encoders along feature dimension
         neg_token_embedding = torch.cat(
             [neg_prompt_embeds_1_hidden, neg_prompt_embeds_2_hidden], dim=-1
         ).squeeze(0)
-
-        # Apply weights
         _apply_weights_to_embedding(neg_token_embedding, neg_weight_tensor)
-
         neg_embeds.append(neg_token_embedding.unsqueeze(0))
 
     # Concatenate all chunks along sequence dimension
@@ -769,54 +768,15 @@ def get_weighted_text_embeddings_sd3(
     """
     device = _get_execution_device(pipe)
 
-    # Tokenizer 1 (CLIP-L)
-    prompt_tokens_1, prompt_weights_1 = get_tokens_and_weights(pipe.tokenizer, prompt)
-    neg_tokens_1, neg_weights_1 = get_tokens_and_weights(pipe.tokenizer, negative_prompt)
+    prompt_chunks_1, prompt_weights_1, neg_chunks_1, neg_weights_1 = _prepare_clip_chunks(
+        pipe.tokenizer, prompt, negative_prompt, pad_last_block
+    )
+    prompt_chunks_2, prompt_weights_2, neg_chunks_2, neg_weights_2 = _prepare_clip_chunks(
+        pipe.tokenizer_2, prompt, negative_prompt, pad_last_block
+    )
 
-    # Tokenizer 2 (CLIP-G)
-    prompt_tokens_2, prompt_weights_2 = get_tokens_and_weights(pipe.tokenizer_2, prompt)
-    neg_tokens_2, neg_weights_2 = get_tokens_and_weights(pipe.tokenizer_2, negative_prompt)
-
-    # Tokenizer 3 (T5)
     prompt_tokens_3, prompt_weights_3 = get_t5_tokens_and_weights(pipe.tokenizer_3, prompt)
     neg_tokens_3, neg_weights_3 = get_t5_tokens_and_weights(pipe.tokenizer_3, negative_prompt)
-
-    # Pad CLIP tokens to same length
-    prompt_tokens_1, prompt_weights_1, neg_tokens_1, neg_weights_1 = pad_to_same_length(
-        prompt_tokens_1, prompt_weights_1, neg_tokens_1, neg_weights_1
-    )
-    prompt_tokens_2, prompt_weights_2, neg_tokens_2, neg_weights_2 = pad_to_same_length(
-        prompt_tokens_2, prompt_weights_2, neg_tokens_2, neg_weights_2
-    )
-
-    # Group CLIP tokens into chunks
-    prompt_chunks_1, prompt_chunk_weights_1 = group_tokens_into_chunks(
-        prompt_tokens_1, prompt_weights_1, pad_last_block=pad_last_block
-    )
-    neg_chunks_1, neg_chunk_weights_1 = group_tokens_into_chunks(
-        neg_tokens_1, neg_weights_1, pad_last_block=pad_last_block
-    )
-    prompt_chunks_2, prompt_chunk_weights_2 = group_tokens_into_chunks(
-        prompt_tokens_2, prompt_weights_2, pad_last_block=pad_last_block
-    )
-    neg_chunks_2, neg_chunk_weights_2 = group_tokens_into_chunks(
-        neg_tokens_2, neg_weights_2, pad_last_block=pad_last_block
-    )
-
-    # Note: group_tokens_into_chunks guarantees at least one chunk,
-    # so no need to handle empty chunk lists here
-
-    # Ensure same number of chunks for each encoder (in case of different BREAK marker counts)
-    prompt_chunks_1, prompt_chunk_weights_1, neg_chunks_1, neg_chunk_weights_1 = (
-        pad_chunks_to_same_count(
-            prompt_chunks_1, prompt_chunk_weights_1, neg_chunks_1, neg_chunk_weights_1
-        )
-    )
-    prompt_chunks_2, prompt_chunk_weights_2, neg_chunks_2, neg_chunk_weights_2 = (
-        pad_chunks_to_same_count(
-            prompt_chunks_2, prompt_chunk_weights_2, neg_chunks_2, neg_chunk_weights_2
-        )
-    )
 
     # Encode CLIP chunks
     embeds = []
@@ -837,7 +797,7 @@ def get_weighted_text_embeddings_sd3(
     for i in range(len(prompt_chunks_1)):
         # Positive - encoder 1
         token_tensor_1 = torch.tensor([prompt_chunks_1[i]], dtype=torch.long, device=device)
-        weight_tensor = torch.tensor(prompt_chunk_weights_1[i], dtype=dtype, device=device)
+        weight_tensor = torch.tensor(prompt_weights_1[i], dtype=dtype, device=device)
 
         prompt_embeds_1 = pipe.text_encoder(token_tensor_1, output_hidden_states=True)
         prompt_embeds_1_hidden = prompt_embeds_1.hidden_states[-2]
@@ -864,7 +824,7 @@ def get_weighted_text_embeddings_sd3(
 
         # Negative - encoder 1
         neg_token_tensor_1 = torch.tensor([neg_chunks_1[i]], dtype=torch.long, device=device)
-        neg_weight_tensor = torch.tensor(neg_chunk_weights_1[i], dtype=dtype, device=device)
+        neg_weight_tensor = torch.tensor(neg_weights_1[i], dtype=dtype, device=device)
 
         neg_prompt_embeds_1 = pipe.text_encoder(neg_token_tensor_1, output_hidden_states=True)
         neg_prompt_embeds_1_hidden = neg_prompt_embeds_1.hidden_states[-2]
