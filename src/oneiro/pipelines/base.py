@@ -180,18 +180,34 @@ class BasePipeline(ABC):
             guidance_scale=guidance_scale,
         )
 
-    def post_generate(self, **kwargs: Any) -> None:  # noqa: B027
+    def post_generate(self, **kwargs: Any) -> None:
         """Post-generation cleanup hook called after generation completes.
 
-        Override for LoRA restore or other cleanup. This is an optional hook
-        with a no-op default; it is intentionally not abstract so subclasses
-        can choose whether to implement it.
+        This base implementation resets stateful model caches using the diffusers
+        `maybe_free_model_hooks()` API. This prevents state leakage between
+        generations (e.g., KV cache, attention state, hook state).
+
+        Subclasses should call super().post_generate(**kwargs) first, then perform
+        any additional cleanup (e.g., LoRA restore).
 
         Note: The kwargs passed here have already had 'init_image' and 'strength'
         removed by generate(). If a subclass needs access to these values,
         it should save them in pre_generate() before they are consumed.
         """
-        pass
+        self._reset_model_state()
+
+    def _reset_model_state(self) -> None:
+        """Reset stateful model caches between generations.
+
+        Uses the diffusers `maybe_free_model_hooks()` API to reset:
+        - Stateful caches (KV cache, attention state)
+        - CPU offload hooks (if model offloading is enabled)
+
+        This is the canonical way to reset diffusers pipeline state.
+        """
+        if self.pipe is None:
+            return
+        self.pipe.maybe_free_model_hooks()
 
     def unload(self) -> None:
         """Free GPU memory."""
