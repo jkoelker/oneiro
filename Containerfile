@@ -1,5 +1,5 @@
 # Oneiro - Discord bot with embedded Diffusers image generation
-FROM docker.io/pytorch/pytorch:2.9.1-cuda12.8-cudnn9-runtime@sha256:7b324d212a4450795b49edba9949b7cdc72429148a64e974334bfe5774d51385
+FROM docker.io/pytorch/pytorch:2.10.0-cuda12.8-cudnn9-runtime@sha256:b85566342b86d13a67712e9315d40cdc2dad7f8d86df1aff3831f80835edbcca
 
 WORKDIR /app
 
