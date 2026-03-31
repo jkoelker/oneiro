@@ -6,7 +6,7 @@ pipeline class based on CivitAI's baseModel metadata.
 """
 
 from dataclasses import dataclass
-from enum import Enum
+from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -28,7 +28,7 @@ if TYPE_CHECKING:
     from oneiro.civitai import CivitaiClient, ModelVersion
 
 
-class CivitaiBaseModel(str, Enum):
+class CivitaiBaseModel(StrEnum):
     """Known CivitAI base model types mapped to diffusers pipelines."""
 
     # Stable Diffusion 1.x
