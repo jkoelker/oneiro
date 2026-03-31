@@ -14,13 +14,13 @@ RUN apt-get update \
 COPY pyproject.toml .
 RUN mkdir -p src/oneiro \
     && touch src/oneiro/__init__.py \
-    && pip install --no-cache-dir .
+    && pip install --no-cache-dir --break-system-packages .
 
 # Copy source and reinstall without deps (fast rebuild on source changes)
 COPY config.toml .
 COPY src/ src/
 
-RUN pip install --no-cache-dir --no-deps .
+RUN pip install --no-cache-dir --no-deps --break-system-packages .
 
 # Environment configuration
 ENV HF_HOME=/data/huggingface
