@@ -1,7 +1,11 @@
 # Oneiro - Discord bot with embedded Diffusers image generation
-FROM docker.io/pytorch/pytorch:2.9.1-cuda12.8-cudnn9-runtime@sha256:7b324d212a4450795b49edba9949b7cdc72429148a64e974334bfe5774d51385
+FROM ghcr.io/astral-sh/uv:0.11.2@sha256:c4f5de312ee66d46810635ffc5df34a1973ba753e7241ce3a08ef979ddd7bea5 AS uv
+FROM docker.io/pytorch/pytorch:2.11.0-cuda12.8-cudnn9-runtime@sha256:eee11b3b3872a8c838e35ef48f08b2d5def2080902c7f666831310ca1a0ef2be
 
 WORKDIR /app
+
+# Install uv from the official container image
+COPY --from=uv /uv /uvx /bin/
 
 # Install git for diffusers from source
 # hadolint ignore=DL3008
@@ -10,17 +14,22 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 
+# Create a virtual environment for isolation from the system Python
+RUN uv venv /opt/venv
+ENV VIRTUAL_ENV=/opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
 # Install dependencies first for caching (only rebuilds when pyproject.toml changes)
 COPY pyproject.toml .
 RUN mkdir -p src/oneiro \
     && touch src/oneiro/__init__.py \
-    && pip install --no-cache-dir .
+    && uv pip install --no-cache .
 
 # Copy source and reinstall without deps (fast rebuild on source changes)
 COPY config.toml .
 COPY src/ src/
 
-RUN pip install --no-cache-dir --no-deps .
+RUN uv pip install --no-cache --no-deps .
 
 # Environment configuration
 ENV HF_HOME=/data/huggingface
