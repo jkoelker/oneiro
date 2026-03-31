@@ -9,7 +9,7 @@ import shutil
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime
-from enum import Enum
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
@@ -42,7 +42,7 @@ class CivitaiNotFoundError(CivitaiError):
     pass
 
 
-class ModelType(str, Enum):
+class ModelType(StrEnum):
     """Civitai model types."""
 
     CHECKPOINT = "Checkpoint"
@@ -54,7 +54,7 @@ class ModelType(str, Enum):
     POSES = "Poses"
 
 
-class BaseModel(str, Enum):
+class BaseModel(StrEnum):
     """Supported base models for filtering."""
 
     SD_1_5 = "SD 1.5"

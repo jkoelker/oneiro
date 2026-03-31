@@ -1,12 +1,12 @@
 """Device management for pipeline placement."""
 
 from dataclasses import dataclass
-from enum import Enum
+from enum import StrEnum
 
 import torch
 
 
-class OffloadMode(str, Enum):
+class OffloadMode(StrEnum):
     """CPU offload behavior for CUDA pipelines."""
 
     AUTO = "auto"  # Offload if CUDA available (default)

@@ -1,7 +1,7 @@
 """Textual inversion / embedding configuration types and loading utilities."""
 
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
@@ -9,7 +9,7 @@ from oneiro.civitai import CivitaiClient, parse_civitai_url
 from oneiro.pipelines.lora import is_resource_compatible
 
 
-class EmbeddingSource(str, Enum):
+class EmbeddingSource(StrEnum):
     """Source type for textual inversion embeddings."""
 
     CIVITAI = "civitai"

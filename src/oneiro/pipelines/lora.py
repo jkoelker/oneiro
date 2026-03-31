@@ -1,14 +1,14 @@
 """LoRA configuration types and loading utilities."""
 
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
 from oneiro.civitai import CivitaiClient, parse_civitai_url
 
 
-class LoraSource(str, Enum):
+class LoraSource(StrEnum):
     """Source type for LoRA weights."""
 
     CIVITAI = "civitai"
