@@ -78,7 +78,7 @@ jobs:
         uses: astral-sh/ruff-action@0ce1b0bf8b818ef400413f810f8a11cdbda0034b  # v4.0.0
 
       - name: Run Agent
-        uses: dobbyphus/action@main
+        uses: dobbyphus/action@eda36284bf674d0f356ef4398f61ab922cc0427c # main
         with:
           bot_name: dobbyphus
           auth_json: ${{ secrets.COPILOT_AUTH_JSON }}
