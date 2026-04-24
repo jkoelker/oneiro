@@ -165,6 +165,20 @@ class TestGetPipelineConfigForBaseModel:
         config = get_pipeline_config_for_base_model("aura flow")
         assert config.pipeline_class == "AuraFlowPipeline"
 
+    def test_zimage_variants(self):
+        """Z-Image model variants use the ZImage pipeline."""
+        config = get_pipeline_config_for_base_model("Z-Image Turbo")
+        assert config.pipeline_class == "ZImagePipeline"
+        assert config.default_steps == 9
+        assert config.default_guidance_scale == 0.0
+        assert config.default_width == 1024
+        assert config.default_height == 1024
+        assert config.default_scheduler == "default"
+
+        for base_model in ["Z-Image", "ZImageTurbo", "z image turbo"]:
+            config = get_pipeline_config_for_base_model(base_model)
+            assert config.pipeline_class == "ZImagePipeline"
+
 
 class TestCivitaiBaseModelPipelineMap:
     """Tests for the CIVITAI_BASE_MODEL_PIPELINE_MAP constant."""
@@ -358,6 +372,177 @@ class TestCivitaiCheckpointPipelineLoad:
 
         mock_vae.enable_tiling.assert_called_once()
         mock_vae.enable_slicing.assert_called_once()
+
+    def test_load_zimage_single_file_injects_text_components(self, tmp_path):
+        """Z-Image single-file checkpoints receive preloaded Qwen3 text components."""
+        checkpoint = tmp_path / "model.safetensors"
+        checkpoint.write_bytes(b"dummy")
+
+        mock_pipeline_class = MagicMock()
+        mock_pipe = MagicMock()
+        mock_pipeline_class.from_single_file.return_value = mock_pipe
+        mock_text_encoder = MagicMock()
+        mock_tokenizer_instance = MagicMock()
+        mock_policy = DevicePolicy(device="cpu", dtype=torch.bfloat16, offload=OffloadMode.NEVER)
+
+        with (
+            patch.object(CivitaiCheckpointPipeline, "configure_scheduler"),
+            patch.object(DevicePolicy, "auto_detect", return_value=mock_policy),
+            patch(
+                "oneiro.pipelines.civitai_checkpoint.get_diffusers_pipeline_class",
+                return_value=mock_pipeline_class,
+            ),
+            patch("transformers.Qwen3Model", create=True) as mock_qwen3_model,
+            patch("transformers.AutoTokenizer") as mock_auto_tokenizer,
+        ):
+            mock_qwen3_model.from_pretrained.return_value = mock_text_encoder
+            mock_auto_tokenizer.from_pretrained.return_value = mock_tokenizer_instance
+
+            pipeline = CivitaiCheckpointPipeline()
+            pipeline.load(
+                {
+                    "checkpoint_path": str(checkpoint),
+                    "pipeline_class": "ZImagePipeline",
+                    "component_repo": "Tongyi-MAI/Z-Image-Turbo",
+                }
+            )
+
+        mock_qwen3_model.from_pretrained.assert_called_once_with(
+            "Tongyi-MAI/Z-Image-Turbo",
+            subfolder="text_encoder",
+            torch_dtype=torch.bfloat16,
+        )
+        mock_auto_tokenizer.from_pretrained.assert_called_once_with(
+            "Tongyi-MAI/Z-Image-Turbo",
+            subfolder="tokenizer",
+        )
+        mock_pipeline_class.from_single_file.assert_called_once()
+        call_kwargs = mock_pipeline_class.from_single_file.call_args.kwargs
+        assert call_kwargs["torch_dtype"] == torch.bfloat16
+        assert call_kwargs["text_encoder"] is mock_text_encoder
+        assert call_kwargs["tokenizer"] is mock_tokenizer_instance
+
+    def test_load_zimage_single_file_from_base_model_injects_text_components(self, tmp_path):
+        """Fetched Z-Image CivitAI checkpoints auto-detect and inject components."""
+        checkpoint = tmp_path / "model.safetensors"
+        checkpoint.write_bytes(b"dummy")
+
+        mock_pipeline_class = MagicMock()
+        mock_pipe = MagicMock()
+        mock_pipeline_class.from_single_file.return_value = mock_pipe
+        mock_text_encoder = MagicMock()
+        mock_tokenizer_instance = MagicMock()
+        mock_policy = DevicePolicy(device="cpu", dtype=torch.bfloat16, offload=OffloadMode.NEVER)
+
+        with (
+            patch.object(CivitaiCheckpointPipeline, "configure_scheduler"),
+            patch.object(DevicePolicy, "auto_detect", return_value=mock_policy),
+            patch(
+                "oneiro.pipelines.civitai_checkpoint.get_diffusers_pipeline_class",
+                return_value=mock_pipeline_class,
+            ) as mock_get_class,
+            patch("transformers.Qwen3Model", create=True) as mock_qwen3_model,
+            patch("transformers.AutoTokenizer") as mock_auto_tokenizer,
+        ):
+            mock_qwen3_model.from_pretrained.return_value = mock_text_encoder
+            mock_auto_tokenizer.from_pretrained.return_value = mock_tokenizer_instance
+
+            pipeline = CivitaiCheckpointPipeline()
+            pipeline.load(
+                {
+                    "checkpoint_path": str(checkpoint),
+                    "base_model": "Z-Image Turbo",
+                }
+            )
+
+        mock_get_class.assert_called_once_with("ZImagePipeline")
+        mock_qwen3_model.from_pretrained.assert_called_once_with(
+            "Tongyi-MAI/Z-Image-Turbo",
+            subfolder="text_encoder",
+            torch_dtype=torch.bfloat16,
+        )
+        mock_auto_tokenizer.from_pretrained.assert_called_once_with(
+            "Tongyi-MAI/Z-Image-Turbo",
+            subfolder="tokenizer",
+        )
+        call_kwargs = mock_pipeline_class.from_single_file.call_args.kwargs
+        assert call_kwargs["text_encoder"] is mock_text_encoder
+        assert call_kwargs["tokenizer"] is mock_tokenizer_instance
+
+    def test_load_non_zimage_single_file_does_not_load_text_components(self, tmp_path):
+        """Non-Z-Image checkpoints keep the original single-file loading behavior."""
+        checkpoint = tmp_path / "model.safetensors"
+        checkpoint.write_bytes(b"dummy")
+
+        mock_pipeline_class = MagicMock()
+        mock_pipeline_class.from_single_file.return_value = MagicMock()
+        mock_policy = DevicePolicy(device="cpu", dtype=torch.float32, offload=OffloadMode.NEVER)
+
+        with (
+            patch.object(CivitaiCheckpointPipeline, "configure_scheduler"),
+            patch.object(DevicePolicy, "auto_detect", return_value=mock_policy),
+            patch(
+                "oneiro.pipelines.civitai_checkpoint.get_diffusers_pipeline_class",
+                return_value=mock_pipeline_class,
+            ),
+            patch("transformers.Qwen3Model", create=True) as mock_qwen3_model,
+            patch("transformers.AutoTokenizer") as mock_auto_tokenizer,
+        ):
+            pipeline = CivitaiCheckpointPipeline()
+            pipeline.load(
+                {
+                    "checkpoint_path": str(checkpoint),
+                    "base_model": "SDXL 1.0",
+                }
+            )
+
+        mock_qwen3_model.from_pretrained.assert_not_called()
+        mock_auto_tokenizer.from_pretrained.assert_not_called()
+        mock_pipeline_class.from_single_file.assert_called_once_with(
+            str(checkpoint),
+            torch_dtype=torch.float32,
+        )
+
+    def test_load_zimage_single_file_allows_component_repo_overrides(self, tmp_path):
+        """Z-Image component locations can be overridden independently."""
+        checkpoint = tmp_path / "model.safetensors"
+        checkpoint.write_bytes(b"dummy")
+
+        mock_pipeline_class = MagicMock()
+        mock_pipeline_class.from_single_file.return_value = MagicMock()
+        mock_policy = DevicePolicy(device="cpu", dtype=torch.float32, offload=OffloadMode.NEVER)
+
+        with (
+            patch.object(CivitaiCheckpointPipeline, "configure_scheduler"),
+            patch.object(DevicePolicy, "auto_detect", return_value=mock_policy),
+            patch(
+                "oneiro.pipelines.civitai_checkpoint.get_diffusers_pipeline_class",
+                return_value=mock_pipeline_class,
+            ),
+            patch("transformers.Qwen3Model", create=True) as mock_qwen3_model,
+            patch("transformers.AutoTokenizer") as mock_auto_tokenizer,
+        ):
+            pipeline = CivitaiCheckpointPipeline()
+            pipeline.load(
+                {
+                    "checkpoint_path": str(checkpoint),
+                    "pipeline_class": "ZImagePipeline",
+                    "text_encoder_repo": "custom/text",
+                    "text_encoder_subfolder": "encoder",
+                    "tokenizer_repo": "custom/tokenizer",
+                    "tokenizer_subfolder": "tok",
+                }
+            )
+
+        mock_qwen3_model.from_pretrained.assert_called_once_with(
+            "custom/text",
+            subfolder="encoder",
+            torch_dtype=torch.float32,
+        )
+        mock_auto_tokenizer.from_pretrained.assert_called_once_with(
+            "custom/tokenizer",
+            subfolder="tok",
+        )
 
 
 class TestCivitaiCheckpointPipelineLoadAsync:

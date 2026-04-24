@@ -141,6 +141,7 @@ verify_hashes = true
 # - SDXL 1.0, SDXL Turbo, SDXL Lightning, Pony, Illustrious (1024x1024)
 # - Flux.1 Dev, Flux.1 Schnell (1024x1024, no negative prompt)
 # - SD 3, SD 3.5 Medium/Large (1024x1024)
+# - Z-Image/Z-Image Turbo (1024x1024, 9 steps, guidance 0.0)
 # - PixArt Alpha/Sigma, Kolors, Hunyuan DiT, AuraFlow
 #
 # SCHEDULER OPTIONS:
@@ -202,3 +203,15 @@ verify_hashes = true
 # type = "civitai"
 # civitai_model_id = 12345
 # scheduler = "euler_a"           # Override default scheduler
+#
+# Example 7: Z-Image CivitAI checkpoint with component overrides
+# [models.zimage-civitai]
+# type = "civitai"
+# civitai_model_id = 153568
+# base_model = "Z-Image Turbo"    # Auto-detected for fetched models when CivitAI provides it
+# component_repo = "Tongyi-MAI/Z-Image-Turbo"
+# # Advanced: override text components independently if a checkpoint requires them
+# # text_encoder_repo = "Tongyi-MAI/Z-Image-Turbo"
+# # text_encoder_subfolder = "text_encoder"
+# # tokenizer_repo = "Tongyi-MAI/Z-Image-Turbo"
+# # tokenizer_subfolder = "tokenizer"

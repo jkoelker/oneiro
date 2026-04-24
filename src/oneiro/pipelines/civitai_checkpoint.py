@@ -77,6 +77,8 @@ class CivitaiBaseModel(StrEnum):
     SD_3_5_LARGE_TURBO = "SD 3.5 Large Turbo"
 
     # Other architectures
+    Z_IMAGE = "Z-Image"
+    Z_IMAGE_TURBO = "Z-Image Turbo"
     PIXART_A = "PixArt a"
     PIXART_SIGMA = "PixArt Sigma"
     KOLORS = "Kolors"
@@ -357,6 +359,22 @@ CIVITAI_BASE_MODEL_PIPELINE_MAP: dict[str, PipelineConfig] = {
         default_height=1024,
         default_scheduler="default",
     ),
+    "Z-Image": PipelineConfig(
+        pipeline_class="ZImagePipeline",
+        default_steps=9,
+        default_guidance_scale=0.0,
+        default_width=1024,
+        default_height=1024,
+        default_scheduler="default",
+    ),
+    "Z-Image Turbo": PipelineConfig(
+        pipeline_class="ZImagePipeline",
+        default_steps=9,
+        default_guidance_scale=0.0,
+        default_width=1024,
+        default_height=1024,
+        default_scheduler="default",
+    ),
 }
 
 SCHEDULER_MAP: dict[str, tuple[str | None, dict[str, Any]]] = {
@@ -376,6 +394,7 @@ SCHEDULER_MAP: dict[str, tuple[str | None, dict[str, Any]]] = {
 }
 
 SCHEDULER_CHOICES: list[str] = list(SCHEDULER_MAP.keys())
+DEFAULT_ZIMAGE_COMPONENT_REPO = "Tongyi-MAI/Z-Image-Turbo"
 
 # Default fallback configuration
 DEFAULT_PIPELINE_CONFIG = PipelineConfig(
@@ -470,6 +489,9 @@ def get_pipeline_config_for_base_model(base_model: str | None) -> PipelineConfig
 
     if "auraflow" in base_lower or "aura" in base_lower:
         return CIVITAI_BASE_MODEL_PIPELINE_MAP["AuraFlow"]
+
+    if "z-image" in base_lower or "zimage" in base_lower or "z image" in base_lower:
+        return CIVITAI_BASE_MODEL_PIPELINE_MAP["Z-Image Turbo"]
 
     # Default to SDXL as it's most common on CivitAI
     return DEFAULT_PIPELINE_CONFIG
@@ -626,11 +648,10 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
         # Get the pipeline class
         pipeline_class = get_diffusers_pipeline_class(self._pipeline_config.pipeline_class)
 
-        # Load from single file
-        self.pipe = pipeline_class.from_single_file(
-            str(checkpoint_path),
-            torch_dtype=self.policy.dtype,
-        )
+        # Load from single file. Some architectures publish single-file checkpoints
+        # without every pipeline component; preload those components when needed.
+        single_file_kwargs = self._build_single_file_kwargs(model_config)
+        self.pipe = pipeline_class.from_single_file(str(checkpoint_path), **single_file_kwargs)
 
         scheduler_override = model_config.get("scheduler")
         self.configure_scheduler(scheduler_override)
@@ -664,6 +685,62 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
                 self.load_embeddings_sync(embeddings)
 
         print(f"Checkpoint loaded: {checkpoint_path.name}")
+
+    def _build_single_file_kwargs(self, model_config: dict[str, Any]) -> dict[str, Any]:
+        """Build keyword arguments for diffusers ``from_single_file`` loading.
+
+        Z-Image checkpoints commonly store the transformer weights in the single
+        file while the Qwen3 text encoder lives in the base Hugging Face repo.
+        Diffusers requires callers to preload and inject that component instead
+        of expecting it to be reconstructed from the checkpoint.
+
+        Args:
+            model_config: Model configuration from TOML/state.
+
+        Returns:
+            Keyword arguments to pass to ``pipeline_class.from_single_file``.
+        """
+        kwargs: dict[str, Any] = {"torch_dtype": self.policy.dtype}
+
+        if (
+            self._pipeline_config is None
+            or self._pipeline_config.pipeline_class != "ZImagePipeline"
+        ):
+            return kwargs
+
+        kwargs.update(self._load_zimage_text_components(model_config))
+        return kwargs
+
+    def _load_zimage_text_components(self, model_config: dict[str, Any]) -> dict[str, Any]:
+        """Load Z-Image text components that are not stored in single-file checkpoints."""
+        from transformers import AutoTokenizer, Qwen3Model
+
+        component_repo = model_config.get("component_repo") or model_config.get("repo")
+        text_encoder_repo = model_config.get("text_encoder_repo") or component_repo
+        tokenizer_repo = model_config.get("tokenizer_repo") or component_repo
+
+        if text_encoder_repo is None:
+            text_encoder_repo = DEFAULT_ZIMAGE_COMPONENT_REPO
+        if tokenizer_repo is None:
+            tokenizer_repo = text_encoder_repo
+
+        text_encoder_subfolder = model_config.get("text_encoder_subfolder", "text_encoder")
+        tokenizer_subfolder = model_config.get("tokenizer_subfolder", "tokenizer")
+
+        print(f"  Loading Z-Image text encoder from {text_encoder_repo}/{text_encoder_subfolder}")
+        text_encoder = Qwen3Model.from_pretrained(
+            text_encoder_repo,
+            subfolder=text_encoder_subfolder,
+            torch_dtype=self.policy.dtype,
+        )
+
+        print(f"  Loading Z-Image tokenizer from {tokenizer_repo}/{tokenizer_subfolder}")
+        tokenizer = AutoTokenizer.from_pretrained(
+            tokenizer_repo,
+            subfolder=tokenizer_subfolder,
+        )
+
+        return {"text_encoder": text_encoder, "tokenizer": tokenizer}
 
     def configure_scheduler(self, scheduler_name: str | None) -> None:
         if self.pipe is None or self._pipeline_config is None:
