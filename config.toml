@@ -242,9 +242,9 @@ verify_hashes = true
 # # component_repo = "Qwen/Qwen-Image"
 # # single_file_config_repo = "Qwen/Qwen-Image"
 # # transformer_subfolder = "transformer"
-# # Qwen transformer-only checkpoints can be very large; defaults preserve FP8 checkpoint
-# # dtype when detected and use sequential CPU offload on CUDA for lower peak VRAM.
-# # qwen_transformer_dtype = "float8_e5m2"  # Optional explicit override
+# # Qwen transformer-only checkpoints can be very large; defaults use sequential CPU
+# # offload on CUDA while keeping transformer math in the device policy dtype.
+# # qwen_transformer_dtype = "bfloat16"     # Optional explicit override
 # # sequential_cpu_offload = true           # Set false to use model CPU offload instead
 #
 # Example 10: FLUX.2 Klein CivitAI checkpoint (transformer-only single file)
