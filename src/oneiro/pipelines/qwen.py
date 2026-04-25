@@ -96,14 +96,25 @@ class QwenPipelineWrapper(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipeline):
             lora: LoRA repository
             lora_weights: LoRA weights filename
             cpu_offload: Enable CPU offload (default: True)
+            offload_type: Offload implementation: group, model, or sequential
         """
         from diffusers import DiffusionPipeline, FlowMatchEulerDiscreteScheduler
 
         repo = model_config.get("repo", "Qwen/Qwen-Image")
         transformer_path = model_config.get("transformer")
         cpu_offload = model_config.get("cpu_offload", True)
+        offload_type = model_config.get("offload_type", "group")
+        group_offload_type = model_config.get("group_offload_type", "leaf_level")
+        group_offload_use_stream = model_config.get("group_offload_use_stream", True)
+        group_offload_num_blocks_per_group = model_config.get("group_offload_num_blocks_per_group")
 
-        self.policy = DevicePolicy.auto_detect(cpu_offload=cpu_offload)
+        self.policy = DevicePolicy.auto_detect(
+            cpu_offload=cpu_offload,
+            offload_type=offload_type,
+            group_offload_type=group_offload_type,
+            group_offload_use_stream=group_offload_use_stream,
+            group_offload_num_blocks_per_group=group_offload_num_blocks_per_group,
+        )
 
         print(f"Loading Qwen-Image from {repo}")
 
@@ -140,8 +151,6 @@ class QwenPipelineWrapper(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipeline):
 
         self.pipe = DiffusionPipeline.from_pretrained(repo, **pipeline_kwargs)
 
-        self.policy.apply_to_pipeline(self.pipe)
-
         loras = parse_loras_from_model_config(model_config)
         if loras:
             print(f"  Loading {len(loras)} LoRA(s)...")
@@ -153,6 +162,8 @@ class QwenPipelineWrapper(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipeline):
             if embeddings:
                 print(f"  Loading {len(embeddings)} embedding(s)...")
                 self.load_embeddings_sync(embeddings)
+
+        self.policy.apply_to_pipeline(self.pipe)
 
         print(f"Qwen-Image loaded from {repo}")
 

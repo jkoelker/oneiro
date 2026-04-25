@@ -29,13 +29,14 @@ class Flux1PipelineWrapper(BasePipeline):
     - FLUX.1-schnell: Fast 4-step generation (steps=4, guidance_scale=0.0)
     """
 
-    def load(self, model_config: dict[str, Any]) -> None:
+    def load(self, model_config: dict[str, Any], full_config: dict[str, Any] | None = None) -> None:
         """Load FLUX.1 model with optional CPU offloading and LoRA support.
 
         Args:
             model_config: Configuration dict with keys:
                 - repo: HuggingFace repo ID (default: "black-forest-labs/FLUX.1-dev")
                 - cpu_offload: Enable CPU offloading (default: True)
+                - offload_type: Offload implementation: group, model, or sequential
                 - cpu_utilization: Fraction of CPU cores to use (default: 0.75)
                 - lora: LoRA repository ID (optional)
                 - lora_weights: LoRA weights filename (optional, required if lora is set)
@@ -44,6 +45,10 @@ class Flux1PipelineWrapper(BasePipeline):
 
         repo = model_config.get("repo", "black-forest-labs/FLUX.1-dev")
         cpu_offload = model_config.get("cpu_offload", True)
+        offload_type = model_config.get("offload_type", "group")
+        group_offload_type = model_config.get("group_offload_type", "leaf_level")
+        group_offload_use_stream = model_config.get("group_offload_use_stream", True)
+        group_offload_num_blocks_per_group = model_config.get("group_offload_num_blocks_per_group")
         cpu_utilization = model_config.get("cpu_utilization", 0.75)
 
         print(f"Loading FLUX.1 from {repo}")
@@ -51,15 +56,19 @@ class Flux1PipelineWrapper(BasePipeline):
         # Configure CPU threading for text encoder
         self._configure_cpu_threads(cpu_utilization)
 
-        self.policy = DevicePolicy.auto_detect(cpu_offload=cpu_offload)
+        self.policy = DevicePolicy.auto_detect(
+            cpu_offload=cpu_offload,
+            offload_type=offload_type,
+            group_offload_type=group_offload_type,
+            group_offload_use_stream=group_offload_use_stream,
+            group_offload_num_blocks_per_group=group_offload_num_blocks_per_group,
+        )
 
         print("  Creating pipeline...")
         self.pipe = FluxPipeline.from_pretrained(
             repo,
             torch_dtype=self.policy.dtype,
         )
-
-        self.policy.apply_to_pipeline(self.pipe)
 
         # Memory optimization for large T5 encoder and high-res VAE decoding
         self.pipe.vae.enable_tiling()
@@ -72,6 +81,8 @@ class Flux1PipelineWrapper(BasePipeline):
         if lora_repo and lora_weights:
             print(f"Loading LoRA from {lora_repo}")
             self.pipe.load_lora_weights(lora_repo, weight_name=lora_weights)
+
+        self.policy.apply_to_pipeline(self.pipe)
 
         print(f"FLUX.1 loaded from {repo}")
 

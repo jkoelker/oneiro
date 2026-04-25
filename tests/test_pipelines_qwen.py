@@ -105,8 +105,8 @@ class TestQwenPipelineWrapperLoad:
 
     @patch("diffusers.FlowMatchEulerDiscreteScheduler")
     @patch("diffusers.DiffusionPipeline")
-    def test_load_enables_cpu_offload_on_cuda(self, mock_diffusion_pipeline, mock_scheduler):
-        """Load enables CPU offload on CUDA by default."""
+    def test_load_enables_group_offload_on_cuda(self, mock_diffusion_pipeline, mock_scheduler):
+        """Load enables group offload on CUDA by default."""
         mock_pipe = MagicMock()
         mock_diffusion_pipeline.from_pretrained.return_value = mock_pipe
         mock_scheduler.from_config.return_value = MagicMock()
@@ -117,7 +117,7 @@ class TestQwenPipelineWrapperLoad:
             pipeline = QwenPipelineWrapper()
             pipeline.load({})
 
-        mock_pipe.enable_model_cpu_offload.assert_called_once()
+        mock_pipe.enable_group_offload.assert_called_once()
 
     @patch("diffusers.FlowMatchEulerDiscreteScheduler")
     @patch("diffusers.DiffusionPipeline")
@@ -132,6 +132,7 @@ class TestQwenPipelineWrapperLoad:
         pipeline = QwenPipelineWrapper()
         pipeline.load({"cpu_offload": False})
 
+        mock_pipe.enable_group_offload.assert_not_called()
         mock_pipe.enable_model_cpu_offload.assert_not_called()
 
 

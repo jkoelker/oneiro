@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from oneiro.device import DevicePolicy, OffloadMode
+from oneiro.device import DevicePolicy, OffloadMode, OffloadType
 
 
 class TestOffloadMode:
@@ -18,6 +18,20 @@ class TestOffloadMode:
         """OffloadMode should be usable as a string."""
         assert isinstance(OffloadMode.AUTO, str)
         assert OffloadMode.AUTO == "auto"
+
+
+class TestOffloadType:
+    """Tests for OffloadType enum."""
+
+    def test_string_values(self):
+        assert OffloadType.MODEL.value == "model"
+        assert OffloadType.GROUP.value == "group"
+        assert OffloadType.SEQUENTIAL.value == "sequential"
+
+    def test_is_str_subclass(self):
+        """OffloadType should be usable as a string."""
+        assert isinstance(OffloadType.GROUP, str)
+        assert OffloadType.GROUP == "group"
 
 
 class TestDevicePolicyAutoDetect:
@@ -35,6 +49,16 @@ class TestDevicePolicyAutoDetect:
     def test_cpu_offload_false_sets_never(self):
         policy = DevicePolicy.auto_detect(cpu_offload=False)
         assert policy.offload == OffloadMode.NEVER
+
+    def test_auto_detect_defaults_to_group_offload(self):
+        policy = DevicePolicy.auto_detect()
+        assert policy.offload_type == OffloadType.GROUP
+        assert policy.group_offload_type == "leaf_level"
+        assert policy.group_offload_use_stream is True
+
+    def test_auto_detect_accepts_model_offload_type(self):
+        policy = DevicePolicy.auto_detect(offload_type="model")
+        assert policy.offload_type == OffloadType.MODEL
 
     def test_dtype_is_valid_torch_dtype(self):
         policy = DevicePolicy.auto_detect()
@@ -64,6 +88,11 @@ class TestDevicePolicyFrozen:
         policy = DevicePolicy.auto_detect()
         with pytest.raises(AttributeError):
             policy.offload = OffloadMode.NEVER
+
+    def test_cannot_modify_offload_type(self):
+        policy = DevicePolicy.auto_detect()
+        with pytest.raises(AttributeError):
+            policy.offload_type = OffloadType.MODEL
 
 
 class TestDevicePolicyApply:
@@ -101,12 +130,40 @@ class TestDevicePolicyApply:
         policy.apply_to_pipeline(pipe)
         assert pipe.moved_to == "cuda"
 
-    def test_auto_offload_on_cuda_enables_offload(self):
+    def test_auto_group_offload_on_cuda_enables_group_offload(self):
         policy = DevicePolicy(device="cuda", dtype=torch.float16, offload=OffloadMode.AUTO)
 
         class MockPipeline:
             def __init__(self):
+                self.group_offload_kwargs = None
+                self._oneiro_offload_type: str | None = None
+
+            def enable_group_offload(self, **kwargs):
+                self.group_offload_kwargs = kwargs
+
+        pipe = MockPipeline()
+        policy.apply_to_pipeline(pipe)
+        assert pipe.group_offload_kwargs == {
+            "onload_device": torch.device("cuda"),
+            "offload_device": torch.device("cpu"),
+            "offload_type": "leaf_level",
+            "num_blocks_per_group": None,
+            "use_stream": True,
+        }
+        assert pipe._oneiro_offload_type == "group"
+
+    def test_model_offload_on_cuda_enables_model_offload(self):
+        policy = DevicePolicy(
+            device="cuda",
+            dtype=torch.float16,
+            offload=OffloadMode.AUTO,
+            offload_type=OffloadType.MODEL,
+        )
+
+        class MockPipeline:
+            def __init__(self):
                 self.offload_enabled = False
+                self._oneiro_offload_type: str | None = None
 
             def enable_model_cpu_offload(self):
                 self.offload_enabled = True
@@ -114,6 +171,70 @@ class TestDevicePolicyApply:
         pipe = MockPipeline()
         policy.apply_to_pipeline(pipe)
         assert pipe.offload_enabled is True
+        assert pipe._oneiro_offload_type == "model"
+
+    def test_sequential_offload_on_cuda_enables_sequential_offload(self):
+        policy = DevicePolicy(
+            device="cuda",
+            dtype=torch.float16,
+            offload=OffloadMode.AUTO,
+            offload_type=OffloadType.SEQUENTIAL,
+        )
+
+        class MockPipeline:
+            def __init__(self):
+                self.offload_enabled = False
+                self._oneiro_offload_type: str | None = None
+
+            def enable_sequential_cpu_offload(self):
+                self.offload_enabled = True
+
+        pipe = MockPipeline()
+        policy.apply_to_pipeline(pipe)
+        assert pipe.offload_enabled is True
+        assert pipe._oneiro_offload_type == "sequential"
+
+    def test_block_level_stream_defaults_to_one_block_per_group(self):
+        policy = DevicePolicy(
+            device="cuda",
+            dtype=torch.float16,
+            offload=OffloadMode.AUTO,
+            group_offload_type="block_level",
+        )
+
+        class MockPipeline:
+            def __init__(self):
+                self.group_offload_kwargs = None
+
+            def enable_group_offload(self, **kwargs):
+                self.group_offload_kwargs = kwargs
+
+        pipe = MockPipeline()
+        policy.apply_to_pipeline(pipe)
+        assert pipe.group_offload_kwargs is not None
+        assert pipe.group_offload_kwargs["num_blocks_per_group"] == 1
+
+    def test_block_level_without_stream_defaults_to_one_block_per_group(self):
+        policy = DevicePolicy(
+            device="cuda",
+            dtype=torch.float16,
+            offload=OffloadMode.AUTO,
+            group_offload_type="block_level",
+            group_offload_use_stream=False,
+        )
+
+        class MockPipeline:
+            def __init__(self):
+                self.group_offload_kwargs = None
+
+            def enable_group_offload(self, **kwargs):
+                self.group_offload_kwargs = kwargs
+
+        pipe = MockPipeline()
+        policy.apply_to_pipeline(pipe)
+        assert pipe.group_offload_kwargs is not None
+        assert pipe.group_offload_kwargs["num_blocks_per_group"] == 1
+        assert pipe.group_offload_kwargs["use_stream"] is False
 
     def test_auto_offload_on_cpu_no_action(self):
         policy = DevicePolicy(device="cpu", dtype=torch.float32, offload=OffloadMode.AUTO)

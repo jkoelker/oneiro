@@ -10,6 +10,9 @@ max_per_user = 20
 [models.zimage-turbo]
 type = "zimage"
 repo = "Tongyi-MAI/Z-Image-Turbo"
+cpu_offload = true
+offload_type = "group"          # "group" | "model" | "sequential"
+group_offload_type = "leaf_level"  # "leaf_level" minimizes VRAM; "block_level" lowers overhead
 steps = 9
 guidance_scale = 0.0
 
@@ -18,6 +21,8 @@ type = "flux2"
 repo = "diffusers/FLUX.2-dev-bnb-4bit"
 quantized = true
 cpu_offload = true
+offload_type = "group"          # "group" | "model" | "sequential"
+group_offload_type = "leaf_level"
 steps = 28
 guidance_scale = 4.0
 
@@ -28,6 +33,8 @@ transformer = "unsloth/Qwen-Image-GGUF:qwen-image-Q4_K_S.gguf"
 lora = "lightx2v/Qwen-Image-Lightning"
 lora_weights = "Qwen-Image-Lightning-8steps-V1.0.safetensors"
 cpu_offload = true
+offload_type = "group"          # Dedicated CivitAI Qwen checkpoints can still use sequential_cpu_offload
+group_offload_type = "leaf_level"
 steps = 8
 true_cfg_scale = 1.3
 requires_negative = true
@@ -242,10 +249,12 @@ verify_hashes = true
 # # component_repo = "Qwen/Qwen-Image"
 # # single_file_config_repo = "Qwen/Qwen-Image"
 # # transformer_subfolder = "transformer"
-# # Qwen transformer-only checkpoints can be very large; defaults use sequential CPU
-# # offload on CUDA while keeping transformer math in the device policy dtype.
+# # Qwen transformer-only checkpoints can be very large; by default they still use
+# # sequential CPU offload on CUDA unless offload_type is set explicitly.
 # # qwen_transformer_dtype = "bfloat16"     # Optional explicit override
-# # sequential_cpu_offload = true           # Set false to use model CPU offload instead
+# # sequential_cpu_offload = true           # Legacy toggle for the default Qwen behavior
+# # offload_type = "group"                  # Explicitly use group offload instead
+# # group_offload_type = "leaf_level"       # "leaf_level" | "block_level"
 #
 # Example 10: FLUX.2 Klein CivitAI checkpoint (transformer-only single file)
 # [models.flux2-klein-civitai]

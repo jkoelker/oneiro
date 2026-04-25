@@ -14,6 +14,14 @@ class OffloadMode(StrEnum):
     NEVER = "never"  # Never offload, use .to(device)
 
 
+class OffloadType(StrEnum):
+    """Diffusers offload implementation to use when CPU offload is enabled."""
+
+    MODEL = "model"
+    GROUP = "group"
+    SEQUENTIAL = "sequential"
+
+
 @dataclass(frozen=True)
 class DevicePolicy:
     """Immutable device configuration for pipeline placement.
@@ -22,18 +30,37 @@ class DevicePolicy:
         device: Target device ("cuda", "mps", "cpu")
         dtype: Torch dtype for model weights
         offload: CPU offload behavior for large models
+        offload_type: Diffusers offload implementation to use when offloading
+        group_offload_type: Diffusers group-offload granularity
+        group_offload_use_stream: Overlap CPU/GPU transfers with CUDA streams
+        group_offload_num_blocks_per_group: Blocks per offload group for block-level mode
     """
 
     device: str
     dtype: torch.dtype
     offload: OffloadMode = OffloadMode.AUTO
+    offload_type: OffloadType = OffloadType.GROUP
+    group_offload_type: str = "leaf_level"
+    group_offload_use_stream: bool = True
+    group_offload_num_blocks_per_group: int | None = None
 
     @classmethod
-    def auto_detect(cls, cpu_offload: bool = True) -> "DevicePolicy":
+    def auto_detect(
+        cls,
+        cpu_offload: bool = True,
+        offload_type: str | OffloadType = OffloadType.GROUP,
+        group_offload_type: str = "leaf_level",
+        group_offload_use_stream: bool = True,
+        group_offload_num_blocks_per_group: int | None = None,
+    ) -> "DevicePolicy":
         """Create policy with auto-detected device and dtype.
 
         Args:
             cpu_offload: Enable CPU offloading when available (default: True)
+            offload_type: Offload implementation: "group", "model", or "sequential"
+            group_offload_type: Diffusers group-offload granularity
+            group_offload_use_stream: Overlap CPU/GPU transfers with CUDA streams
+            group_offload_num_blocks_per_group: Blocks per offload group for block-level mode
 
         Returns:
             DevicePolicy configured for the best available device
@@ -53,7 +80,15 @@ class DevicePolicy:
             dtype = torch.float32
 
         offload = OffloadMode.AUTO if cpu_offload else OffloadMode.NEVER
-        return cls(device=device, dtype=dtype, offload=offload)
+        return cls(
+            device=device,
+            dtype=dtype,
+            offload=offload,
+            offload_type=OffloadType(offload_type),
+            group_offload_type=group_offload_type,
+            group_offload_use_stream=group_offload_use_stream,
+            group_offload_num_blocks_per_group=group_offload_num_blocks_per_group,
+        )
 
     def apply_to_pipeline(self, pipe) -> None:
         """Apply device policy to a diffusers pipeline.
@@ -74,7 +109,27 @@ class DevicePolicy:
                     f"CPU offload requires CUDA device, got '{self.device}'. "
                     f"Set cpu_offload=false in config or use a CUDA-enabled system."
                 )
-            pipe.enable_model_cpu_offload()
+            if self.offload_type == OffloadType.MODEL:
+                pipe.enable_model_cpu_offload()
+                pipe._oneiro_offload_type = OffloadType.MODEL.value
+            elif self.offload_type == OffloadType.SEQUENTIAL:
+                pipe.enable_sequential_cpu_offload()
+                pipe._oneiro_offload_type = OffloadType.SEQUENTIAL.value
+            else:
+                group_offload_num_blocks_per_group = self.group_offload_num_blocks_per_group
+                if (
+                    self.group_offload_type == "block_level"
+                    and group_offload_num_blocks_per_group is None
+                ):
+                    group_offload_num_blocks_per_group = 1
+                pipe.enable_group_offload(
+                    onload_device=torch.device(self.device),
+                    offload_device=torch.device("cpu"),
+                    offload_type=self.group_offload_type,
+                    num_blocks_per_group=group_offload_num_blocks_per_group,
+                    use_stream=self.group_offload_use_stream,
+                )
+                pipe._oneiro_offload_type = OffloadType.GROUP.value
         elif self.device != "cpu":
             pipe.to(self.device)
         # CPU: no action needed, pipeline stays on CPU

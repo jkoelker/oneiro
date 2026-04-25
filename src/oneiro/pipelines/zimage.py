@@ -5,7 +5,7 @@ from typing import Any
 import torch
 from PIL import Image
 
-from oneiro.device import DevicePolicy
+from oneiro.device import DevicePolicy, OffloadType
 from oneiro.pipelines.base import BasePipeline, GenerationResult
 from oneiro.pipelines.embedding import EmbeddingLoaderMixin, parse_embeddings_from_config
 from oneiro.pipelines.lora import LoraLoaderMixin, parse_loras_from_model_config
@@ -28,8 +28,18 @@ class ZImagePipelineWrapper(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipeline)
 
         repo = model_config.get("repo", "Tongyi-MAI/Z-Image-Turbo")
         cpu_offload = model_config.get("cpu_offload", True)
+        offload_type = model_config.get("offload_type", "group")
+        group_offload_type = model_config.get("group_offload_type", "leaf_level")
+        group_offload_use_stream = model_config.get("group_offload_use_stream", True)
+        group_offload_num_blocks_per_group = model_config.get("group_offload_num_blocks_per_group")
 
-        self.policy = DevicePolicy.auto_detect(cpu_offload=cpu_offload)
+        self.policy = DevicePolicy.auto_detect(
+            cpu_offload=cpu_offload,
+            offload_type=offload_type,
+            group_offload_type=group_offload_type,
+            group_offload_use_stream=group_offload_use_stream,
+            group_offload_num_blocks_per_group=group_offload_num_blocks_per_group,
+        )
 
         print(f"Loading Z-Image from {repo}")
 
@@ -40,8 +50,6 @@ class ZImagePipelineWrapper(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipeline)
         self.img2img_pipe = ZImageImg2ImgPipeline(**self.pipe.components)
         self.inpaint_pipe = ZImageInpaintPipeline(**self.pipe.components)
         self._active_pipe = self.pipe
-
-        self.policy.apply_to_pipeline(self.pipe)
 
         loras = parse_loras_from_model_config(model_config)
         if loras:
@@ -55,6 +63,8 @@ class ZImagePipelineWrapper(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipeline)
             if embeddings:
                 print(f"  Loading {len(embeddings)} embedding(s)...")
                 self.load_embeddings_sync(embeddings)
+
+        self.policy.apply_to_pipeline(self.pipe)
 
         print(f"Z-Image loaded from {repo}")
 
@@ -152,6 +162,10 @@ class ZImagePipelineWrapper(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipeline)
 
     def _reset_model_state(self) -> None:
         """Reset hooks on the Z-Image pipeline variant used for this generation."""
+        if self.pipe is not None and getattr(self.pipe, "_oneiro_offload_type", None) == (
+            OffloadType.GROUP.value
+        ):
+            return
         if self._active_pipe is None:
             return
         self._active_pipe.maybe_free_model_hooks()

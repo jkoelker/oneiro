@@ -46,6 +46,11 @@ class TestFlux2PipelineWrapperLoad:
         call_args = mock_flux2_pipeline.from_pretrained.call_args
         assert call_args[0][0] == "diffusers/FLUX.2-dev-bnb-4bit"
 
+        transformer_kwargs = mock_transformer.from_pretrained.call_args.kwargs
+        text_encoder_kwargs = mock_text_encoder.from_pretrained.call_args.kwargs
+        assert "device_map" not in transformer_kwargs
+        assert "device_map" not in text_encoder_kwargs
+
     @patch("oneiro.pipelines.base.torch.set_num_interop_threads")
     @patch("oneiro.pipelines.base.torch.set_num_threads")
     @patch("transformers.Mistral3ForConditionalGeneration")
@@ -71,10 +76,10 @@ class TestFlux2PipelineWrapperLoad:
     @patch("transformers.Mistral3ForConditionalGeneration")
     @patch("diffusers.Flux2Transformer2DModel")
     @patch("diffusers.Flux2Pipeline")
-    def test_load_enables_cpu_offload_on_cuda(
+    def test_load_enables_group_offload_on_cuda(
         self, mock_flux2_pipeline, mock_transformer, mock_text_encoder, mock_threads, mock_interop
     ):
-        """Load enables CPU offload on CUDA by default."""
+        """Load enables group offload on CUDA by default."""
         mock_pipe = MagicMock()
         mock_flux2_pipeline.from_pretrained.return_value = mock_pipe
         mock_transformer.from_pretrained.return_value = MagicMock()
@@ -86,7 +91,7 @@ class TestFlux2PipelineWrapperLoad:
             pipeline = Flux2PipelineWrapper()
             pipeline.load({})
 
-        mock_pipe.enable_model_cpu_offload.assert_called_once()
+        mock_pipe.enable_group_offload.assert_called_once()
 
     @patch("oneiro.pipelines.base.torch.set_num_interop_threads")
     @patch("oneiro.pipelines.base.torch.set_num_threads")
@@ -105,6 +110,7 @@ class TestFlux2PipelineWrapperLoad:
         pipeline = Flux2PipelineWrapper()
         pipeline.load({"cpu_offload": False})
 
+        mock_pipe.enable_group_offload.assert_not_called()
         mock_pipe.enable_model_cpu_offload.assert_not_called()
 
 

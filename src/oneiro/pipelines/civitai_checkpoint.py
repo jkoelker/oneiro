@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 from PIL import Image
 
-from oneiro.device import DevicePolicy, OffloadMode
+from oneiro.device import DevicePolicy, OffloadMode, OffloadType
 from oneiro.pipelines.base import BasePipeline, GenerationResult
 from oneiro.pipelines.embedding import EmbeddingLoaderMixin, parse_embeddings_from_config
 from oneiro.pipelines.long_prompt import (
@@ -716,8 +716,24 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
         print(f"  Base model: {base_model or 'unknown'}")
         print(f"  Pipeline: {self._pipeline_config.pipeline_class}")
 
+        offload_type = model_config.get("offload_type")
+        if (
+            offload_type is None
+            and self._pipeline_config.pipeline_class == "QwenImagePipeline"
+            and model_config.get("sequential_cpu_offload") is False
+        ):
+            offload_type = OffloadType.MODEL.value
+
         cpu_offload = model_config.get("cpu_offload", True)
-        self.policy = DevicePolicy.auto_detect(cpu_offload=cpu_offload)
+        self.policy = DevicePolicy.auto_detect(
+            cpu_offload=cpu_offload,
+            offload_type=offload_type or "group",
+            group_offload_type=model_config.get("group_offload_type", "leaf_level"),
+            group_offload_use_stream=model_config.get("group_offload_use_stream", True),
+            group_offload_num_blocks_per_group=model_config.get(
+                "group_offload_num_blocks_per_group"
+            ),
+        )
 
         # Get the pipeline class unless this wrapper has a custom assembly path.
         pipeline_class: type | None = None
@@ -740,15 +756,6 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
         scheduler_override = model_config.get("scheduler")
         self.configure_scheduler(scheduler_override)
 
-        if self._should_use_sequential_cpu_offload(model_config):
-            self.pipe.enable_sequential_cpu_offload()
-        else:
-            self.policy.apply_to_pipeline(self.pipe)
-        # Track whether offload was applied (for dynamic LoRA handling)
-        self._cpu_offload = (
-            self.policy.offload != OffloadMode.NEVER and self.policy.device == "cuda"
-        )
-
         # Enable memory optimizations for VAE if available
         if hasattr(self.pipe, "vae"):
             if hasattr(self.pipe.vae, "enable_tiling"):
@@ -770,6 +777,16 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
             if embeddings:
                 print(f"  Loading {len(embeddings)} embedding(s)...")
                 self.load_embeddings_sync(embeddings)
+
+        if self._should_use_sequential_cpu_offload(model_config):
+            self.pipe.enable_sequential_cpu_offload()
+            self.pipe._oneiro_offload_type = OffloadType.SEQUENTIAL.value
+        else:
+            self.policy.apply_to_pipeline(self.pipe)
+        # Track whether offload was applied (for dynamic LoRA handling)
+        self._cpu_offload = (
+            self.policy.offload != OffloadMode.NEVER and self.policy.device == "cuda"
+        )
 
         print(f"Checkpoint loaded: {checkpoint_path.name}")
 
@@ -961,6 +978,10 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
         should_offload = self.policy.offload != OffloadMode.NEVER and self.policy.device == "cuda"
         if not should_offload:
             return False
+
+        offload_type = model_config.get("offload_type")
+        if offload_type is not None:
+            return OffloadType(offload_type) == OffloadType.SEQUENTIAL
 
         configured = model_config.get("sequential_cpu_offload")
         if configured is not None:
