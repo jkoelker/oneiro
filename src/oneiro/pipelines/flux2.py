@@ -24,6 +24,10 @@ class Flux2PipelineWrapper(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipeline):
 
         repo = model_config.get("repo", "diffusers/FLUX.2-dev-bnb-4bit")
         cpu_offload = model_config.get("cpu_offload", True)
+        offload_type = model_config.get("offload_type", "group")
+        group_offload_type = model_config.get("group_offload_type", "leaf_level")
+        group_offload_use_stream = model_config.get("group_offload_use_stream", True)
+        group_offload_num_blocks_per_group = model_config.get("group_offload_num_blocks_per_group")
         cpu_utilization = model_config.get("cpu_utilization", 0.75)
 
         print(f"Loading FLUX.2 from {repo}")
@@ -31,7 +35,13 @@ class Flux2PipelineWrapper(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipeline):
         # Configure CPU threading for text encoder
         self._configure_cpu_threads(cpu_utilization)
 
-        self.policy = DevicePolicy.auto_detect(cpu_offload=cpu_offload)
+        self.policy = DevicePolicy.auto_detect(
+            cpu_offload=cpu_offload,
+            offload_type=offload_type,
+            group_offload_type=group_offload_type,
+            group_offload_use_stream=group_offload_use_stream,
+            group_offload_num_blocks_per_group=group_offload_num_blocks_per_group,
+        )
 
         # Load transformer and text encoder on CPU first
         print("  Loading transformer on CPU...")
@@ -39,7 +49,6 @@ class Flux2PipelineWrapper(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipeline):
             repo,
             subfolder="transformer",
             torch_dtype=self.policy.dtype,
-            device_map="cpu",
         )
 
         print("  Loading text encoder on CPU...")
@@ -47,7 +56,6 @@ class Flux2PipelineWrapper(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipeline):
             repo,
             subfolder="text_encoder",
             torch_dtype=self.policy.dtype,
-            device_map="cpu",
         )
 
         print("  Creating pipeline...")
@@ -57,8 +65,6 @@ class Flux2PipelineWrapper(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipeline):
             text_encoder=text_encoder,
             torch_dtype=self.policy.dtype,
         )
-
-        self.policy.apply_to_pipeline(self.pipe)
 
         loras = parse_loras_from_model_config(model_config)
         if loras:
@@ -72,6 +78,8 @@ class Flux2PipelineWrapper(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipeline):
             if embeddings:
                 print(f"  Loading {len(embeddings)} embedding(s)...")
                 self.load_embeddings_sync(embeddings)
+
+        self.policy.apply_to_pipeline(self.pipe)
 
         print(f"FLUX.2 loaded from {repo}")
 

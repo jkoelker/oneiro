@@ -88,10 +88,10 @@ class TestZImagePipelineWrapperLoad:
     @patch("diffusers.ZImageInpaintPipeline")
     @patch("diffusers.ZImageImg2ImgPipeline")
     @patch("diffusers.ZImagePipeline")
-    def test_load_enables_cpu_offload_on_cuda(
+    def test_load_enables_group_offload_on_cuda(
         self, mock_zimage_pipeline, mock_img2img_pipeline, mock_inpaint_pipeline
     ):
-        """Load enables CPU offload on CUDA by default."""
+        """Load enables group offload on CUDA by default."""
         mock_pipe = MagicMock()
         mock_pipe.components = make_zimage_components()
         mock_zimage_pipeline.from_pretrained.return_value = mock_pipe
@@ -102,7 +102,7 @@ class TestZImagePipelineWrapperLoad:
             pipeline = ZImagePipelineWrapper()
             pipeline.load({})
 
-        mock_pipe.enable_model_cpu_offload.assert_called_once()
+        mock_pipe.enable_group_offload.assert_called_once()
         mock_img2img_pipeline.assert_called_once_with(**mock_pipe.components)
         mock_inpaint_pipeline.assert_called_once_with(**mock_pipe.components)
 
@@ -120,6 +120,7 @@ class TestZImagePipelineWrapperLoad:
         pipeline = ZImagePipelineWrapper()
         pipeline.load({"cpu_offload": False})
 
+        mock_pipe.enable_group_offload.assert_not_called()
         mock_pipe.enable_model_cpu_offload.assert_not_called()
         mock_img2img_pipeline.assert_called_once_with(**mock_pipe.components)
         mock_inpaint_pipeline.assert_called_once_with(**mock_pipe.components)

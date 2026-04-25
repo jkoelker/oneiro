@@ -11,7 +11,7 @@ from typing import Any
 import torch
 from PIL import Image, UnidentifiedImageError
 
-from oneiro.device import DevicePolicy
+from oneiro.device import DevicePolicy, OffloadType
 
 MAX_INPUT_IMAGE_PIXELS = 4096 * 4096
 
@@ -215,6 +215,8 @@ class BasePipeline(ABC):
         This is the canonical way to reset diffusers pipeline state.
         """
         if self.pipe is None:
+            return
+        if getattr(self.pipe, "_oneiro_offload_type", None) == OffloadType.GROUP.value:
             return
         self.pipe.maybe_free_model_hooks()
 

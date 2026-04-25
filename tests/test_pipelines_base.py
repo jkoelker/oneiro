@@ -8,7 +8,7 @@ import pytest
 import torch
 from PIL import Image
 
-from oneiro.device import DevicePolicy, OffloadMode
+from oneiro.device import DevicePolicy, OffloadMode, OffloadType
 from oneiro.pipelines import PipelineManager
 from oneiro.pipelines.base import BasePipeline, GenerationResult
 from oneiro.pipelines.lora import LoraConfig, LoraSource
@@ -323,6 +323,16 @@ class TestBasePipelinePostGenerate:
         pipeline.pipe = mock_pipe
         pipeline._reset_model_state()
         mock_pipe.maybe_free_model_hooks.assert_called_once()
+
+    @patch("oneiro.pipelines.base.torch.cuda.is_available", return_value=False)
+    def test_reset_model_state_skips_group_offload_pipelines(self, mock_cuda):
+        """_reset_model_state() skips model hook reset for group offload."""
+        pipeline = ConcretePipeline()
+        mock_pipe = Mock()
+        mock_pipe._oneiro_offload_type = OffloadType.GROUP.value
+        pipeline.pipe = mock_pipe
+        pipeline._reset_model_state()
+        mock_pipe.maybe_free_model_hooks.assert_not_called()
 
     @patch("oneiro.pipelines.base.torch.cuda.is_available", return_value=False)
     def test_reset_model_state_handles_none_pipe(self, mock_cuda):

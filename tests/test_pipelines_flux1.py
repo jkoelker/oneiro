@@ -57,8 +57,10 @@ class TestFlux1PipelineWrapperLoad:
     @patch("oneiro.pipelines.base.torch.set_num_interop_threads")
     @patch("oneiro.pipelines.base.torch.set_num_threads")
     @patch("diffusers.FluxPipeline")
-    def test_load_enables_cpu_offload_on_cuda(self, mock_flux_pipeline, mock_threads, mock_interop):
-        """Load enables CPU offload on CUDA by default."""
+    def test_load_enables_group_offload_on_cuda(
+        self, mock_flux_pipeline, mock_threads, mock_interop
+    ):
+        """Load enables group offload on CUDA by default."""
         mock_pipe = MagicMock()
         mock_flux_pipeline.from_pretrained.return_value = mock_pipe
 
@@ -68,7 +70,7 @@ class TestFlux1PipelineWrapperLoad:
             pipeline = Flux1PipelineWrapper()
             pipeline.load({})
 
-        mock_pipe.enable_model_cpu_offload.assert_called_once()
+        mock_pipe.enable_group_offload.assert_called_once()
 
     @patch("oneiro.pipelines.base.torch.set_num_interop_threads")
     @patch("oneiro.pipelines.base.torch.set_num_threads")
@@ -83,6 +85,7 @@ class TestFlux1PipelineWrapperLoad:
         pipeline = Flux1PipelineWrapper()
         pipeline.load({"cpu_offload": False})
 
+        mock_pipe.enable_group_offload.assert_not_called()
         mock_pipe.enable_model_cpu_offload.assert_not_called()
 
     @patch("oneiro.pipelines.base.torch.set_num_interop_threads")

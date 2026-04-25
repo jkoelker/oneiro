@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 import torch
 
-from oneiro.device import DevicePolicy, OffloadMode
+from oneiro.device import DevicePolicy, OffloadMode, OffloadType
 from oneiro.pipelines.civitai_checkpoint import (
     CIVITAI_BASE_MODEL_PIPELINE_MAP,
     DEFAULT_PIPELINE_CONFIG,
@@ -362,8 +362,8 @@ class TestCivitaiCheckpointPipelineLoad:
 
     @patch.object(CivitaiCheckpointPipeline, "configure_scheduler")
     @patch("oneiro.pipelines.civitai_checkpoint.get_diffusers_pipeline_class")
-    def test_load_enables_cpu_offload(self, mock_get_class, mock_config_sched, tmp_path):
-        """load() enables CPU offload when configured on CUDA."""
+    def test_load_enables_group_offload(self, mock_get_class, mock_config_sched, tmp_path):
+        """load() enables group offload when configured on CUDA."""
         checkpoint = tmp_path / "model.safetensors"
         checkpoint.write_bytes(b"dummy")
 
@@ -380,6 +380,36 @@ class TestCivitaiCheckpointPipelineLoad:
                 {
                     "checkpoint_path": str(checkpoint),
                     "cpu_offload": True,
+                }
+            )
+
+        mock_pipe.enable_group_offload.assert_called_once()
+
+    @patch.object(CivitaiCheckpointPipeline, "configure_scheduler")
+    @patch("oneiro.pipelines.civitai_checkpoint.get_diffusers_pipeline_class")
+    def test_load_can_use_model_cpu_offload(self, mock_get_class, mock_config_sched, tmp_path):
+        """load() can use legacy model CPU offload when requested."""
+        checkpoint = tmp_path / "model.safetensors"
+        checkpoint.write_bytes(b"dummy")
+
+        mock_pipeline_class = MagicMock()
+        mock_pipe = MagicMock()
+        mock_pipeline_class.from_single_file.return_value = mock_pipe
+        mock_get_class.return_value = mock_pipeline_class
+
+        pipeline = CivitaiCheckpointPipeline()
+        mock_policy = DevicePolicy(
+            device="cuda",
+            dtype=torch.float16,
+            offload=OffloadMode.AUTO,
+            offload_type="model",
+        )
+        with patch.object(DevicePolicy, "auto_detect", return_value=mock_policy):
+            pipeline.load(
+                {
+                    "checkpoint_path": str(checkpoint),
+                    "cpu_offload": True,
+                    "offload_type": "model",
                 }
             )
 
@@ -776,7 +806,93 @@ class TestCivitaiCheckpointPipelineLoad:
             )
 
         mock_pipe.enable_sequential_cpu_offload.assert_called_once_with()
+        assert mock_pipe._oneiro_offload_type == "sequential"
         mock_apply_to_pipeline.assert_not_called()
+
+    def test_load_qwen_can_use_explicit_group_offload_on_cuda(self, tmp_path):
+        """Qwen CivitAI checkpoints can opt into group offload explicitly."""
+        checkpoint = tmp_path / "qwen.safetensors"
+        checkpoint.write_bytes(b"dummy")
+
+        mock_pipe = MagicMock()
+        mock_transformer = MagicMock()
+        mock_scheduler = MagicMock()
+        qwen_state_dict = {"img_in.weight": MagicMock()}
+        mock_policy = DevicePolicy(device="cuda", dtype=torch.float16, offload=OffloadMode.AUTO)
+
+        with (
+            patch.object(CivitaiCheckpointPipeline, "configure_scheduler"),
+            patch.object(DevicePolicy, "auto_detect", return_value=mock_policy),
+            patch.object(DevicePolicy, "apply_to_pipeline") as mock_apply_to_pipeline,
+            patch.object(
+                CivitaiCheckpointPipeline,
+                "_load_transformer_checkpoint",
+                return_value=qwen_state_dict,
+            ),
+            patch("diffusers.QwenImageTransformer2DModel") as mock_transformer_class,
+            patch("diffusers.FlowMatchEulerDiscreteScheduler") as mock_scheduler_class,
+            patch("diffusers.DiffusionPipeline") as mock_diffusion_pipeline,
+        ):
+            mock_transformer_class.from_single_file.return_value = mock_transformer
+            mock_scheduler_class.from_config.return_value = mock_scheduler
+            mock_diffusion_pipeline.from_pretrained.return_value = mock_pipe
+
+            pipeline = CivitaiCheckpointPipeline()
+            pipeline.load(
+                {
+                    "checkpoint_path": str(checkpoint),
+                    "base_model": "Qwen",
+                    "offload_type": "group",
+                }
+            )
+
+        mock_pipe.enable_sequential_cpu_offload.assert_not_called()
+        mock_apply_to_pipeline.assert_called_once_with(mock_pipe)
+
+    def test_load_qwen_sequential_false_uses_model_offload_on_cuda(self, tmp_path):
+        """Legacy sequential_cpu_offload=False keeps model offload for Qwen checkpoints."""
+        checkpoint = tmp_path / "qwen.safetensors"
+        checkpoint.write_bytes(b"dummy")
+
+        mock_pipe = MagicMock()
+        mock_transformer = MagicMock()
+        mock_scheduler = MagicMock()
+        qwen_state_dict = {"img_in.weight": MagicMock()}
+        mock_policy = DevicePolicy(
+            device="cuda",
+            dtype=torch.float16,
+            offload=OffloadMode.AUTO,
+            offload_type=OffloadType.MODEL,
+        )
+
+        with (
+            patch.object(CivitaiCheckpointPipeline, "configure_scheduler"),
+            patch.object(DevicePolicy, "auto_detect", return_value=mock_policy) as mock_auto_detect,
+            patch.object(
+                CivitaiCheckpointPipeline,
+                "_load_transformer_checkpoint",
+                return_value=qwen_state_dict,
+            ),
+            patch("diffusers.QwenImageTransformer2DModel") as mock_transformer_class,
+            patch("diffusers.FlowMatchEulerDiscreteScheduler") as mock_scheduler_class,
+            patch("diffusers.DiffusionPipeline") as mock_diffusion_pipeline,
+        ):
+            mock_transformer_class.from_single_file.return_value = mock_transformer
+            mock_scheduler_class.from_config.return_value = mock_scheduler
+            mock_diffusion_pipeline.from_pretrained.return_value = mock_pipe
+
+            pipeline = CivitaiCheckpointPipeline()
+            pipeline.load(
+                {
+                    "checkpoint_path": str(checkpoint),
+                    "base_model": "Qwen",
+                    "sequential_cpu_offload": False,
+                }
+            )
+
+        assert mock_auto_detect.call_args.kwargs["offload_type"] == "model"
+        mock_pipe.enable_sequential_cpu_offload.assert_not_called()
+        mock_pipe.enable_model_cpu_offload.assert_called_once_with()
 
     def test_load_flux2_klein_single_file_assembles_klein_pipeline(self, tmp_path):
         """CivitAI FLUX.2 Klein checkpoints load via the Flux2 transformer path."""
