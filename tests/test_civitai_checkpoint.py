@@ -503,6 +503,139 @@ class TestCivitaiCheckpointPipelineLoad:
             torch_dtype=torch.float32,
         )
 
+    def test_load_sdxl_single_file_retries_with_text_components(self, tmp_path):
+        """SDXL checkpoints retry with explicit text components when weights are missing."""
+        checkpoint = tmp_path / "model.safetensors"
+        checkpoint.write_bytes(b"dummy")
+
+        mock_pipeline_class = MagicMock()
+        mock_pipe = MagicMock()
+        mock_pipeline_class.from_single_file.side_effect = [
+            RuntimeError(
+                "Failed to load CLIPTextModel. Weights for this component appear to be "
+                "missing in the checkpoint."
+            ),
+            mock_pipe,
+        ]
+        mock_text_encoder = MagicMock()
+        mock_text_encoder_2 = MagicMock()
+        mock_tokenizer = MagicMock()
+        mock_tokenizer_2 = MagicMock()
+        mock_policy = DevicePolicy(device="cpu", dtype=torch.float16, offload=OffloadMode.NEVER)
+
+        with (
+            patch.object(CivitaiCheckpointPipeline, "configure_scheduler"),
+            patch.object(DevicePolicy, "auto_detect", return_value=mock_policy),
+            patch(
+                "oneiro.pipelines.civitai_checkpoint.get_diffusers_pipeline_class",
+                return_value=mock_pipeline_class,
+            ),
+            patch("transformers.CLIPTextModel") as mock_clip_text_model,
+            patch("transformers.CLIPTextModelWithProjection") as mock_clip_text_model_2,
+            patch("transformers.CLIPTokenizer") as mock_clip_tokenizer,
+        ):
+            mock_clip_text_model.from_pretrained.return_value = mock_text_encoder
+            mock_clip_text_model_2.from_pretrained.return_value = mock_text_encoder_2
+            mock_clip_tokenizer.from_pretrained.side_effect = [mock_tokenizer, mock_tokenizer_2]
+
+            pipeline = CivitaiCheckpointPipeline()
+            pipeline.load(
+                {
+                    "checkpoint_path": str(checkpoint),
+                    "base_model": "Illustrious",
+                }
+            )
+
+        assert mock_pipeline_class.from_single_file.call_count == 2
+        first_call = mock_pipeline_class.from_single_file.call_args_list[0]
+        assert first_call.args == (str(checkpoint),)
+        assert first_call.kwargs == {"torch_dtype": torch.float16}
+
+        second_call = mock_pipeline_class.from_single_file.call_args_list[1]
+        assert second_call.args == (str(checkpoint),)
+        assert second_call.kwargs["torch_dtype"] == torch.float16
+        assert second_call.kwargs["config"] == "stabilityai/stable-diffusion-xl-base-1.0"
+        assert second_call.kwargs["text_encoder"] is mock_text_encoder
+        assert second_call.kwargs["text_encoder_2"] is mock_text_encoder_2
+        assert second_call.kwargs["tokenizer"] is mock_tokenizer
+        assert second_call.kwargs["tokenizer_2"] is mock_tokenizer_2
+
+        mock_clip_text_model.from_pretrained.assert_called_once_with(
+            "stabilityai/stable-diffusion-xl-base-1.0",
+            subfolder="text_encoder",
+            torch_dtype=torch.float16,
+        )
+        mock_clip_text_model_2.from_pretrained.assert_called_once_with(
+            "stabilityai/stable-diffusion-xl-base-1.0",
+            subfolder="text_encoder_2",
+            torch_dtype=torch.float16,
+        )
+        assert mock_clip_tokenizer.from_pretrained.call_args_list == [
+            (("stabilityai/stable-diffusion-xl-base-1.0",), {"subfolder": "tokenizer"}),
+            (("stabilityai/stable-diffusion-xl-base-1.0",), {"subfolder": "tokenizer_2"}),
+        ]
+
+    def test_load_sdxl_single_file_uses_component_overrides_on_retry(self, tmp_path):
+        """SDXL text component fallback supports custom repos and subfolders."""
+        checkpoint = tmp_path / "model.safetensors"
+        checkpoint.write_bytes(b"dummy")
+
+        mock_pipeline_class = MagicMock()
+        mock_pipeline_class.from_single_file.side_effect = [
+            RuntimeError(
+                "Failed to load CLIPTextModelWithProjection. Weights for this component "
+                "appear to be missing in the checkpoint."
+            ),
+            MagicMock(),
+        ]
+        mock_policy = DevicePolicy(device="cpu", dtype=torch.float32, offload=OffloadMode.NEVER)
+
+        with (
+            patch.object(CivitaiCheckpointPipeline, "configure_scheduler"),
+            patch.object(DevicePolicy, "auto_detect", return_value=mock_policy),
+            patch(
+                "oneiro.pipelines.civitai_checkpoint.get_diffusers_pipeline_class",
+                return_value=mock_pipeline_class,
+            ),
+            patch("transformers.CLIPTextModel") as mock_clip_text_model,
+            patch("transformers.CLIPTextModelWithProjection") as mock_clip_text_model_2,
+            patch("transformers.CLIPTokenizer") as mock_clip_tokenizer,
+        ):
+            pipeline = CivitaiCheckpointPipeline()
+            pipeline.load(
+                {
+                    "checkpoint_path": str(checkpoint),
+                    "base_model": "SDXL 1.0",
+                    "sdxl_component_repo": "base/sdxl",
+                    "single_file_config_repo": "config/sdxl",
+                    "text_encoder_repo": "custom/text",
+                    "text_encoder_subfolder": "clip_l",
+                    "text_encoder_2_repo": "custom/text2",
+                    "text_encoder_2_subfolder": "clip_g",
+                    "tokenizer_repo": "custom/tokenizer",
+                    "tokenizer_subfolder": "tok_l",
+                    "tokenizer_2_repo": "custom/tokenizer2",
+                    "tokenizer_2_subfolder": "tok_g",
+                }
+            )
+
+        retry_kwargs = mock_pipeline_class.from_single_file.call_args_list[1].kwargs
+        assert retry_kwargs["config"] == "config/sdxl"
+        mock_clip_text_model.from_pretrained.assert_called_once_with(
+            "custom/text",
+            subfolder="clip_l",
+            torch_dtype=torch.float32,
+        )
+        mock_clip_text_model_2.from_pretrained.assert_called_once_with(
+            "custom/text2",
+            subfolder="clip_g",
+            torch_dtype=torch.float32,
+        )
+        assert mock_clip_tokenizer.from_pretrained.call_args_list == [
+            (("custom/tokenizer",), {"subfolder": "tok_l"}),
+            (("custom/tokenizer2",), {"subfolder": "tok_g"}),
+        ]
+
     def test_load_zimage_single_file_allows_component_repo_overrides(self, tmp_path):
         """Z-Image component locations can be overridden independently."""
         checkpoint = tmp_path / "model.safetensors"

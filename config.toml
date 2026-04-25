@@ -215,3 +215,17 @@ verify_hashes = true
 # # text_encoder_subfolder = "text_encoder"
 # # tokenizer_repo = "Tongyi-MAI/Z-Image-Turbo"
 # # tokenizer_subfolder = "tokenizer"
+#
+# Example 8: SDXL-family checkpoint with missing text encoder components
+# [models.sdxl-civitai]
+# type = "civitai"
+# civitai_model_id = 12345
+# base_model = "Illustrious"      # Also applies to SDXL/Pony variants
+# # Used only if the checkpoint omits CLIP text encoder weights
+# sdxl_component_repo = "stabilityai/stable-diffusion-xl-base-1.0"
+# # Advanced: override SDXL text components independently if needed
+# # single_file_config_repo = "stabilityai/stable-diffusion-xl-base-1.0"
+# # text_encoder_repo = "stabilityai/stable-diffusion-xl-base-1.0"
+# # text_encoder_2_repo = "stabilityai/stable-diffusion-xl-base-1.0"
+# # tokenizer_repo = "stabilityai/stable-diffusion-xl-base-1.0"
+# # tokenizer_2_repo = "stabilityai/stable-diffusion-xl-base-1.0"

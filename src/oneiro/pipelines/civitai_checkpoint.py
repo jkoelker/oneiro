@@ -394,6 +394,7 @@ SCHEDULER_MAP: dict[str, tuple[str | None, dict[str, Any]]] = {
 }
 
 SCHEDULER_CHOICES: list[str] = list(SCHEDULER_MAP.keys())
+DEFAULT_SDXL_COMPONENT_REPO = "stabilityai/stable-diffusion-xl-base-1.0"
 DEFAULT_ZIMAGE_COMPONENT_REPO = "Tongyi-MAI/Z-Image-Turbo"
 
 # Default fallback configuration
@@ -651,7 +652,12 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
         # Load from single file. Some architectures publish single-file checkpoints
         # without every pipeline component; preload those components when needed.
         single_file_kwargs = self._build_single_file_kwargs(model_config)
-        self.pipe = pipeline_class.from_single_file(str(checkpoint_path), **single_file_kwargs)
+        self.pipe = self._load_pipeline_from_single_file(
+            pipeline_class,
+            checkpoint_path,
+            model_config,
+            single_file_kwargs,
+        )
 
         scheduler_override = model_config.get("scheduler")
         self.configure_scheduler(scheduler_override)
@@ -686,6 +692,43 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
 
         print(f"Checkpoint loaded: {checkpoint_path.name}")
 
+    def _load_pipeline_from_single_file(
+        self,
+        pipeline_class: type,
+        checkpoint_path: Path,
+        model_config: dict[str, Any],
+        single_file_kwargs: dict[str, Any],
+    ) -> Any:
+        """Load a diffusers pipeline from one checkpoint file with component fallbacks."""
+        try:
+            return pipeline_class.from_single_file(str(checkpoint_path), **single_file_kwargs)
+        except Exception as error:
+            if not self._should_retry_with_sdxl_text_components(error, single_file_kwargs):
+                raise
+
+            print("  Text encoder weights missing; retrying with SDXL text components")
+            retry_kwargs = dict(single_file_kwargs)
+            retry_kwargs.update(self._load_sdxl_text_components(model_config))
+            return pipeline_class.from_single_file(str(checkpoint_path), **retry_kwargs)
+
+    def _should_retry_with_sdxl_text_components(
+        self,
+        error: Exception,
+        single_file_kwargs: dict[str, Any],
+    ) -> bool:
+        """Return whether an SDXL checkpoint should retry with explicit text components."""
+        if self._pipeline_config is None:
+            return False
+        if self._pipeline_config.pipeline_class != "StableDiffusionXLPipeline":
+            return False
+        if "text_encoder" in single_file_kwargs or "text_encoder_2" in single_file_kwargs:
+            return False
+
+        message = str(error)
+        return "Weights for this component appear to be missing" in message and (
+            "CLIPTextModel" in message or "CLIPTextModelWithProjection" in message
+        )
+
     def _build_single_file_kwargs(self, model_config: dict[str, Any]) -> dict[str, Any]:
         """Build keyword arguments for diffusers ``from_single_file`` loading.
 
@@ -710,6 +753,63 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
 
         kwargs.update(self._load_zimage_text_components(model_config))
         return kwargs
+
+    def _load_sdxl_text_components(self, model_config: dict[str, Any]) -> dict[str, Any]:
+        """Load SDXL text components when a single-file checkpoint omits them."""
+        from transformers import CLIPTextModel, CLIPTextModelWithProjection, CLIPTokenizer
+
+        component_repo = model_config.get("sdxl_component_repo") or model_config.get(
+            "component_repo"
+        )
+        if component_repo is None:
+            component_repo = DEFAULT_SDXL_COMPONENT_REPO
+
+        text_encoder_repo = model_config.get("text_encoder_repo") or component_repo
+        text_encoder_2_repo = model_config.get("text_encoder_2_repo") or component_repo
+        tokenizer_repo = model_config.get("tokenizer_repo") or component_repo
+        tokenizer_2_repo = model_config.get("tokenizer_2_repo") or component_repo
+
+        text_encoder_subfolder = model_config.get("text_encoder_subfolder", "text_encoder")
+        text_encoder_2_subfolder = model_config.get("text_encoder_2_subfolder", "text_encoder_2")
+        tokenizer_subfolder = model_config.get("tokenizer_subfolder", "tokenizer")
+        tokenizer_2_subfolder = model_config.get("tokenizer_2_subfolder", "tokenizer_2")
+        single_file_config = model_config.get("single_file_config_repo") or component_repo
+
+        print(f"  Loading SDXL text encoder from {text_encoder_repo}/{text_encoder_subfolder}")
+        text_encoder = CLIPTextModel.from_pretrained(
+            text_encoder_repo,
+            subfolder=text_encoder_subfolder,
+            torch_dtype=self.policy.dtype,
+        )
+
+        print(
+            f"  Loading SDXL text encoder 2 from {text_encoder_2_repo}/{text_encoder_2_subfolder}"
+        )
+        text_encoder_2 = CLIPTextModelWithProjection.from_pretrained(
+            text_encoder_2_repo,
+            subfolder=text_encoder_2_subfolder,
+            torch_dtype=self.policy.dtype,
+        )
+
+        print(f"  Loading SDXL tokenizer from {tokenizer_repo}/{tokenizer_subfolder}")
+        tokenizer = CLIPTokenizer.from_pretrained(
+            tokenizer_repo,
+            subfolder=tokenizer_subfolder,
+        )
+
+        print(f"  Loading SDXL tokenizer 2 from {tokenizer_2_repo}/{tokenizer_2_subfolder}")
+        tokenizer_2 = CLIPTokenizer.from_pretrained(
+            tokenizer_2_repo,
+            subfolder=tokenizer_2_subfolder,
+        )
+
+        return {
+            "config": single_file_config,
+            "text_encoder": text_encoder,
+            "text_encoder_2": text_encoder_2,
+            "tokenizer": tokenizer,
+            "tokenizer_2": tokenizer_2,
+        }
 
     def _load_zimage_text_components(self, model_config: dict[str, Any]) -> dict[str, Any]:
         """Load Z-Image text components that are not stored in single-file checkpoints."""
