@@ -951,9 +951,10 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
         """Build keyword arguments for diffusers ``from_single_file`` loading.
 
         Z-Image checkpoints commonly store the transformer weights in the single
-        file while the Qwen3 text encoder lives in the base Hugging Face repo.
-        Diffusers requires callers to preload and inject that component instead
-        of expecting it to be reconstructed from the checkpoint.
+        file while the Qwen3 text encoder, tokenizer, and VAE live in the base
+        Hugging Face repo. Diffusers requires callers to preload and inject
+        those components instead of expecting them to be reconstructed from the
+        checkpoint.
 
         Args:
             model_config: Model configuration from TOML/state.
@@ -969,7 +970,7 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
         ):
             return kwargs
 
-        kwargs.update(self._load_zimage_text_components(model_config))
+        kwargs.update(self._load_zimage_components(model_config))
         return kwargs
 
     def _load_sdxl_text_components(self, model_config: dict[str, Any]) -> dict[str, Any]:
@@ -1029,21 +1030,26 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
             "tokenizer_2": tokenizer_2,
         }
 
-    def _load_zimage_text_components(self, model_config: dict[str, Any]) -> dict[str, Any]:
-        """Load Z-Image text components that are not stored in single-file checkpoints."""
+    def _load_zimage_components(self, model_config: dict[str, Any]) -> dict[str, Any]:
+        """Load Z-Image components that are not stored in single-file checkpoints."""
+        from diffusers import AutoencoderKL
         from transformers import AutoTokenizer, Qwen3Model
 
         component_repo = model_config.get("component_repo") or model_config.get("repo")
         text_encoder_repo = model_config.get("text_encoder_repo") or component_repo
         tokenizer_repo = model_config.get("tokenizer_repo") or component_repo
+        vae_repo = model_config.get("vae_repo") or component_repo
 
         if text_encoder_repo is None:
             text_encoder_repo = DEFAULT_ZIMAGE_COMPONENT_REPO
         if tokenizer_repo is None:
             tokenizer_repo = text_encoder_repo
+        if vae_repo is None:
+            vae_repo = text_encoder_repo
 
         text_encoder_subfolder = model_config.get("text_encoder_subfolder", "text_encoder")
         tokenizer_subfolder = model_config.get("tokenizer_subfolder", "tokenizer")
+        vae_subfolder = model_config.get("vae_subfolder", "vae")
 
         print(f"  Loading Z-Image text encoder from {text_encoder_repo}/{text_encoder_subfolder}")
         text_encoder = Qwen3Model.from_pretrained(
@@ -1058,7 +1064,14 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
             subfolder=tokenizer_subfolder,
         )
 
-        return {"text_encoder": text_encoder, "tokenizer": tokenizer}
+        print(f"  Loading Z-Image VAE from {vae_repo}/{vae_subfolder}")
+        vae = AutoencoderKL.from_pretrained(
+            vae_repo,
+            subfolder=vae_subfolder,
+            torch_dtype=self.policy.dtype,
+        )
+
+        return {"text_encoder": text_encoder, "tokenizer": tokenizer, "vae": vae}
 
     def configure_scheduler(self, scheduler_name: str | None) -> None:
         if self.pipe is None or self._pipeline_config is None:

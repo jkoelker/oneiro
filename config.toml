@@ -212,11 +212,13 @@ verify_hashes = true
 # civitai_model_id = 153568
 # base_model = "Z-Image Turbo"    # Auto-detected for fetched models when CivitAI provides it
 # component_repo = "Tongyi-MAI/Z-Image-Turbo"
-# # Advanced: override text components independently if a checkpoint requires them
+# # Advanced: override components independently if a checkpoint requires them
 # # text_encoder_repo = "Tongyi-MAI/Z-Image-Turbo"
 # # text_encoder_subfolder = "text_encoder"
 # # tokenizer_repo = "Tongyi-MAI/Z-Image-Turbo"
 # # tokenizer_subfolder = "tokenizer"
+# # vae_repo = "Tongyi-MAI/Z-Image-Turbo"
+# # vae_subfolder = "vae"
 #
 # Example 8: SDXL-family checkpoint with missing text encoder components
 # [models.sdxl-civitai]
