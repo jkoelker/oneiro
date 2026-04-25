@@ -826,7 +826,7 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
 
         print(f"  Loading Qwen transformer from {checkpoint_path}")
         checkpoint = self._load_transformer_checkpoint(checkpoint_path)
-        transformer_dtype = self._resolve_qwen_transformer_dtype(model_config, checkpoint)
+        transformer_dtype = self._resolve_qwen_transformer_dtype(model_config)
         transformer = QwenImageTransformer2DModel.from_single_file(
             checkpoint,
             torch_dtype=transformer_dtype,
@@ -906,25 +906,20 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
     def _resolve_qwen_transformer_dtype(
         self,
         model_config: dict[str, Any],
-        checkpoint: dict[str, Any],
     ) -> torch.dtype:
         """Return the dtype used for Qwen single-file transformer weights.
 
-        Some CivitAI Qwen checkpoints are published as FP8 transformer-only
-        files. Passing the global bf16/fp16 device dtype to Diffusers' component
-        loader can upcast those weights and remove the memory savings. Preserve
-        FP8 storage by default, while keeping an explicit override for operators
-        who need a different dtype.
+        Qwen Image currently runs the transformer with bf16/fp16 activations.
+        Loading raw FP8 weights directly can fail at runtime with mismatched
+        matrix-multiply dtypes, so the safe default is the device policy dtype.
+        Keep an explicit override for operators whose Diffusers/PyTorch stack
+        supports a different transformer dtype.
         """
         configured_dtype = model_config.get("qwen_transformer_dtype") or model_config.get(
             "transformer_dtype"
         )
         if configured_dtype is not None:
             return self._parse_torch_dtype(configured_dtype)
-
-        checkpoint_dtype = self._infer_float8_checkpoint_dtype(checkpoint)
-        if checkpoint_dtype is not None:
-            return checkpoint_dtype
 
         return self.policy.dtype
 
@@ -960,23 +955,6 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
             raise ValueError(f"Unsupported transformer_dtype '{value}'. Supported: {supported}")
 
         return dtype
-
-    @staticmethod
-    def _infer_float8_checkpoint_dtype(checkpoint: dict[str, Any]) -> torch.dtype | None:
-        """Infer a single FP8 dtype from a transformer checkpoint if present."""
-        dtypes = {
-            value.dtype
-            for value in checkpoint.values()
-            if isinstance(value, torch.Tensor) and value.is_floating_point()
-        }
-        if len(dtypes) != 1:
-            return None
-
-        dtype = next(iter(dtypes))
-        if str(dtype).startswith("torch.float8_"):
-            return dtype
-
-        return None
 
     def _should_use_sequential_cpu_offload(self, model_config: dict[str, Any]) -> bool:
         """Return whether to use Diffusers' lower-memory sequential offload."""
