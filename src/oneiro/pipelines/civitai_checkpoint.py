@@ -822,8 +822,9 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
         transformer_subfolder = model_config.get("transformer_subfolder", "transformer")
 
         print(f"  Loading Qwen transformer from {checkpoint_path}")
+        checkpoint = self._load_transformer_checkpoint(checkpoint_path)
         transformer = QwenImageTransformer2DModel.from_single_file(
-            str(checkpoint_path),
+            checkpoint,
             torch_dtype=self.policy.dtype,
             config=transformer_config,
             subfolder=transformer_subfolder,
@@ -857,7 +858,7 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
         transformer_subfolder = model_config.get("transformer_subfolder", "transformer")
 
         print(f"  Loading FLUX.2 Klein transformer from {checkpoint_path}")
-        checkpoint = self._load_flux2_transformer_checkpoint(checkpoint_path)
+        checkpoint = self._load_transformer_checkpoint(checkpoint_path)
         transformer = Flux2Transformer2DModel.from_single_file(
             checkpoint,
             torch_dtype=self.policy.dtype,
@@ -872,13 +873,15 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
             torch_dtype=self.policy.dtype,
         )
 
-    def _load_flux2_transformer_checkpoint(self, checkpoint_path: Path) -> dict[str, Any]:
-        """Load and normalize FLUX.2 transformer checkpoint keys for Diffusers.
+    def _load_transformer_checkpoint(self, checkpoint_path: Path) -> dict[str, Any]:
+        """Load and normalize CivitAI/Comfy transformer checkpoint keys for Diffusers.
 
-        CivitAI/ComfyUI FLUX.2 checkpoints commonly prefix transformer keys with
-        ``model.diffusion_model.``. Diffusers' FLUX.2 single-file converter
-        expects the original transformer keyspace to start at ``double_blocks``
-        / ``single_blocks``, so strip only that known wrapper prefix.
+        CivitAI/ComfyUI transformer checkpoints commonly prefix model keys with
+        ``model.diffusion_model.``. Some Diffusers component loaders already
+        strip that prefix, but Qwen Image uses an identity converter and FLUX.2
+        expects the keyspace to start at ``double_blocks`` / ``single_blocks``.
+        Strip only that known wrapper prefix before handing the state dict to
+        those component loaders.
         """
         from safetensors.torch import load_file
 
