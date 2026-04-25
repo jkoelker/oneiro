@@ -1112,7 +1112,7 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
         checkpoint_path: Path,
         model_config: dict[str, Any],
     ) -> dict[str, Any]:
-        """Load Z-Image components that are not stored in single-file checkpoints."""
+        """Load Z-Image components that Diffusers cannot infer from one checkpoint."""
         from diffusers import AutoencoderKL
         from transformers import AutoTokenizer, Qwen3Model
 
@@ -1145,11 +1145,8 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
             subfolder=tokenizer_subfolder,
         )
 
-        components = {"text_encoder": text_encoder, "tokenizer": tokenizer}
-
         if self._checkpoint_has_component(checkpoint_path, "vae"):
-            print("  Z-Image checkpoint includes VAE weights; using checkpoint VAE")
-            return components
+            print("  Z-Image checkpoint includes VAE weights; using repo VAE for Diffusers")
 
         print(f"  Loading Z-Image VAE from {vae_repo}/{vae_subfolder}")
         vae = AutoencoderKL.from_pretrained(
@@ -1158,8 +1155,7 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
             torch_dtype=self.policy.dtype,
         )
 
-        components["vae"] = vae
-        return components
+        return {"text_encoder": text_encoder, "tokenizer": tokenizer, "vae": vae}
 
     @staticmethod
     def _checkpoint_has_component(checkpoint_path: Path, component: str) -> bool:
