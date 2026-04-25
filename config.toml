@@ -26,6 +26,15 @@ group_offload_type = "leaf_level"
 steps = 28
 guidance_scale = 4.0
 
+[models.flux2-klein]
+type = "flux2-klein"
+repo = "black-forest-labs/FLUX.2-klein-9B"
+cpu_offload = true
+offload_type = "group"
+group_offload_type = "leaf_level"
+steps = 4
+guidance_scale = 1.0  # Distilled Klein model-card default; base variants use 4.0/50 steps
+
 [models.qwen-image]
 type = "qwen"
 repo = "Qwen/Qwen-Image"

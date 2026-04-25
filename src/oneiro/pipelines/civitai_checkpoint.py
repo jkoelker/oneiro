@@ -1373,6 +1373,24 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
 
             return gen_kwargs
 
+        if self._pipeline_config.pipeline_class == "Flux2KleinPipeline":
+            gen_kwargs = {
+                "prompt": prompt,
+                "num_inference_steps": steps,
+                "guidance_scale": guidance_scale,
+                "generator": generator,
+            }
+
+            if init_image:
+                print(f"CivitAI FLUX.2 Klein img2img: '{prompt[:50]}...'")
+                gen_kwargs["image"] = init_image
+            else:
+                print(f"CivitAI FLUX.2 Klein generating: '{prompt[:50]}...'")
+                gen_kwargs["height"] = height
+                gen_kwargs["width"] = width
+
+            return gen_kwargs
+
         gen_kwargs: dict[str, Any] = {
             "num_inference_steps": steps,
             "guidance_scale": guidance_scale,

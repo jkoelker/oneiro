@@ -351,6 +351,10 @@ class TestIsEmbeddingCompatible:
     def test_flux2_compatible(self):
         """Flux.2 embeddings compatible with flux2 pipeline."""
         assert is_resource_compatible("flux2", "Flux.2")
+        assert is_resource_compatible("flux2-klein", "Flux.2 Klein 9B")
+        assert is_resource_compatible("flux2-klein", "FLUX.2-klein-4B")
+        assert not is_resource_compatible("flux2", "Flux.2 Klein 9B")
+        assert not is_resource_compatible("flux2-klein", "Flux.2")
 
     def test_flux1_flux2_incompatible(self):
         """Flux.1 and Flux.2 embeddings are NOT cross-compatible."""
@@ -406,7 +410,7 @@ class TestPipelineBaseModelMap:
 
     def test_all_pipeline_types_have_mappings(self):
         """All common pipeline types have base model mappings."""
-        expected_types = ["flux2", "zimage", "qwen", "sdxl", "sd15"]
+        expected_types = ["flux2", "flux2-klein", "zimage", "qwen", "sdxl", "sd15"]
         for pipeline_type in expected_types:
             assert pipeline_type in PIPELINE_BASE_MODEL_MAP
             assert len(PIPELINE_BASE_MODEL_MAP[pipeline_type]) > 0
