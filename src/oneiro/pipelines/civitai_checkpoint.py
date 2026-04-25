@@ -453,6 +453,7 @@ DEFAULT_FLUX2_KLEIN_COMPONENT_REPO = "black-forest-labs/FLUX.2-klein-9B"
 DEFAULT_FLUX2_KLEIN_BASE_COMPONENT_REPO = "black-forest-labs/FLUX.2-klein-base-9B"
 DEFAULT_FLUX2_KLEIN_4B_COMPONENT_REPO = "black-forest-labs/FLUX.2-klein-4B"
 DEFAULT_FLUX2_KLEIN_4B_BASE_COMPONENT_REPO = "black-forest-labs/FLUX.2-klein-base-4B"
+COMFY_DIFFUSION_MODEL_PREFIX = "model.diffusion_model."
 
 # Default fallback configuration
 DEFAULT_PIPELINE_CONFIG = PipelineConfig(
@@ -856,8 +857,9 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
         transformer_subfolder = model_config.get("transformer_subfolder", "transformer")
 
         print(f"  Loading FLUX.2 Klein transformer from {checkpoint_path}")
+        checkpoint = self._load_flux2_transformer_checkpoint(checkpoint_path)
         transformer = Flux2Transformer2DModel.from_single_file(
-            str(checkpoint_path),
+            checkpoint,
             torch_dtype=self.policy.dtype,
             config=transformer_config,
             subfolder=transformer_subfolder,
@@ -869,6 +871,30 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
             transformer=transformer,
             torch_dtype=self.policy.dtype,
         )
+
+    def _load_flux2_transformer_checkpoint(self, checkpoint_path: Path) -> dict[str, Any]:
+        """Load and normalize FLUX.2 transformer checkpoint keys for Diffusers.
+
+        CivitAI/ComfyUI FLUX.2 checkpoints commonly prefix transformer keys with
+        ``model.diffusion_model.``. Diffusers' FLUX.2 single-file converter
+        expects the original transformer keyspace to start at ``double_blocks``
+        / ``single_blocks``, so strip only that known wrapper prefix.
+        """
+        from safetensors.torch import load_file
+
+        checkpoint = load_file(checkpoint_path, device="cpu")
+        if not checkpoint:
+            return checkpoint
+
+        if not any(key.startswith(COMFY_DIFFUSION_MODEL_PREFIX) for key in checkpoint):
+            return checkpoint
+
+        normalized_checkpoint: dict[str, Any] = {}
+        for key, tensor in checkpoint.items():
+            normalized_key = key.removeprefix(COMFY_DIFFUSION_MODEL_PREFIX)
+            normalized_checkpoint[normalized_key] = tensor
+
+        return normalized_checkpoint
 
     def _default_flux2_component_repo(self) -> str:
         """Return the default FLUX.2 Klein repo for the detected CivitAI base model."""
