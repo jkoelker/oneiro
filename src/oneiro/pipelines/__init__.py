@@ -17,6 +17,7 @@ from oneiro.pipelines.civitai_checkpoint import (
 )
 from oneiro.pipelines.flux1 import Flux1PipelineWrapper
 from oneiro.pipelines.flux2 import Flux2PipelineWrapper
+from oneiro.pipelines.flux2_klein import Flux2KleinPipelineWrapper
 from oneiro.pipelines.lora import (
     LoraConfig,
     LoraIncompatibleError,
@@ -39,6 +40,7 @@ __all__ = [
     "PipelineManager",
     "Flux1PipelineWrapper",
     "Flux2PipelineWrapper",
+    "Flux2KleinPipelineWrapper",
     "QwenPipelineWrapper",
     "ZImagePipelineWrapper",
     "CivitaiCheckpointPipeline",
@@ -64,6 +66,7 @@ class PipelineManager:
         "zimage": ZImagePipelineWrapper,
         "flux1": Flux1PipelineWrapper,
         "flux2": Flux2PipelineWrapper,
+        "flux2-klein": Flux2KleinPipelineWrapper,
         "qwen": QwenPipelineWrapper,
         "civitai": CivitaiCheckpointPipeline,
     }

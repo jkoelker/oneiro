@@ -11,6 +11,7 @@ from PIL import Image
 from oneiro.device import DevicePolicy, OffloadMode, OffloadType
 from oneiro.pipelines import PipelineManager
 from oneiro.pipelines.base import BasePipeline, GenerationResult
+from oneiro.pipelines.flux2_klein import Flux2KleinPipelineWrapper
 from oneiro.pipelines.lora import LoraConfig, LoraSource
 
 
@@ -112,6 +113,14 @@ class TestBasePipelineInit:
         with patch.object(DevicePolicy, "auto_detect", return_value=mock_policy):
             pipeline = ConcretePipeline()
         assert pipeline.policy.device == "cpu"
+
+
+class TestPipelineManagerRegistry:
+    """Tests for pipeline manager registration."""
+
+    def test_registers_flux2_klein_pipeline_type(self):
+        """PipelineManager exposes the dedicated FLUX.2 Klein wrapper."""
+        assert PipelineManager.PIPELINE_TYPES["flux2-klein"] is Flux2KleinPipelineWrapper
 
 
 class TestBasePipelineUnload:

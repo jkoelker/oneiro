@@ -582,7 +582,11 @@ class TestIsLoraCompatible:
         assert is_resource_compatible("flux1", "Flux.1 Schnell")
         assert is_resource_compatible("flux1", "Flux.1 D")
         assert is_resource_compatible("flux2", "Flux.2")
+        assert is_resource_compatible("flux2-klein", "Flux.2 Klein 9B")
+        assert is_resource_compatible("flux2-klein", "FLUX.2-klein-4B")
         assert not is_resource_compatible("flux2", "Flux.1 Dev")
+        assert not is_resource_compatible("flux2", "Flux.2 Klein 9B")
+        assert not is_resource_compatible("flux2-klein", "Flux.2")
 
     def test_sdxl_compatible(self):
         """SDXL LoRAs compatible with sdxl pipeline."""
@@ -633,7 +637,7 @@ class TestPipelineBaseModelMap:
 
     def test_all_pipeline_types_have_mappings(self):
         """All common pipeline types have base model mappings."""
-        expected_types = ["flux2", "zimage", "qwen", "sdxl", "sd15"]
+        expected_types = ["flux2", "flux2-klein", "zimage", "qwen", "sdxl", "sd15"]
         for pipeline_type in expected_types:
             assert pipeline_type in PIPELINE_BASE_MODEL_MAP
             assert len(PIPELINE_BASE_MODEL_MAP[pipeline_type]) > 0

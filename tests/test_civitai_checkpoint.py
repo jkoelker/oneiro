@@ -1521,6 +1521,40 @@ class TestCivitaiCheckpointPipelineGenerate:
         assert "width" not in call_kwargs
         assert "height" not in call_kwargs
 
+    def test_generate_flux2_klein_img2img_omits_strength(self):
+        """Flux2 Klein accepts image input but not img2img strength."""
+        pipeline = CivitaiCheckpointPipeline()
+        pipeline._pipeline_config = PipelineConfig(
+            pipeline_class="Flux2KleinPipeline",
+            supports_negative_prompt=False,
+            default_steps=4,
+            default_guidance_scale=1.0,
+        )
+
+        mock_pipe = MagicMock()
+        mock_image = MagicMock()
+        mock_image.width = 1024
+        mock_image.height = 1024
+        mock_pipe.return_value.images = [mock_image]
+        pipeline.pipe = mock_pipe
+
+        mock_init_image = MagicMock()
+        with (
+            patch.object(DevicePolicy, "clear_cache"),
+            patch.object(pipeline, "_load_init_image", return_value=mock_init_image),
+        ):
+            pipeline.generate("test prompt", init_image=b"dummy", strength=0.5)
+
+        call_kwargs = mock_pipe.call_args.kwargs
+        assert call_kwargs["prompt"] == "test prompt"
+        assert call_kwargs["image"] == mock_init_image
+        assert call_kwargs["num_inference_steps"] == 4
+        assert call_kwargs["guidance_scale"] == 1.0
+        assert "strength" not in call_kwargs
+        assert "negative_prompt" not in call_kwargs
+        assert "width" not in call_kwargs
+        assert "height" not in call_kwargs
+
     def test_generate_with_scheduler_override(self):
         pipeline = CivitaiCheckpointPipeline()
         pipeline._pipeline_config = PipelineConfig(

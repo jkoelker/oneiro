@@ -456,10 +456,11 @@ def parse_loras_from_config(
 
 
 # Pipeline type to Civitai base model mapping
-# FLUX.1 and FLUX.2 are NOT LoRA-compatible due to different transformer architectures
+# FLUX.1, FLUX.2, and FLUX.2 Klein use distinct transformer families.
 PIPELINE_BASE_MODEL_MAP: dict[str, list[str]] = {
     "flux1": ["Flux.1 D", "Flux.1 S", "Flux.1", "Flux.1 Dev", "Flux.1 Schnell"],
     "flux2": ["Flux.2"],
+    "flux2-klein": ["Flux.2 Klein", "FLUX.2-klein"],
     "zimage": ["ZImageTurbo", "ZImageBase", "Z-Image"],
     "qwen": ["Qwen", "Qwen-Image"],
     "sdxl": ["SDXL 1.0", "SDXL Turbo", "SDXL Lightning", "Pony", "Illustrious"],
@@ -487,8 +488,13 @@ def is_resource_compatible(pipeline_type: str, civitai_base_model: str | None) -
         # Unknown pipeline type, assume compatible
         return True
 
-    # Check if any compatible base model matches (case-insensitive substring)
     civitai_lower = civitai_base_model.lower()
+    if pipeline_type == "flux2":
+        return "flux.2" in civitai_lower and "klein" not in civitai_lower
+    if pipeline_type == "flux2-klein":
+        return ("flux.2" in civitai_lower or "flux2" in civitai_lower) and "klein" in civitai_lower
+
+    # Check if any compatible base model matches (case-insensitive substring)
     for base in compatible_bases:
         if base.lower() in civitai_lower or civitai_lower in base.lower():
             return True
