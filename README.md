@@ -59,6 +59,7 @@ Config uses layered TOML with hot-reload:
 | `prompt` | Text prompt for generation (required) |
 | `negative_prompt` | What to avoid in the image |
 | `image` | Reference image for img2img |
+| `mask` | Mask image for supported inpaint models (white = repaint, black = keep) |
 | `strength` | img2img strength (0.0-1.0, higher = more change) |
 | `width` | Image width (512, 768, 1024) |
 | `height` | Image height (512, 768, 1024) |

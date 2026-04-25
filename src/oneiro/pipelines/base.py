@@ -9,9 +9,11 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 
 from oneiro.device import DevicePolicy
+
+MAX_INPUT_IMAGE_PIXELS = 4096 * 4096
 
 
 @dataclass
@@ -30,6 +32,8 @@ class GenerationResult:
 
 class BasePipeline(ABC):
     """Base class for all pipeline types."""
+
+    supports_inpaint: bool = False
 
     def __init__(self) -> None:
         super().__init__()
@@ -66,8 +70,12 @@ class BasePipeline(ABC):
         self.pre_generate(**kwargs)
         try:
             actual_seed, generator = self._prepare_seed(seed)
-            # Pop init_image and strength from kwargs to avoid passing twice
+            # Pop image inputs and strength from kwargs to avoid passing twice
             init_image = self._load_init_image(kwargs.pop("init_image", None))
+            mask_image_bytes = kwargs.pop("mask_image", None)
+            if mask_image_bytes is not None and not self.supports_inpaint:
+                raise ValueError("This pipeline does not support inpainting masks")
+            mask_image = self._load_init_image(mask_image_bytes)
             strength = kwargs.pop("strength", 0.75)
 
             gen_kwargs = self.build_generation_kwargs(
@@ -80,6 +88,7 @@ class BasePipeline(ABC):
                 generator=generator,
                 init_image=init_image,
                 strength=strength,
+                mask_image=mask_image,
                 **kwargs,
             )
             is_img2img = init_image is not None
@@ -190,8 +199,8 @@ class BasePipeline(ABC):
         Subclasses should call super().post_generate(**kwargs) first, then perform
         any additional cleanup (e.g., LoRA restore).
 
-        Note: The kwargs passed here have already had 'init_image' and 'strength'
-        removed by generate(). If a subclass needs access to these values,
+        Note: The kwargs passed here have already had 'init_image', 'mask_image',
+        and 'strength' removed by generate(). If a subclass needs access to these values,
         it should save them in pre_generate() before they are consumed.
         """
         self._reset_model_state()
@@ -233,7 +242,17 @@ class BasePipeline(ABC):
         """Load init_image from bytes if provided."""
         if init_image is None:
             return None
-        return Image.open(io.BytesIO(init_image)).convert("RGB")
+        try:
+            image = Image.open(io.BytesIO(init_image))
+            width, height = image.size
+            if width * height > MAX_INPUT_IMAGE_PIXELS:
+                raise ValueError(
+                    f"Input image is too large ({width}×{height}); "
+                    "maximum supported size is 4096×4096"
+                )
+            return image.convert("RGB")
+        except (Image.DecompressionBombError, UnidentifiedImageError, OSError) as e:
+            raise ValueError("Invalid image attachment; upload a valid image file") from e
 
     def _configure_cpu_threads(self, utilization: float = 0.75) -> int:
         """Configure PyTorch CPU threading for optimal performance.

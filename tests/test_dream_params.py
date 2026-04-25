@@ -4,12 +4,53 @@ Tests for issue #51: Exposing steps and guidance_scale parameters in /dream comm
 and setting model defaults via /model command.
 """
 
+from types import SimpleNamespace
+
+from oneiro.discord.commands import MAX_DREAM_ATTACHMENT_BYTES, validate_image_attachment
 from oneiro.services.generation import (
     MAX_GUIDANCE_SCALE,
     MAX_STEPS,
     MIN_GUIDANCE_SCALE,
     MIN_STEPS,
 )
+
+
+class TestDreamAttachmentValidation:
+    """Tests for /dream image attachment validation."""
+
+    def test_accepts_image_content_type(self):
+        """Image attachments with valid content types are accepted."""
+        attachment = SimpleNamespace(size=1024, filename="upload.bin", content_type="image/png")
+
+        assert validate_image_attachment(attachment, "image") is None
+
+    def test_accepts_image_extension_without_content_type(self):
+        """Image attachments can fall back to filename extension."""
+        attachment = SimpleNamespace(size=1024, filename="mask.webp", content_type=None)
+
+        assert validate_image_attachment(attachment, "mask") is None
+
+    def test_rejects_large_attachment(self):
+        """Oversized attachments are rejected before reading bytes."""
+        attachment = SimpleNamespace(
+            size=MAX_DREAM_ATTACHMENT_BYTES + 1,
+            filename="image.png",
+            content_type="image/png",
+        )
+
+        error = validate_image_attachment(attachment, "image")
+
+        assert error is not None
+        assert "MiB or smaller" in error
+
+    def test_rejects_non_image_attachment(self):
+        """Non-image attachments are rejected."""
+        attachment = SimpleNamespace(size=1024, filename="notes.txt", content_type="text/plain")
+
+        error = validate_image_attachment(attachment, "mask")
+
+        assert error is not None
+        assert "PNG, JPEG, or WebP" in error
 
 
 class TestDreamParamValidation:

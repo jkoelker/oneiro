@@ -14,12 +14,17 @@ from oneiro.pipelines.lora import LoraLoaderMixin, parse_loras_from_model_config
 class ZImagePipelineWrapper(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipeline):
     """Wrapper for Z-Image-Turbo pipeline with multi-LoRA and embedding support."""
 
+    supports_inpaint = True
+
     def __init__(self) -> None:
         super().__init__()
+        self.img2img_pipe: Any = None
+        self.inpaint_pipe: Any = None
+        self._active_pipe: Any = None
 
     def load(self, model_config: dict[str, Any], full_config: dict[str, Any] | None = None) -> None:
         """Load Z-Image-Turbo model."""
-        from diffusers import ZImagePipeline
+        from diffusers import ZImageImg2ImgPipeline, ZImageInpaintPipeline, ZImagePipeline
 
         repo = model_config.get("repo", "Tongyi-MAI/Z-Image-Turbo")
         cpu_offload = model_config.get("cpu_offload", True)
@@ -32,6 +37,9 @@ class ZImagePipelineWrapper(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipeline)
             repo,
             torch_dtype=self.policy.dtype,
         )
+        self.img2img_pipe = ZImageImg2ImgPipeline(**self.pipe.components)
+        self.inpaint_pipe = ZImageInpaintPipeline(**self.pipe.components)
+        self._active_pipe = self.pipe
 
         self.policy.apply_to_pipeline(self.pipe)
 
@@ -64,9 +72,17 @@ class ZImagePipelineWrapper(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipeline)
         **kwargs: Any,
     ) -> dict[str, Any]:
         """Build Z-Image generation kwargs. Forces guidance_scale=0.0 for Turbo."""
+        mask_image = kwargs.pop("mask_image", None)
+        if mask_image is not None and init_image is None:
+            raise ValueError("Z-Image inpainting requires both image and mask_image")
+
         if init_image:
-            print(f"Z-Image img2img: '{prompt[:50]}...' strength={strength}")
-            return {
+            if mask_image is not None:
+                print(f"Z-Image inpaint: '{prompt[:50]}...' strength={strength}")
+            else:
+                print(f"Z-Image img2img: '{prompt[:50]}...' strength={strength}")
+
+            gen_kwargs = {
                 "prompt": prompt,
                 "negative_prompt": negative_prompt,
                 "image": init_image,
@@ -75,6 +91,9 @@ class ZImagePipelineWrapper(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipeline)
                 "guidance_scale": 0.0,  # Always 0.0 for Turbo
                 "generator": generator,
             }
+            if mask_image is not None:
+                gen_kwargs["mask_image"] = mask_image
+            return gen_kwargs
         else:
             print(f"Z-Image generating: '{prompt[:50]}...'")
             return {
@@ -86,6 +105,23 @@ class ZImagePipelineWrapper(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipeline)
                 "guidance_scale": 0.0,  # Always 0.0 for Turbo
                 "generator": generator,
             }
+
+    def run_inference(self, gen_kwargs: dict[str, Any], is_img2img: bool) -> Any:
+        """Run the correct Z-Image pipeline for text, image, or inpaint generation."""
+        if "mask_image" in gen_kwargs:
+            if self.inpaint_pipe is None:
+                raise RuntimeError("Z-Image inpaint pipeline not loaded")
+            self._active_pipe = self.inpaint_pipe
+            return self._active_pipe(**gen_kwargs)
+
+        if is_img2img:
+            if self.img2img_pipe is None:
+                raise RuntimeError("Z-Image img2img pipeline not loaded")
+            self._active_pipe = self.img2img_pipe
+            return self._active_pipe(**gen_kwargs)
+
+        self._active_pipe = self.pipe
+        return super().run_inference(gen_kwargs, is_img2img)
 
     def build_result(
         self,
@@ -113,3 +149,16 @@ class ZImagePipelineWrapper(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipeline)
         """Reset LoRA state after generation to prevent state leakage."""
         super().post_generate(**kwargs)
         self.restore_static_loras()
+
+    def _reset_model_state(self) -> None:
+        """Reset hooks on the Z-Image pipeline variant used for this generation."""
+        if self._active_pipe is None:
+            return
+        self._active_pipe.maybe_free_model_hooks()
+
+    def unload(self) -> None:
+        """Free all Z-Image pipeline wrappers and shared components."""
+        self._active_pipe = None
+        self.img2img_pipe = None
+        self.inpaint_pipe = None
+        super().unload()

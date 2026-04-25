@@ -10,6 +10,27 @@ from oneiro.device import DevicePolicy, OffloadMode
 from oneiro.pipelines.zimage import ZImagePipelineWrapper
 
 
+def make_image_bytes(color: str = "red") -> bytes:
+    """Create PNG image bytes for generation tests."""
+    import io
+
+    image = Image.new("RGB", (512, 512), color=color)
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+def make_zimage_components() -> dict[str, MagicMock]:
+    """Create mock Z-Image components shared across pipeline variants."""
+    return {
+        "scheduler": MagicMock(),
+        "vae": MagicMock(),
+        "text_encoder": MagicMock(),
+        "tokenizer": MagicMock(),
+        "transformer": MagicMock(),
+    }
+
+
 class TestZImagePipelineWrapperInit:
     """Tests for ZImagePipelineWrapper initialization."""
 
@@ -25,10 +46,15 @@ class TestZImagePipelineWrapperInit:
 class TestZImagePipelineWrapperLoad:
     """Tests for ZImagePipelineWrapper.load()."""
 
+    @patch("diffusers.ZImageInpaintPipeline")
+    @patch("diffusers.ZImageImg2ImgPipeline")
     @patch("diffusers.ZImagePipeline")
-    def test_load_with_default_repo(self, mock_zimage_pipeline):
+    def test_load_with_default_repo(
+        self, mock_zimage_pipeline, mock_img2img_pipeline, mock_inpaint_pipeline
+    ):
         """Load uses default repo when not specified."""
         mock_pipe = MagicMock()
+        mock_pipe.components = make_zimage_components()
         mock_zimage_pipeline.from_pretrained.return_value = mock_pipe
 
         pipeline = ZImagePipelineWrapper()
@@ -37,11 +63,18 @@ class TestZImagePipelineWrapperLoad:
         mock_zimage_pipeline.from_pretrained.assert_called_once()
         call_args = mock_zimage_pipeline.from_pretrained.call_args
         assert call_args[0][0] == "Tongyi-MAI/Z-Image-Turbo"
+        mock_img2img_pipeline.assert_called_once_with(**mock_pipe.components)
+        mock_inpaint_pipeline.assert_called_once_with(**mock_pipe.components)
 
+    @patch("diffusers.ZImageInpaintPipeline")
+    @patch("diffusers.ZImageImg2ImgPipeline")
     @patch("diffusers.ZImagePipeline")
-    def test_load_with_custom_repo(self, mock_zimage_pipeline):
+    def test_load_with_custom_repo(
+        self, mock_zimage_pipeline, mock_img2img_pipeline, mock_inpaint_pipeline
+    ):
         """Load uses custom repo from config."""
         mock_pipe = MagicMock()
+        mock_pipe.components = make_zimage_components()
         mock_zimage_pipeline.from_pretrained.return_value = mock_pipe
 
         pipeline = ZImagePipelineWrapper()
@@ -49,11 +82,18 @@ class TestZImagePipelineWrapperLoad:
 
         call_args = mock_zimage_pipeline.from_pretrained.call_args
         assert call_args[0][0] == "custom/z-image"
+        mock_img2img_pipeline.assert_called_once_with(**mock_pipe.components)
+        mock_inpaint_pipeline.assert_called_once_with(**mock_pipe.components)
 
+    @patch("diffusers.ZImageInpaintPipeline")
+    @patch("diffusers.ZImageImg2ImgPipeline")
     @patch("diffusers.ZImagePipeline")
-    def test_load_enables_cpu_offload_on_cuda(self, mock_zimage_pipeline):
+    def test_load_enables_cpu_offload_on_cuda(
+        self, mock_zimage_pipeline, mock_img2img_pipeline, mock_inpaint_pipeline
+    ):
         """Load enables CPU offload on CUDA by default."""
         mock_pipe = MagicMock()
+        mock_pipe.components = make_zimage_components()
         mock_zimage_pipeline.from_pretrained.return_value = mock_pipe
 
         # Mock CUDA being available
@@ -63,17 +103,26 @@ class TestZImagePipelineWrapperLoad:
             pipeline.load({})
 
         mock_pipe.enable_model_cpu_offload.assert_called_once()
+        mock_img2img_pipeline.assert_called_once_with(**mock_pipe.components)
+        mock_inpaint_pipeline.assert_called_once_with(**mock_pipe.components)
 
+    @patch("diffusers.ZImageInpaintPipeline")
+    @patch("diffusers.ZImageImg2ImgPipeline")
     @patch("diffusers.ZImagePipeline")
-    def test_load_disables_cpu_offload_when_configured(self, mock_zimage_pipeline):
+    def test_load_disables_cpu_offload_when_configured(
+        self, mock_zimage_pipeline, mock_img2img_pipeline, mock_inpaint_pipeline
+    ):
         """Load respects cpu_offload=False config."""
         mock_pipe = MagicMock()
+        mock_pipe.components = make_zimage_components()
         mock_zimage_pipeline.from_pretrained.return_value = mock_pipe
 
         pipeline = ZImagePipelineWrapper()
         pipeline.load({"cpu_offload": False})
 
         mock_pipe.enable_model_cpu_offload.assert_not_called()
+        mock_img2img_pipeline.assert_called_once_with(**mock_pipe.components)
+        mock_inpaint_pipeline.assert_called_once_with(**mock_pipe.components)
 
 
 class TestZImagePipelineWrapperGenerate:
@@ -199,25 +248,22 @@ class TestZImagePipelineWrapperImg2Img:
 
     def test_generate_with_init_image(self):
         """Generate supports img2img with init_image."""
-        import io
-
         mock_policy = DevicePolicy(device="cpu", dtype=torch.float32, offload=OffloadMode.NEVER)
         with patch.object(DevicePolicy, "auto_detect", return_value=mock_policy):
             pipeline = ZImagePipelineWrapper()
             mock_pipe = MagicMock()
+            mock_img2img_pipe = MagicMock()
             mock_output = Image.new("RGB", (1024, 1024))
-            mock_pipe.return_value.images = [mock_output]
+            mock_img2img_pipe.return_value.images = [mock_output]
             pipeline.pipe = mock_pipe
-
-            # Create init image bytes
-            init_img = Image.new("RGB", (512, 512), color="red")
-            buffer = io.BytesIO()
-            init_img.save(buffer, format="PNG")
-            init_bytes = buffer.getvalue()
+            pipeline.img2img_pipe = mock_img2img_pipe
+            init_bytes = make_image_bytes()
 
             result = pipeline.generate("test prompt", seed=42, init_image=init_bytes)
 
-            call_kwargs = mock_pipe.call_args[1]
+            mock_pipe.assert_not_called()
+            mock_img2img_pipe.assert_called_once()
+            call_kwargs = mock_img2img_pipe.call_args[1]
             assert "image" in call_kwargs
             assert call_kwargs["strength"] == 0.75  # default strength
             assert call_kwargs["guidance_scale"] == 0.0  # still forced to 0.0
@@ -225,26 +271,65 @@ class TestZImagePipelineWrapperImg2Img:
 
     def test_generate_with_custom_strength(self):
         """Generate respects custom strength for img2img."""
-        import io
-
         mock_policy = DevicePolicy(device="cpu", dtype=torch.float32, offload=OffloadMode.NEVER)
         with patch.object(DevicePolicy, "auto_detect", return_value=mock_policy):
             pipeline = ZImagePipelineWrapper()
             mock_pipe = MagicMock()
+            mock_img2img_pipe = MagicMock()
             mock_output = Image.new("RGB", (1024, 1024))
-            mock_pipe.return_value.images = [mock_output]
+            mock_img2img_pipe.return_value.images = [mock_output]
             pipeline.pipe = mock_pipe
-
-            # Create init image bytes
-            init_img = Image.new("RGB", (512, 512), color="red")
-            buffer = io.BytesIO()
-            init_img.save(buffer, format="PNG")
-            init_bytes = buffer.getvalue()
+            pipeline.img2img_pipe = mock_img2img_pipe
+            init_bytes = make_image_bytes()
 
             pipeline.generate("test prompt", seed=42, init_image=init_bytes, strength=0.5)
 
-            call_kwargs = mock_pipe.call_args[1]
+            mock_pipe.assert_not_called()
+            call_kwargs = mock_img2img_pipe.call_args[1]
             assert call_kwargs["strength"] == 0.5
+
+    def test_generate_with_mask_uses_inpaint_pipeline(self):
+        """Generate supports inpainting with init_image and mask_image."""
+        mock_policy = DevicePolicy(device="cpu", dtype=torch.float32, offload=OffloadMode.NEVER)
+        with patch.object(DevicePolicy, "auto_detect", return_value=mock_policy):
+            pipeline = ZImagePipelineWrapper()
+            mock_pipe = MagicMock()
+            mock_img2img_pipe = MagicMock()
+            mock_inpaint_pipe = MagicMock()
+            mock_output = Image.new("RGB", (1024, 1024))
+            mock_inpaint_pipe.return_value.images = [mock_output]
+            pipeline.pipe = mock_pipe
+            pipeline.img2img_pipe = mock_img2img_pipe
+            pipeline.inpaint_pipe = mock_inpaint_pipe
+
+            result = pipeline.generate(
+                "test prompt",
+                seed=42,
+                init_image=make_image_bytes("red"),
+                mask_image=make_image_bytes("white"),
+                strength=0.4,
+            )
+
+            mock_pipe.assert_not_called()
+            mock_img2img_pipe.assert_not_called()
+            mock_inpaint_pipe.assert_called_once()
+            call_kwargs = mock_inpaint_pipe.call_args[1]
+            assert "image" in call_kwargs
+            assert "mask_image" in call_kwargs
+            assert call_kwargs["strength"] == 0.4
+            assert call_kwargs["guidance_scale"] == 0.0
+            assert result.prompt == "test prompt"
+
+    def test_generate_with_mask_without_init_image_raises(self):
+        """Inpainting requires both init_image and mask_image."""
+        mock_policy = DevicePolicy(device="cpu", dtype=torch.float32, offload=OffloadMode.NEVER)
+        with patch.object(DevicePolicy, "auto_detect", return_value=mock_policy):
+            pipeline = ZImagePipelineWrapper()
+            pipeline.pipe = MagicMock()
+            pipeline.inpaint_pipe = MagicMock()
+
+            with pytest.raises(ValueError, match="requires both image and mask_image"):
+                pipeline.generate("test prompt", seed=42, mask_image=make_image_bytes("white"))
 
 
 class TestZImagePipelineWrapperPostGenerate:

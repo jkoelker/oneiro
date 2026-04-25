@@ -30,6 +30,7 @@ class DreamContext:
     lora_configs: list[LoraConfig]
     auto_detected_loras: list[tuple[str, str]]
     is_img2img: bool
+    is_inpaint: bool
     strength: float
     pipeline_manager: "PipelineManager"
     start_time: float = field(default_factory=time.time)
@@ -85,10 +86,8 @@ def create_dream_callbacks(
         image_buffer = context.pipeline_manager.image_to_bytes(result.image)
         file = discord.File(image_buffer, filename="dream.png")
 
-        embed = discord.Embed(
-            title="🎨 Dream Generated" + (" (img2img)" if context.is_img2img else ""),
-            color=discord.Color.purple(),
-        )
+        mode = " (inpaint)" if context.is_inpaint else " (img2img)" if context.is_img2img else ""
+        embed = discord.Embed(title="🎨 Dream Generated" + mode, color=discord.Color.purple())
         embed.add_field(name="Prompt", value=context.prompt[:1024], inline=False)
         if context.negative_prompt:
             embed.add_field(
