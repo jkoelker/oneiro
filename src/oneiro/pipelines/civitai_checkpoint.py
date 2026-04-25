@@ -729,7 +729,7 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
 
         # Load from single file. Some architectures publish single-file checkpoints
         # without every pipeline component; preload those components when needed.
-        single_file_kwargs = self._build_single_file_kwargs(model_config)
+        single_file_kwargs = self._build_single_file_kwargs(checkpoint_path, model_config)
         self.pipe = self._load_pipeline_from_single_file(
             pipeline_class,
             checkpoint_path,
@@ -1019,7 +1019,11 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
             "CLIPTextModel" in message or "CLIPTextModelWithProjection" in message
         )
 
-    def _build_single_file_kwargs(self, model_config: dict[str, Any]) -> dict[str, Any]:
+    def _build_single_file_kwargs(
+        self,
+        checkpoint_path: Path,
+        model_config: dict[str, Any],
+    ) -> dict[str, Any]:
         """Build keyword arguments for diffusers ``from_single_file`` loading.
 
         Z-Image checkpoints commonly store the transformer weights in the single
@@ -1029,6 +1033,7 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
         checkpoint.
 
         Args:
+            checkpoint_path: Path to the checkpoint being loaded.
             model_config: Model configuration from TOML/state.
 
         Returns:
@@ -1042,7 +1047,7 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
         ):
             return kwargs
 
-        kwargs.update(self._load_zimage_components(model_config))
+        kwargs.update(self._load_zimage_components(checkpoint_path, model_config))
         return kwargs
 
     def _load_sdxl_text_components(self, model_config: dict[str, Any]) -> dict[str, Any]:
@@ -1102,7 +1107,11 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
             "tokenizer_2": tokenizer_2,
         }
 
-    def _load_zimage_components(self, model_config: dict[str, Any]) -> dict[str, Any]:
+    def _load_zimage_components(
+        self,
+        checkpoint_path: Path,
+        model_config: dict[str, Any],
+    ) -> dict[str, Any]:
         """Load Z-Image components that are not stored in single-file checkpoints."""
         from diffusers import AutoencoderKL
         from transformers import AutoTokenizer, Qwen3Model
@@ -1127,7 +1136,7 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
         text_encoder = Qwen3Model.from_pretrained(
             text_encoder_repo,
             subfolder=text_encoder_subfolder,
-            torch_dtype=self.policy.dtype,
+            dtype=self.policy.dtype,
         )
 
         print(f"  Loading Z-Image tokenizer from {tokenizer_repo}/{tokenizer_subfolder}")
@@ -1136,6 +1145,12 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
             subfolder=tokenizer_subfolder,
         )
 
+        components = {"text_encoder": text_encoder, "tokenizer": tokenizer}
+
+        if self._checkpoint_has_component(checkpoint_path, "vae"):
+            print("  Z-Image checkpoint includes VAE weights; using checkpoint VAE")
+            return components
+
         print(f"  Loading Z-Image VAE from {vae_repo}/{vae_subfolder}")
         vae = AutoencoderKL.from_pretrained(
             vae_repo,
@@ -1143,7 +1158,20 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
             torch_dtype=self.policy.dtype,
         )
 
-        return {"text_encoder": text_encoder, "tokenizer": tokenizer, "vae": vae}
+        components["vae"] = vae
+        return components
+
+    @staticmethod
+    def _checkpoint_has_component(checkpoint_path: Path, component: str) -> bool:
+        """Return whether a safetensors checkpoint includes component-prefixed keys."""
+        if checkpoint_path.suffix != ".safetensors":
+            return False
+
+        from safetensors import safe_open
+
+        prefix = f"{component}."
+        with safe_open(checkpoint_path, framework="pt", device="cpu") as checkpoint:
+            return any(key.startswith(prefix) for key in checkpoint.keys())
 
     def configure_scheduler(self, scheduler_name: str | None) -> None:
         if self.pipe is None or self._pipeline_config is None:
