@@ -5,6 +5,7 @@ diffusers' from_single_file() method. Automatically detects the appropriate
 pipeline class based on CivitAI's baseModel metadata.
 """
 
+import math
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -67,6 +68,13 @@ class CivitaiBaseModel(StrEnum):
     FLUX_1_S = "Flux.1 S"
     FLUX_1_DEV = "Flux.1 Dev"
     FLUX_1_SCHNELL = "Flux.1 Schnell"
+    FLUX_2_KLEIN_9B = "Flux.2 Klein 9B"
+    FLUX_2_KLEIN_9B_BASE = "Flux.2 Klein 9B-base"
+    FLUX_2_KLEIN_4B = "Flux.2 Klein 4B"
+    FLUX_2_KLEIN_4B_BASE = "Flux.2 Klein 4B-base"
+
+    # Qwen
+    QWEN = "Qwen"
 
     # SD 3.x
     SD_3 = "SD 3"
@@ -108,7 +116,7 @@ class PipelineConfig:
 # Using partial string matching to handle variations
 CIVITAI_BASE_MODEL_PIPELINE_MAP: dict[str, PipelineConfig] = {
     # SD 1.x family
-    "SD 1.4": PipelineConfig(
+    CivitaiBaseModel.SD_1_4: PipelineConfig(
         pipeline_class="StableDiffusionPipeline",
         default_steps=20,
         default_guidance_scale=7.5,
@@ -116,7 +124,7 @@ CIVITAI_BASE_MODEL_PIPELINE_MAP: dict[str, PipelineConfig] = {
         default_height=512,
         default_scheduler="dpm++_karras",
     ),
-    "SD 1.5": PipelineConfig(
+    CivitaiBaseModel.SD_1_5: PipelineConfig(
         pipeline_class="StableDiffusionPipeline",
         default_steps=20,
         default_guidance_scale=7.5,
@@ -124,7 +132,7 @@ CIVITAI_BASE_MODEL_PIPELINE_MAP: dict[str, PipelineConfig] = {
         default_height=512,
         default_scheduler="dpm++_karras",
     ),
-    "SD 1.5 LCM": PipelineConfig(
+    CivitaiBaseModel.SD_1_5_LCM: PipelineConfig(
         pipeline_class="StableDiffusionPipeline",
         default_steps=4,
         default_guidance_scale=1.0,
@@ -132,7 +140,7 @@ CIVITAI_BASE_MODEL_PIPELINE_MAP: dict[str, PipelineConfig] = {
         default_height=512,
         default_scheduler="default",
     ),
-    "SD 1.5 Hyper": PipelineConfig(
+    CivitaiBaseModel.SD_1_5_HYPER: PipelineConfig(
         pipeline_class="StableDiffusionPipeline",
         default_steps=4,
         default_guidance_scale=1.0,
@@ -141,7 +149,7 @@ CIVITAI_BASE_MODEL_PIPELINE_MAP: dict[str, PipelineConfig] = {
         default_scheduler="default",
     ),
     # SD 2.x family
-    "SD 2.0": PipelineConfig(
+    CivitaiBaseModel.SD_2_0: PipelineConfig(
         pipeline_class="StableDiffusionPipeline",
         default_steps=20,
         default_guidance_scale=7.5,
@@ -149,7 +157,7 @@ CIVITAI_BASE_MODEL_PIPELINE_MAP: dict[str, PipelineConfig] = {
         default_height=768,
         default_scheduler="dpm++_karras",
     ),
-    "SD 2.1": PipelineConfig(
+    CivitaiBaseModel.SD_2_1: PipelineConfig(
         pipeline_class="StableDiffusionPipeline",
         default_steps=20,
         default_guidance_scale=7.5,
@@ -158,7 +166,7 @@ CIVITAI_BASE_MODEL_PIPELINE_MAP: dict[str, PipelineConfig] = {
         default_scheduler="dpm++_karras",
     ),
     # SDXL family
-    "SDXL 0.9": PipelineConfig(
+    CivitaiBaseModel.SDXL_0_9: PipelineConfig(
         pipeline_class="StableDiffusionXLPipeline",
         default_steps=25,
         default_guidance_scale=7.0,
@@ -166,7 +174,7 @@ CIVITAI_BASE_MODEL_PIPELINE_MAP: dict[str, PipelineConfig] = {
         default_height=1024,
         default_scheduler="dpm++_karras",
     ),
-    "SDXL 1.0": PipelineConfig(
+    CivitaiBaseModel.SDXL_1_0: PipelineConfig(
         pipeline_class="StableDiffusionXLPipeline",
         default_steps=25,
         default_guidance_scale=7.0,
@@ -174,7 +182,7 @@ CIVITAI_BASE_MODEL_PIPELINE_MAP: dict[str, PipelineConfig] = {
         default_height=1024,
         default_scheduler="dpm++_karras",
     ),
-    "SDXL 1.0 LCM": PipelineConfig(
+    CivitaiBaseModel.SDXL_1_0_LCM: PipelineConfig(
         pipeline_class="StableDiffusionXLPipeline",
         default_steps=4,
         default_guidance_scale=1.0,
@@ -182,7 +190,7 @@ CIVITAI_BASE_MODEL_PIPELINE_MAP: dict[str, PipelineConfig] = {
         default_height=1024,
         default_scheduler="default",
     ),
-    "SDXL Turbo": PipelineConfig(
+    CivitaiBaseModel.SDXL_TURBO: PipelineConfig(
         pipeline_class="StableDiffusionXLPipeline",
         default_steps=4,
         default_guidance_scale=0.0,
@@ -190,7 +198,7 @@ CIVITAI_BASE_MODEL_PIPELINE_MAP: dict[str, PipelineConfig] = {
         default_height=1024,
         default_scheduler="default",
     ),
-    "SDXL Lightning": PipelineConfig(
+    CivitaiBaseModel.SDXL_LIGHTNING: PipelineConfig(
         pipeline_class="StableDiffusionXLPipeline",
         default_steps=4,
         default_guidance_scale=0.0,
@@ -198,7 +206,7 @@ CIVITAI_BASE_MODEL_PIPELINE_MAP: dict[str, PipelineConfig] = {
         default_height=1024,
         default_scheduler="default",
     ),
-    "SDXL Hyper": PipelineConfig(
+    CivitaiBaseModel.SDXL_HYPER: PipelineConfig(
         pipeline_class="StableDiffusionXLPipeline",
         default_steps=4,
         default_guidance_scale=0.0,
@@ -207,7 +215,7 @@ CIVITAI_BASE_MODEL_PIPELINE_MAP: dict[str, PipelineConfig] = {
         default_scheduler="default",
     ),
     # Pony (SDXL-based)
-    "Pony": PipelineConfig(
+    CivitaiBaseModel.PONY: PipelineConfig(
         pipeline_class="StableDiffusionXLPipeline",
         default_steps=25,
         default_guidance_scale=7.0,
@@ -216,7 +224,7 @@ CIVITAI_BASE_MODEL_PIPELINE_MAP: dict[str, PipelineConfig] = {
         default_scheduler="dpm++_karras",
     ),
     # Illustrious (SDXL-based)
-    "Illustrious": PipelineConfig(
+    CivitaiBaseModel.ILLUSTRIOUS: PipelineConfig(
         pipeline_class="StableDiffusionXLPipeline",
         default_steps=25,
         default_guidance_scale=7.0,
@@ -225,7 +233,7 @@ CIVITAI_BASE_MODEL_PIPELINE_MAP: dict[str, PipelineConfig] = {
         default_scheduler="dpm++_karras",
     ),
     # Flux family (flow-based, incompatible with DPM schedulers)
-    "Flux.1 D": PipelineConfig(
+    CivitaiBaseModel.FLUX_1_D: PipelineConfig(
         pipeline_class="FluxPipeline",
         supports_negative_prompt=False,
         default_steps=28,
@@ -234,7 +242,7 @@ CIVITAI_BASE_MODEL_PIPELINE_MAP: dict[str, PipelineConfig] = {
         default_height=1024,
         default_scheduler="default",
     ),
-    "Flux.1 S": PipelineConfig(
+    CivitaiBaseModel.FLUX_1_S: PipelineConfig(
         pipeline_class="FluxPipeline",
         supports_negative_prompt=False,
         default_steps=4,
@@ -243,7 +251,7 @@ CIVITAI_BASE_MODEL_PIPELINE_MAP: dict[str, PipelineConfig] = {
         default_height=1024,
         default_scheduler="default",
     ),
-    "Flux.1 Dev": PipelineConfig(
+    CivitaiBaseModel.FLUX_1_DEV: PipelineConfig(
         pipeline_class="FluxPipeline",
         supports_negative_prompt=False,
         default_steps=28,
@@ -252,17 +260,53 @@ CIVITAI_BASE_MODEL_PIPELINE_MAP: dict[str, PipelineConfig] = {
         default_height=1024,
         default_scheduler="default",
     ),
-    "Flux.1 Schnell": PipelineConfig(
+    CivitaiBaseModel.FLUX_1_SCHNELL: PipelineConfig(
         pipeline_class="FluxPipeline",
         supports_negative_prompt=False,
         default_steps=4,
         default_guidance_scale=0.0,
+        default_width=1024,
+        default_height=1024,
+        default_scheduler="default",
+    ),
+    CivitaiBaseModel.FLUX_2_KLEIN_9B: PipelineConfig(
+        pipeline_class="Flux2KleinPipeline",
+        supports_negative_prompt=False,
+        default_steps=4,
+        default_guidance_scale=1.0,
+        default_width=1024,
+        default_height=1024,
+        default_scheduler="default",
+    ),
+    CivitaiBaseModel.FLUX_2_KLEIN_9B_BASE: PipelineConfig(
+        pipeline_class="Flux2KleinPipeline",
+        supports_negative_prompt=False,
+        default_steps=4,
+        default_guidance_scale=1.0,
+        default_width=1024,
+        default_height=1024,
+        default_scheduler="default",
+    ),
+    CivitaiBaseModel.FLUX_2_KLEIN_4B: PipelineConfig(
+        pipeline_class="Flux2KleinPipeline",
+        supports_negative_prompt=False,
+        default_steps=4,
+        default_guidance_scale=1.0,
+        default_width=1024,
+        default_height=1024,
+        default_scheduler="default",
+    ),
+    CivitaiBaseModel.FLUX_2_KLEIN_4B_BASE: PipelineConfig(
+        pipeline_class="Flux2KleinPipeline",
+        supports_negative_prompt=False,
+        default_steps=4,
+        default_guidance_scale=1.0,
         default_width=1024,
         default_height=1024,
         default_scheduler="default",
     ),
     # SD 3.x family (flow-based, incompatible with DPM schedulers)
-    "SD 3": PipelineConfig(
+    CivitaiBaseModel.SD_3: PipelineConfig(
         pipeline_class="StableDiffusion3Pipeline",
         default_steps=28,
         default_guidance_scale=7.0,
@@ -270,7 +314,7 @@ CIVITAI_BASE_MODEL_PIPELINE_MAP: dict[str, PipelineConfig] = {
         default_height=1024,
         default_scheduler="default",
     ),
-    "SD 3 Medium": PipelineConfig(
+    CivitaiBaseModel.SD_3_MEDIUM: PipelineConfig(
         pipeline_class="StableDiffusion3Pipeline",
         default_steps=28,
         default_guidance_scale=7.0,
@@ -278,7 +322,7 @@ CIVITAI_BASE_MODEL_PIPELINE_MAP: dict[str, PipelineConfig] = {
         default_height=1024,
         default_scheduler="default",
     ),
-    "SD 3.5": PipelineConfig(
+    CivitaiBaseModel.SD_3_5: PipelineConfig(
         pipeline_class="StableDiffusion3Pipeline",
         default_steps=28,
         default_guidance_scale=7.0,
@@ -286,7 +330,7 @@ CIVITAI_BASE_MODEL_PIPELINE_MAP: dict[str, PipelineConfig] = {
         default_height=1024,
         default_scheduler="default",
     ),
-    "SD 3.5 Medium": PipelineConfig(
+    CivitaiBaseModel.SD_3_5_MEDIUM: PipelineConfig(
         pipeline_class="StableDiffusion3Pipeline",
         default_steps=28,
         default_guidance_scale=4.5,
@@ -294,7 +338,7 @@ CIVITAI_BASE_MODEL_PIPELINE_MAP: dict[str, PipelineConfig] = {
         default_height=1024,
         default_scheduler="default",
     ),
-    "SD 3.5 Large": PipelineConfig(
+    CivitaiBaseModel.SD_3_5_LARGE: PipelineConfig(
         pipeline_class="StableDiffusion3Pipeline",
         default_steps=28,
         default_guidance_scale=4.5,
@@ -302,7 +346,7 @@ CIVITAI_BASE_MODEL_PIPELINE_MAP: dict[str, PipelineConfig] = {
         default_height=1024,
         default_scheduler="default",
     ),
-    "SD 3.5 Large Turbo": PipelineConfig(
+    CivitaiBaseModel.SD_3_5_LARGE_TURBO: PipelineConfig(
         pipeline_class="StableDiffusion3Pipeline",
         default_steps=4,
         default_guidance_scale=0.0,
@@ -311,7 +355,7 @@ CIVITAI_BASE_MODEL_PIPELINE_MAP: dict[str, PipelineConfig] = {
         default_scheduler="default",
     ),
     # Other architectures
-    "PixArt a": PipelineConfig(
+    CivitaiBaseModel.PIXART_A: PipelineConfig(
         pipeline_class="PixArtAlphaPipeline",
         default_steps=20,
         default_guidance_scale=4.5,
@@ -319,7 +363,7 @@ CIVITAI_BASE_MODEL_PIPELINE_MAP: dict[str, PipelineConfig] = {
         default_height=1024,
         default_scheduler="default",
     ),
-    "PixArt Sigma": PipelineConfig(
+    CivitaiBaseModel.PIXART_SIGMA: PipelineConfig(
         pipeline_class="PixArtSigmaPipeline",
         default_steps=20,
         default_guidance_scale=4.5,
@@ -327,7 +371,7 @@ CIVITAI_BASE_MODEL_PIPELINE_MAP: dict[str, PipelineConfig] = {
         default_height=1024,
         default_scheduler="default",
     ),
-    "Kolors": PipelineConfig(
+    CivitaiBaseModel.KOLORS: PipelineConfig(
         pipeline_class="KolorsPipeline",
         default_steps=25,
         default_guidance_scale=5.0,
@@ -335,7 +379,7 @@ CIVITAI_BASE_MODEL_PIPELINE_MAP: dict[str, PipelineConfig] = {
         default_height=1024,
         default_scheduler="default",
     ),
-    "Hunyuan DiT": PipelineConfig(
+    CivitaiBaseModel.HUNYUAN_DIT: PipelineConfig(
         pipeline_class="HunyuanDiTPipeline",
         default_steps=50,
         default_guidance_scale=5.0,
@@ -343,7 +387,7 @@ CIVITAI_BASE_MODEL_PIPELINE_MAP: dict[str, PipelineConfig] = {
         default_height=1024,
         default_scheduler="default",
     ),
-    "Lumina": PipelineConfig(
+    CivitaiBaseModel.LUMINA: PipelineConfig(
         pipeline_class="LuminaText2ImgPipeline",
         default_steps=30,
         default_guidance_scale=4.0,
@@ -351,7 +395,7 @@ CIVITAI_BASE_MODEL_PIPELINE_MAP: dict[str, PipelineConfig] = {
         default_height=1024,
         default_scheduler="default",
     ),
-    "AuraFlow": PipelineConfig(
+    CivitaiBaseModel.AURA_FLOW: PipelineConfig(
         pipeline_class="AuraFlowPipeline",
         default_steps=50,
         default_guidance_scale=3.5,
@@ -359,7 +403,7 @@ CIVITAI_BASE_MODEL_PIPELINE_MAP: dict[str, PipelineConfig] = {
         default_height=1024,
         default_scheduler="default",
     ),
-    "Z-Image": PipelineConfig(
+    CivitaiBaseModel.Z_IMAGE: PipelineConfig(
         pipeline_class="ZImagePipeline",
         default_steps=9,
         default_guidance_scale=0.0,
@@ -367,10 +411,18 @@ CIVITAI_BASE_MODEL_PIPELINE_MAP: dict[str, PipelineConfig] = {
         default_height=1024,
         default_scheduler="default",
     ),
-    "Z-Image Turbo": PipelineConfig(
+    CivitaiBaseModel.Z_IMAGE_TURBO: PipelineConfig(
         pipeline_class="ZImagePipeline",
         default_steps=9,
         default_guidance_scale=0.0,
+        default_width=1024,
+        default_height=1024,
+        default_scheduler="default",
+    ),
+    CivitaiBaseModel.QWEN: PipelineConfig(
+        pipeline_class="QwenImagePipeline",
+        default_steps=8,
+        default_guidance_scale=4.0,
         default_width=1024,
         default_height=1024,
         default_scheduler="default",
@@ -396,6 +448,11 @@ SCHEDULER_MAP: dict[str, tuple[str | None, dict[str, Any]]] = {
 SCHEDULER_CHOICES: list[str] = list(SCHEDULER_MAP.keys())
 DEFAULT_SDXL_COMPONENT_REPO = "stabilityai/stable-diffusion-xl-base-1.0"
 DEFAULT_ZIMAGE_COMPONENT_REPO = "Tongyi-MAI/Z-Image-Turbo"
+DEFAULT_QWEN_COMPONENT_REPO = "Qwen/Qwen-Image"
+DEFAULT_FLUX2_KLEIN_COMPONENT_REPO = "black-forest-labs/FLUX.2-klein-9B"
+DEFAULT_FLUX2_KLEIN_BASE_COMPONENT_REPO = "black-forest-labs/FLUX.2-klein-base-9B"
+DEFAULT_FLUX2_KLEIN_4B_COMPONENT_REPO = "black-forest-labs/FLUX.2-klein-4B"
+DEFAULT_FLUX2_KLEIN_4B_BASE_COMPONENT_REPO = "black-forest-labs/FLUX.2-klein-base-4B"
 
 # Default fallback configuration
 DEFAULT_PIPELINE_CONFIG = PipelineConfig(
@@ -431,71 +488,84 @@ def get_pipeline_config_for_base_model(base_model: str | None) -> PipelineConfig
 
     # Check for specific patterns
     if "flux" in base_lower:
+        if "flux.2" in base_lower or "flux2" in base_lower:
+            if "4b" in base_lower and "base" in base_lower:
+                return CIVITAI_BASE_MODEL_PIPELINE_MAP[CivitaiBaseModel.FLUX_2_KLEIN_4B_BASE]
+            if "4b" in base_lower:
+                return CIVITAI_BASE_MODEL_PIPELINE_MAP[CivitaiBaseModel.FLUX_2_KLEIN_4B]
+            if "base" in base_lower:
+                return CIVITAI_BASE_MODEL_PIPELINE_MAP[CivitaiBaseModel.FLUX_2_KLEIN_9B_BASE]
+            return CIVITAI_BASE_MODEL_PIPELINE_MAP[CivitaiBaseModel.FLUX_2_KLEIN_9B]
         if "schnell" in base_lower or " s" in base_lower:
-            return CIVITAI_BASE_MODEL_PIPELINE_MAP["Flux.1 Schnell"]
-        return CIVITAI_BASE_MODEL_PIPELINE_MAP["Flux.1 Dev"]
+            return CIVITAI_BASE_MODEL_PIPELINE_MAP[CivitaiBaseModel.FLUX_1_SCHNELL]
+        return CIVITAI_BASE_MODEL_PIPELINE_MAP[CivitaiBaseModel.FLUX_1_DEV]
+
+    if "qwen" in base_lower:
+        return CIVITAI_BASE_MODEL_PIPELINE_MAP[CivitaiBaseModel.QWEN]
 
     if "sd 3.5" in base_lower or "sd3.5" in base_lower:
         if "turbo" in base_lower:
-            return CIVITAI_BASE_MODEL_PIPELINE_MAP["SD 3.5 Large Turbo"]
+            return CIVITAI_BASE_MODEL_PIPELINE_MAP[CivitaiBaseModel.SD_3_5_LARGE_TURBO]
         if "large" in base_lower:
-            return CIVITAI_BASE_MODEL_PIPELINE_MAP["SD 3.5 Large"]
+            return CIVITAI_BASE_MODEL_PIPELINE_MAP[CivitaiBaseModel.SD_3_5_LARGE]
         if "medium" in base_lower:
-            return CIVITAI_BASE_MODEL_PIPELINE_MAP["SD 3.5 Medium"]
-        return CIVITAI_BASE_MODEL_PIPELINE_MAP["SD 3.5"]
+            return CIVITAI_BASE_MODEL_PIPELINE_MAP[CivitaiBaseModel.SD_3_5_MEDIUM]
+        return CIVITAI_BASE_MODEL_PIPELINE_MAP[CivitaiBaseModel.SD_3_5]
 
     if "sd 3" in base_lower or "sd3" in base_lower:
-        return CIVITAI_BASE_MODEL_PIPELINE_MAP["SD 3"]
+        return CIVITAI_BASE_MODEL_PIPELINE_MAP[CivitaiBaseModel.SD_3]
 
     if "pony" in base_lower:
-        return CIVITAI_BASE_MODEL_PIPELINE_MAP["Pony"]
+        return CIVITAI_BASE_MODEL_PIPELINE_MAP[CivitaiBaseModel.PONY]
 
     if "illustrious" in base_lower:
-        return CIVITAI_BASE_MODEL_PIPELINE_MAP["Illustrious"]
+        return CIVITAI_BASE_MODEL_PIPELINE_MAP[CivitaiBaseModel.ILLUSTRIOUS]
 
     if "sdxl" in base_lower or "xl" in base_lower:
         if "turbo" in base_lower:
-            return CIVITAI_BASE_MODEL_PIPELINE_MAP["SDXL Turbo"]
+            return CIVITAI_BASE_MODEL_PIPELINE_MAP[CivitaiBaseModel.SDXL_TURBO]
         if "lightning" in base_lower:
-            return CIVITAI_BASE_MODEL_PIPELINE_MAP["SDXL Lightning"]
+            return CIVITAI_BASE_MODEL_PIPELINE_MAP[CivitaiBaseModel.SDXL_LIGHTNING]
         if "lcm" in base_lower:
-            return CIVITAI_BASE_MODEL_PIPELINE_MAP["SDXL 1.0 LCM"]
+            return CIVITAI_BASE_MODEL_PIPELINE_MAP[CivitaiBaseModel.SDXL_1_0_LCM]
         if "hyper" in base_lower:
-            return CIVITAI_BASE_MODEL_PIPELINE_MAP["SDXL Hyper"]
-        return CIVITAI_BASE_MODEL_PIPELINE_MAP["SDXL 1.0"]
+            return CIVITAI_BASE_MODEL_PIPELINE_MAP[CivitaiBaseModel.SDXL_HYPER]
+        return CIVITAI_BASE_MODEL_PIPELINE_MAP[CivitaiBaseModel.SDXL_1_0]
 
     if "sd 2" in base_lower or "sd2" in base_lower:
-        return CIVITAI_BASE_MODEL_PIPELINE_MAP["SD 2.1"]
+        return CIVITAI_BASE_MODEL_PIPELINE_MAP[CivitaiBaseModel.SD_2_1]
 
     if "sd 1.5" in base_lower or "sd1.5" in base_lower or "sd 1" in base_lower:
         if "lcm" in base_lower:
-            return CIVITAI_BASE_MODEL_PIPELINE_MAP["SD 1.5 LCM"]
+            return CIVITAI_BASE_MODEL_PIPELINE_MAP[CivitaiBaseModel.SD_1_5_LCM]
         if "hyper" in base_lower:
-            return CIVITAI_BASE_MODEL_PIPELINE_MAP["SD 1.5 Hyper"]
-        return CIVITAI_BASE_MODEL_PIPELINE_MAP["SD 1.5"]
+            return CIVITAI_BASE_MODEL_PIPELINE_MAP[CivitaiBaseModel.SD_1_5_HYPER]
+        return CIVITAI_BASE_MODEL_PIPELINE_MAP[CivitaiBaseModel.SD_1_5]
 
     if "pixart" in base_lower:
         if "sigma" in base_lower:
-            return CIVITAI_BASE_MODEL_PIPELINE_MAP["PixArt Sigma"]
-        return CIVITAI_BASE_MODEL_PIPELINE_MAP["PixArt a"]
+            return CIVITAI_BASE_MODEL_PIPELINE_MAP[CivitaiBaseModel.PIXART_SIGMA]
+        return CIVITAI_BASE_MODEL_PIPELINE_MAP[CivitaiBaseModel.PIXART_A]
 
     if "kolors" in base_lower:
-        return CIVITAI_BASE_MODEL_PIPELINE_MAP["Kolors"]
+        return CIVITAI_BASE_MODEL_PIPELINE_MAP[CivitaiBaseModel.KOLORS]
 
     if "hunyuan" in base_lower:
-        return CIVITAI_BASE_MODEL_PIPELINE_MAP["Hunyuan DiT"]
+        return CIVITAI_BASE_MODEL_PIPELINE_MAP[CivitaiBaseModel.HUNYUAN_DIT]
 
     if "lumina" in base_lower:
-        return CIVITAI_BASE_MODEL_PIPELINE_MAP["Lumina"]
+        return CIVITAI_BASE_MODEL_PIPELINE_MAP[CivitaiBaseModel.LUMINA]
 
     if "auraflow" in base_lower or "aura" in base_lower:
-        return CIVITAI_BASE_MODEL_PIPELINE_MAP["AuraFlow"]
+        return CIVITAI_BASE_MODEL_PIPELINE_MAP[CivitaiBaseModel.AURA_FLOW]
 
     if "z-image" in base_lower or "zimage" in base_lower or "z image" in base_lower:
-        return CIVITAI_BASE_MODEL_PIPELINE_MAP["Z-Image Turbo"]
+        return CIVITAI_BASE_MODEL_PIPELINE_MAP[CivitaiBaseModel.Z_IMAGE_TURBO]
 
-    # Default to SDXL as it's most common on CivitAI
-    return DEFAULT_PIPELINE_CONFIG
+    raise ValueError(
+        f"Unsupported CivitAI base model '{base_model}'. "
+        "Set pipeline_class explicitly or add a CivitAI base-model mapping before loading."
+    )
 
 
 def get_diffusers_pipeline_class(class_name: str) -> type:
@@ -623,6 +693,8 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
 
         # Determine base model (from config override or stored from API)
         base_model = model_config.get("base_model", self._base_model)
+        if base_model is not None:
+            self._base_model = base_model
 
         # Get pipeline configuration
         pipeline_class_override = model_config.get("pipeline_class")
@@ -646,8 +718,13 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
         cpu_offload = model_config.get("cpu_offload", True)
         self.policy = DevicePolicy.auto_detect(cpu_offload=cpu_offload)
 
-        # Get the pipeline class
-        pipeline_class = get_diffusers_pipeline_class(self._pipeline_config.pipeline_class)
+        # Get the pipeline class unless this wrapper has a custom assembly path.
+        pipeline_class: type | None = None
+        if self._pipeline_config.pipeline_class not in {
+            "QwenImagePipeline",
+            "Flux2KleinPipeline",
+        }:
+            pipeline_class = get_diffusers_pipeline_class(self._pipeline_config.pipeline_class)
 
         # Load from single file. Some architectures publish single-file checkpoints
         # without every pipeline component; preload those components when needed.
@@ -694,12 +771,23 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
 
     def _load_pipeline_from_single_file(
         self,
-        pipeline_class: type,
+        pipeline_class: type | None,
         checkpoint_path: Path,
         model_config: dict[str, Any],
         single_file_kwargs: dict[str, Any],
     ) -> Any:
         """Load a diffusers pipeline from one checkpoint file with component fallbacks."""
+        if self._pipeline_config is not None:
+            if self._pipeline_config.pipeline_class == "QwenImagePipeline":
+                return self._load_qwen_image_pipeline_from_single_file(
+                    checkpoint_path, model_config
+                )
+            if self._pipeline_config.pipeline_class == "Flux2KleinPipeline":
+                return self._load_flux2_klein_pipeline_from_single_file(
+                    checkpoint_path, model_config
+                )
+
+        assert pipeline_class is not None
         try:
             return pipeline_class.from_single_file(str(checkpoint_path), **single_file_kwargs)
         except Exception as error:
@@ -710,6 +798,107 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
             retry_kwargs = dict(single_file_kwargs)
             retry_kwargs.update(self._load_sdxl_text_components(model_config))
             return pipeline_class.from_single_file(str(checkpoint_path), **retry_kwargs)
+
+    def _load_qwen_image_pipeline_from_single_file(
+        self,
+        checkpoint_path: Path,
+        model_config: dict[str, Any],
+    ) -> Any:
+        """Load a Qwen CivitAI transformer checkpoint into the Qwen-Image pipeline."""
+        from diffusers import (
+            DiffusionPipeline,
+            FlowMatchEulerDiscreteScheduler,
+            QwenImageTransformer2DModel,
+        )
+
+        component_repo = (
+            model_config.get("qwen_component_repo")
+            or model_config.get("component_repo")
+            or model_config.get("repo")
+            or DEFAULT_QWEN_COMPONENT_REPO
+        )
+        transformer_config = model_config.get("single_file_config_repo") or component_repo
+        transformer_subfolder = model_config.get("transformer_subfolder", "transformer")
+
+        print(f"  Loading Qwen transformer from {checkpoint_path}")
+        transformer = QwenImageTransformer2DModel.from_single_file(
+            str(checkpoint_path),
+            torch_dtype=self.policy.dtype,
+            config=transformer_config,
+            subfolder=transformer_subfolder,
+        )
+
+        scheduler = FlowMatchEulerDiscreteScheduler.from_config(self._qwen_scheduler_config())
+
+        print(f"  Assembling Qwen-Image pipeline from {component_repo}")
+        return DiffusionPipeline.from_pretrained(
+            component_repo,
+            transformer=transformer,
+            scheduler=scheduler,
+            torch_dtype=self.policy.dtype,
+        )
+
+    def _load_flux2_klein_pipeline_from_single_file(
+        self,
+        checkpoint_path: Path,
+        model_config: dict[str, Any],
+    ) -> Any:
+        """Load a FLUX.2 Klein transformer checkpoint into the Klein pipeline."""
+        from diffusers import Flux2KleinPipeline, Flux2Transformer2DModel
+
+        component_repo = (
+            model_config.get("flux2_component_repo")
+            or model_config.get("component_repo")
+            or model_config.get("repo")
+            or self._default_flux2_component_repo()
+        )
+        transformer_config = model_config.get("single_file_config_repo") or component_repo
+        transformer_subfolder = model_config.get("transformer_subfolder", "transformer")
+
+        print(f"  Loading FLUX.2 Klein transformer from {checkpoint_path}")
+        transformer = Flux2Transformer2DModel.from_single_file(
+            str(checkpoint_path),
+            torch_dtype=self.policy.dtype,
+            config=transformer_config,
+            subfolder=transformer_subfolder,
+        )
+
+        print(f"  Assembling FLUX.2 Klein pipeline from {component_repo}")
+        return Flux2KleinPipeline.from_pretrained(
+            component_repo,
+            transformer=transformer,
+            torch_dtype=self.policy.dtype,
+        )
+
+    def _default_flux2_component_repo(self) -> str:
+        """Return the default FLUX.2 Klein repo for the detected CivitAI base model."""
+        base_model = (self._base_model or "").lower()
+        if "4b" in base_model and "base" in base_model:
+            return DEFAULT_FLUX2_KLEIN_4B_BASE_COMPONENT_REPO
+        if "4b" in base_model:
+            return DEFAULT_FLUX2_KLEIN_4B_COMPONENT_REPO
+        if "base" in base_model:
+            return DEFAULT_FLUX2_KLEIN_BASE_COMPONENT_REPO
+        return DEFAULT_FLUX2_KLEIN_COMPONENT_REPO
+
+    def _qwen_scheduler_config(self) -> dict[str, Any]:
+        """Return the scheduler config used by Qwen-Image Diffusers pipelines."""
+        return {
+            "base_image_seq_len": 256,
+            "base_shift": math.log(3),
+            "invert_sigmas": False,
+            "max_image_seq_len": 8192,
+            "max_shift": math.log(3),
+            "num_train_timesteps": 1000,
+            "shift": 1.0,
+            "shift_terminal": None,
+            "stochastic_sampling": False,
+            "time_shift_type": "exponential",
+            "use_beta_sigmas": False,
+            "use_dynamic_shifting": True,
+            "use_exponential_sigmas": False,
+            "use_karras_sigmas": False,
+        }
 
     def _should_retry_with_sdxl_text_components(
         self,
@@ -1003,6 +1192,27 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
     ) -> dict[str, Any]:
         """Build generation kwargs with embedding support."""
         assert self._pipeline_config is not None
+
+        if self._pipeline_config.pipeline_class == "QwenImagePipeline":
+            gen_kwargs = {
+                "prompt": prompt,
+                "negative_prompt": negative_prompt if negative_prompt else " ",
+                "num_inference_steps": steps,
+                "true_cfg_scale": kwargs.get("true_cfg_scale", guidance_scale),
+                "generator": generator,
+                "num_images_per_prompt": 1,
+            }
+
+            if init_image:
+                print(f"CivitAI Qwen img2img: '{prompt[:50]}...' strength={strength}")
+                gen_kwargs["image"] = init_image
+                gen_kwargs["strength"] = strength
+            else:
+                print(f"CivitAI Qwen generating: '{prompt[:50]}...'")
+                gen_kwargs["height"] = height
+                gen_kwargs["width"] = width
+
+            return gen_kwargs
 
         gen_kwargs: dict[str, Any] = {
             "num_inference_steps": steps,

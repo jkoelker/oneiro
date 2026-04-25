@@ -76,6 +76,21 @@ class TestGetPipelineConfigForBaseModel:
         assert config.default_steps == 4
         assert config.default_guidance_scale == 0.0
 
+    def test_exact_match_qwen(self):
+        """Exact match for CivitAI Qwen checkpoints."""
+        config = get_pipeline_config_for_base_model("Qwen")
+        assert config.pipeline_class == "QwenImagePipeline"
+        assert config.default_steps == 8
+        assert config.default_guidance_scale == 4.0
+
+    def test_exact_match_flux2_klein(self):
+        """Exact match for CivitAI FLUX.2 Klein checkpoints."""
+        config = get_pipeline_config_for_base_model("Flux.2 Klein 9B")
+        assert config.pipeline_class == "Flux2KleinPipeline"
+        assert config.supports_negative_prompt is False
+        assert config.default_steps == 4
+        assert config.default_guidance_scale == 1.0
+
     def test_partial_match_flux(self):
         """Partial match for Flux variants."""
         config = get_pipeline_config_for_base_model("Flux.1")
@@ -83,6 +98,23 @@ class TestGetPipelineConfigForBaseModel:
 
         config = get_pipeline_config_for_base_model("flux dev")
         assert config.pipeline_class == "FluxPipeline"
+
+    def test_partial_match_qwen(self):
+        """Partial match for Qwen Image variants."""
+        for base_model in ["qwen", "Qwen Image", "Qwen-Image"]:
+            config = get_pipeline_config_for_base_model(base_model)
+            assert config.pipeline_class == "QwenImagePipeline"
+
+    def test_partial_match_flux2_before_flux1(self):
+        """FLUX.2 variants do not fall through to the FLUX.1 pipeline."""
+        for base_model in [
+            "Flux.2 Klein 9B",
+            "Flux.2 Klein 9B-base",
+            "Flux.2 Klein 4B",
+            "Flux.2 Klein 4B-base",
+        ]:
+            config = get_pipeline_config_for_base_model(base_model)
+            assert config.pipeline_class == "Flux2KleinPipeline"
 
     def test_partial_match_sdxl_turbo(self):
         """Partial match for SDXL Turbo."""
@@ -134,10 +166,10 @@ class TestGetPipelineConfigForBaseModel:
         config = get_pipeline_config_for_base_model(None)
         assert config == DEFAULT_PIPELINE_CONFIG
 
-    def test_unknown_returns_default(self):
-        """Unknown base_model returns default (SDXL) config."""
-        config = get_pipeline_config_for_base_model("Some Unknown Model")
-        assert config == DEFAULT_PIPELINE_CONFIG
+    def test_unknown_raises(self):
+        """Unknown base_model does not silently fall back to SDXL."""
+        with pytest.raises(ValueError, match="Unsupported CivitAI base model"):
+            get_pipeline_config_for_base_model("Some Unknown Model")
 
     def test_pixart_variants(self):
         """PixArt model variants."""
@@ -468,6 +500,108 @@ class TestCivitaiCheckpointPipelineLoad:
         call_kwargs = mock_pipeline_class.from_single_file.call_args.kwargs
         assert call_kwargs["text_encoder"] is mock_text_encoder
         assert call_kwargs["tokenizer"] is mock_tokenizer_instance
+
+    def test_load_qwen_single_file_assembles_qwen_pipeline(self, tmp_path):
+        """CivitAI Qwen checkpoints load as Qwen transformer components, not SDXL."""
+        checkpoint = tmp_path / "qwen.safetensors"
+        checkpoint.write_bytes(b"dummy")
+
+        mock_pipeline_class = MagicMock()
+        mock_pipe = MagicMock()
+        mock_transformer = MagicMock()
+        mock_scheduler = MagicMock()
+        mock_policy = DevicePolicy(device="cpu", dtype=torch.bfloat16, offload=OffloadMode.NEVER)
+
+        with (
+            patch.object(CivitaiCheckpointPipeline, "configure_scheduler"),
+            patch.object(DevicePolicy, "auto_detect", return_value=mock_policy),
+            patch(
+                "oneiro.pipelines.civitai_checkpoint.get_diffusers_pipeline_class",
+                return_value=mock_pipeline_class,
+            ) as mock_get_class,
+            patch("diffusers.QwenImageTransformer2DModel") as mock_transformer_class,
+            patch("diffusers.FlowMatchEulerDiscreteScheduler") as mock_scheduler_class,
+            patch("diffusers.DiffusionPipeline") as mock_diffusion_pipeline,
+        ):
+            mock_transformer_class.from_single_file.return_value = mock_transformer
+            mock_scheduler_class.from_config.return_value = mock_scheduler
+            mock_diffusion_pipeline.from_pretrained.return_value = mock_pipe
+
+            pipeline = CivitaiCheckpointPipeline()
+            pipeline.load(
+                {
+                    "checkpoint_path": str(checkpoint),
+                    "base_model": "Qwen",
+                }
+            )
+
+        mock_get_class.assert_not_called()
+        mock_pipeline_class.from_single_file.assert_not_called()
+        mock_transformer_class.from_single_file.assert_called_once_with(
+            str(checkpoint),
+            torch_dtype=torch.bfloat16,
+            config="Qwen/Qwen-Image",
+            subfolder="transformer",
+        )
+        mock_scheduler_class.from_config.assert_called_once()
+        mock_diffusion_pipeline.from_pretrained.assert_called_once_with(
+            "Qwen/Qwen-Image",
+            transformer=mock_transformer,
+            scheduler=mock_scheduler,
+            torch_dtype=torch.bfloat16,
+        )
+
+    def test_load_flux2_klein_single_file_assembles_klein_pipeline(self, tmp_path):
+        """CivitAI FLUX.2 Klein checkpoints load via the Flux2 transformer path."""
+        checkpoint = tmp_path / "flux2.safetensors"
+        checkpoint.write_bytes(b"dummy")
+
+        mock_pipeline_class = MagicMock()
+        mock_pipe = MagicMock()
+        mock_transformer = MagicMock()
+        mock_policy = DevicePolicy(device="cpu", dtype=torch.bfloat16, offload=OffloadMode.NEVER)
+
+        with (
+            patch.object(CivitaiCheckpointPipeline, "configure_scheduler"),
+            patch.object(DevicePolicy, "auto_detect", return_value=mock_policy),
+            patch(
+                "oneiro.pipelines.civitai_checkpoint.get_diffusers_pipeline_class",
+                return_value=mock_pipeline_class,
+            ) as mock_get_class,
+            patch("diffusers.Flux2Transformer2DModel") as mock_transformer_class,
+            patch("diffusers.Flux2KleinPipeline") as mock_flux2_pipeline,
+        ):
+            mock_transformer_class.from_single_file.return_value = mock_transformer
+            mock_flux2_pipeline.from_pretrained.return_value = mock_pipe
+
+            pipeline = CivitaiCheckpointPipeline()
+            pipeline.load(
+                {
+                    "checkpoint_path": str(checkpoint),
+                    "base_model": "Flux.2 Klein 9B",
+                }
+            )
+
+        mock_get_class.assert_not_called()
+        mock_pipeline_class.from_single_file.assert_not_called()
+        mock_transformer_class.from_single_file.assert_called_once_with(
+            str(checkpoint),
+            torch_dtype=torch.bfloat16,
+            config="black-forest-labs/FLUX.2-klein-9B",
+            subfolder="transformer",
+        )
+        mock_flux2_pipeline.from_pretrained.assert_called_once_with(
+            "black-forest-labs/FLUX.2-klein-9B",
+            transformer=mock_transformer,
+            torch_dtype=torch.bfloat16,
+        )
+
+    def test_flux2_klein_4b_base_uses_4b_base_repo(self):
+        """FLUX.2 Klein 4B base models default to the matching 4B base repo."""
+        pipeline = CivitaiCheckpointPipeline()
+        pipeline._base_model = "Flux.2 Klein 4B-base"
+
+        assert pipeline._default_flux2_component_repo() == "black-forest-labs/FLUX.2-klein-base-4B"
 
     def test_load_non_zimage_single_file_does_not_load_text_components(self, tmp_path):
         """Non-Z-Image checkpoints keep the original single-file loading behavior."""
@@ -903,6 +1037,34 @@ class TestCivitaiCheckpointPipelineGenerate:
 
         call_kwargs = mock_pipe.call_args.kwargs
         assert "negative_prompt" not in call_kwargs
+
+    def test_generate_qwen_uses_true_cfg_scale(self):
+        """Qwen generation uses true_cfg_scale instead of SDXL guidance kwargs."""
+        pipeline = CivitaiCheckpointPipeline()
+        pipeline._pipeline_config = PipelineConfig(
+            pipeline_class="QwenImagePipeline",
+            default_steps=8,
+            default_guidance_scale=4.0,
+            default_width=1024,
+            default_height=1024,
+        )
+
+        mock_pipe = MagicMock()
+        mock_image = MagicMock()
+        mock_image.width = 1024
+        mock_image.height = 1024
+        mock_pipe.return_value.images = [mock_image]
+        pipeline.pipe = mock_pipe
+
+        with patch.object(DevicePolicy, "clear_cache"):
+            pipeline.generate("test prompt", negative_prompt=None)
+
+        call_kwargs = mock_pipe.call_args.kwargs
+        assert call_kwargs["prompt"] == "test prompt"
+        assert call_kwargs["negative_prompt"] == " "
+        assert call_kwargs["true_cfg_scale"] == 4.0
+        assert "guidance_scale" not in call_kwargs
+        assert "prompt_embeds" not in call_kwargs
 
     def test_generate_returns_generation_result(self):
         """generate() returns proper GenerationResult."""
