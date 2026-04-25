@@ -740,7 +740,10 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
         scheduler_override = model_config.get("scheduler")
         self.configure_scheduler(scheduler_override)
 
-        self.policy.apply_to_pipeline(self.pipe)
+        if self._should_use_sequential_cpu_offload(model_config):
+            self.pipe.enable_sequential_cpu_offload()
+        else:
+            self.policy.apply_to_pipeline(self.pipe)
         # Track whether offload was applied (for dynamic LoRA handling)
         self._cpu_offload = (
             self.policy.offload != OffloadMode.NEVER and self.policy.device == "cuda"
@@ -823,9 +826,10 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
 
         print(f"  Loading Qwen transformer from {checkpoint_path}")
         checkpoint = self._load_transformer_checkpoint(checkpoint_path)
+        transformer_dtype = self._resolve_qwen_transformer_dtype(model_config, checkpoint)
         transformer = QwenImageTransformer2DModel.from_single_file(
             checkpoint,
-            torch_dtype=self.policy.dtype,
+            torch_dtype=transformer_dtype,
             config=transformer_config,
             subfolder=transformer_subfolder,
         )
@@ -898,6 +902,96 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
             normalized_checkpoint[normalized_key] = tensor
 
         return normalized_checkpoint
+
+    def _resolve_qwen_transformer_dtype(
+        self,
+        model_config: dict[str, Any],
+        checkpoint: dict[str, Any],
+    ) -> torch.dtype:
+        """Return the dtype used for Qwen single-file transformer weights.
+
+        Some CivitAI Qwen checkpoints are published as FP8 transformer-only
+        files. Passing the global bf16/fp16 device dtype to Diffusers' component
+        loader can upcast those weights and remove the memory savings. Preserve
+        FP8 storage by default, while keeping an explicit override for operators
+        who need a different dtype.
+        """
+        configured_dtype = model_config.get("qwen_transformer_dtype") or model_config.get(
+            "transformer_dtype"
+        )
+        if configured_dtype is not None:
+            return self._parse_torch_dtype(configured_dtype)
+
+        checkpoint_dtype = self._infer_float8_checkpoint_dtype(checkpoint)
+        if checkpoint_dtype is not None:
+            return checkpoint_dtype
+
+        return self.policy.dtype
+
+    @staticmethod
+    def _parse_torch_dtype(value: Any) -> torch.dtype:
+        """Parse a torch dtype from config-friendly strings."""
+        if isinstance(value, torch.dtype):
+            return value
+        if not isinstance(value, str):
+            raise TypeError("transformer_dtype must be a string or torch.dtype")
+
+        dtype_name = value.removeprefix("torch.").replace("-", "_").lower()
+        dtype_aliases: dict[str, torch.dtype | None] = {
+            "auto": None,
+            "bfloat16": torch.bfloat16,
+            "bf16": torch.bfloat16,
+            "float16": torch.float16,
+            "fp16": torch.float16,
+            "float32": torch.float32,
+            "fp32": torch.float32,
+            "float8_e4m3fn": getattr(torch, "float8_e4m3fn", None),
+            "fp8_e4m3fn": getattr(torch, "float8_e4m3fn", None),
+            "float8_e5m2": getattr(torch, "float8_e5m2", None),
+            "fp8_e5m2": getattr(torch, "float8_e5m2", None),
+        }
+
+        if dtype_name == "auto":
+            raise ValueError("Use qwen_transformer_dtype only for explicit torch dtypes")
+
+        dtype = dtype_aliases.get(dtype_name)
+        if dtype is None:
+            supported = ", ".join(sorted(name for name, alias in dtype_aliases.items() if alias))
+            raise ValueError(f"Unsupported transformer_dtype '{value}'. Supported: {supported}")
+
+        return dtype
+
+    @staticmethod
+    def _infer_float8_checkpoint_dtype(checkpoint: dict[str, Any]) -> torch.dtype | None:
+        """Infer a single FP8 dtype from a transformer checkpoint if present."""
+        dtypes = {
+            value.dtype
+            for value in checkpoint.values()
+            if isinstance(value, torch.Tensor) and value.is_floating_point()
+        }
+        if len(dtypes) != 1:
+            return None
+
+        dtype = next(iter(dtypes))
+        if str(dtype).startswith("torch.float8_"):
+            return dtype
+
+        return None
+
+    def _should_use_sequential_cpu_offload(self, model_config: dict[str, Any]) -> bool:
+        """Return whether to use Diffusers' lower-memory sequential offload."""
+        should_offload = self.policy.offload != OffloadMode.NEVER and self.policy.device == "cuda"
+        if not should_offload:
+            return False
+
+        configured = model_config.get("sequential_cpu_offload")
+        if configured is not None:
+            return bool(configured)
+
+        return (
+            self._pipeline_config is not None
+            and self._pipeline_config.pipeline_class == "QwenImagePipeline"
+        )
 
     def _default_flux2_component_repo(self) -> str:
         """Return the default FLUX.2 Klein repo for the detected CivitAI base model."""

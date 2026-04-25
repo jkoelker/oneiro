@@ -576,6 +576,97 @@ class TestCivitaiCheckpointPipelineLoad:
             torch_dtype=torch.bfloat16,
         )
 
+    def test_load_qwen_fp8_single_file_preserves_transformer_dtype(self, tmp_path):
+        """Qwen FP8 checkpoints keep FP8 transformer storage instead of upcasting."""
+        fp8_dtype = getattr(torch, "float8_e5m2", None)
+        if fp8_dtype is None:
+            pytest.skip("torch build does not expose float8_e5m2")
+
+        checkpoint = tmp_path / "qwen-fp8.safetensors"
+        checkpoint.write_bytes(b"dummy")
+
+        mock_pipe = MagicMock()
+        mock_transformer = MagicMock()
+        mock_scheduler = MagicMock()
+        qwen_state_dict = {"img_in.weight": torch.empty((), dtype=fp8_dtype)}
+        mock_policy = DevicePolicy(device="cpu", dtype=torch.bfloat16, offload=OffloadMode.NEVER)
+
+        with (
+            patch.object(CivitaiCheckpointPipeline, "configure_scheduler"),
+            patch.object(DevicePolicy, "auto_detect", return_value=mock_policy),
+            patch.object(
+                CivitaiCheckpointPipeline,
+                "_load_transformer_checkpoint",
+                return_value=qwen_state_dict,
+            ),
+            patch("diffusers.QwenImageTransformer2DModel") as mock_transformer_class,
+            patch("diffusers.FlowMatchEulerDiscreteScheduler") as mock_scheduler_class,
+            patch("diffusers.DiffusionPipeline") as mock_diffusion_pipeline,
+        ):
+            mock_transformer_class.from_single_file.return_value = mock_transformer
+            mock_scheduler_class.from_config.return_value = mock_scheduler
+            mock_diffusion_pipeline.from_pretrained.return_value = mock_pipe
+
+            pipeline = CivitaiCheckpointPipeline()
+            pipeline.load(
+                {
+                    "checkpoint_path": str(checkpoint),
+                    "base_model": "Qwen",
+                }
+            )
+
+        mock_transformer_class.from_single_file.assert_called_once_with(
+            qwen_state_dict,
+            torch_dtype=fp8_dtype,
+            config="Qwen/Qwen-Image",
+            subfolder="transformer",
+        )
+        mock_diffusion_pipeline.from_pretrained.assert_called_once_with(
+            "Qwen/Qwen-Image",
+            transformer=mock_transformer,
+            scheduler=mock_scheduler,
+            torch_dtype=torch.bfloat16,
+        )
+
+    def test_load_qwen_uses_sequential_cpu_offload_on_cuda(self, tmp_path):
+        """Qwen CivitAI checkpoints use lower-memory sequential offload by default."""
+        checkpoint = tmp_path / "qwen.safetensors"
+        checkpoint.write_bytes(b"dummy")
+
+        mock_pipe = MagicMock()
+        mock_transformer = MagicMock()
+        mock_scheduler = MagicMock()
+        qwen_state_dict = {"img_in.weight": MagicMock()}
+        mock_policy = DevicePolicy(device="cuda", dtype=torch.float16, offload=OffloadMode.AUTO)
+
+        with (
+            patch.object(CivitaiCheckpointPipeline, "configure_scheduler"),
+            patch.object(DevicePolicy, "auto_detect", return_value=mock_policy),
+            patch.object(DevicePolicy, "apply_to_pipeline") as mock_apply_to_pipeline,
+            patch.object(
+                CivitaiCheckpointPipeline,
+                "_load_transformer_checkpoint",
+                return_value=qwen_state_dict,
+            ),
+            patch("diffusers.QwenImageTransformer2DModel") as mock_transformer_class,
+            patch("diffusers.FlowMatchEulerDiscreteScheduler") as mock_scheduler_class,
+            patch("diffusers.DiffusionPipeline") as mock_diffusion_pipeline,
+        ):
+            mock_transformer_class.from_single_file.return_value = mock_transformer
+            mock_scheduler_class.from_config.return_value = mock_scheduler
+            mock_diffusion_pipeline.from_pretrained.return_value = mock_pipe
+
+            pipeline = CivitaiCheckpointPipeline()
+            pipeline.load(
+                {
+                    "checkpoint_path": str(checkpoint),
+                    "base_model": "Qwen",
+                }
+            )
+
+        mock_pipe.enable_sequential_cpu_offload.assert_called_once_with()
+        mock_apply_to_pipeline.assert_not_called()
+
     def test_load_flux2_klein_single_file_assembles_klein_pipeline(self, tmp_path):
         """CivitAI FLUX.2 Klein checkpoints load via the Flux2 transformer path."""
         checkpoint = tmp_path / "flux2.safetensors"
