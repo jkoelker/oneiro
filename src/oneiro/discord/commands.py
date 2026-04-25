@@ -25,6 +25,11 @@ if TYPE_CHECKING:
     from oneiro.app import OneiroBot
 
 
+MAX_DREAM_ATTACHMENT_BYTES = 25 * 1024 * 1024
+IMAGE_ATTACHMENT_CONTENT_TYPES = ("image/png", "image/jpeg", "image/webp")
+IMAGE_ATTACHMENT_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp")
+
+
 def slugify(text: str) -> str:
     """Convert text to a URL-friendly slug.
 
@@ -44,6 +49,25 @@ def slugify(text: str) -> str:
     # Remove leading/trailing hyphens
     slug = slug.strip("-")
     return slug or "unnamed"
+
+
+def validate_image_attachment(attachment: discord.Attachment, label: str) -> str | None:
+    """Validate a Discord attachment before reading it into memory."""
+    size = getattr(attachment, "size", 0) or 0
+    if size > MAX_DREAM_ATTACHMENT_BYTES:
+        max_mb = MAX_DREAM_ATTACHMENT_BYTES // (1024 * 1024)
+        return f"❌ {label} must be {max_mb} MiB or smaller."
+
+    filename = (getattr(attachment, "filename", "") or "").lower()
+    content_type = getattr(attachment, "content_type", None)
+    has_image_type = (
+        isinstance(content_type, str) and content_type.lower() in IMAGE_ATTACHMENT_CONTENT_TYPES
+    )
+    has_image_extension = filename.endswith(IMAGE_ATTACHMENT_EXTENSIONS)
+    if not has_image_type and not has_image_extension:
+        return f"❌ {label} must be a PNG, JPEG, or WebP image."
+
+    return None
 
 
 async def get_lora_choices(ctx: discord.AutocompleteContext) -> list[str]:
@@ -117,6 +141,12 @@ def register_commands(bot: "OneiroBot") -> None:
         required=False,
     )
     @option(
+        "mask",
+        discord.Attachment,
+        description="Mask image for inpainting (white = repaint, black = keep)",
+        required=False,
+    )
+    @option(
         "strength",
         float,
         description="img2img strength (0.0-1.0, higher = more change)",
@@ -182,6 +212,7 @@ def register_commands(bot: "OneiroBot") -> None:
         prompt: str,
         negative_prompt: str | None = None,
         image: discord.Attachment | None = None,
+        mask: discord.Attachment | None = None,
         strength: float = 0.75,
         width: int = 1024,
         height: int = 1024,
@@ -209,6 +240,31 @@ def register_commands(bot: "OneiroBot") -> None:
         # Defer immediately to avoid 3-second timeout
         await ctx.defer()
 
+        # Get model-specific defaults from config
+        current_model = ctx.bot.pipeline_manager.current_model or "zimage-turbo"
+        model_config = (
+            ctx.bot.config.get("models", current_model, default={}) if ctx.bot.config else {}
+        )
+        pipeline_type = model_config.get("type") if model_config else None
+
+        # Validate image attachments before reading them into memory
+        for label, attachment in (("image", image), ("mask", mask)):
+            if attachment is None:
+                continue
+            validation_error = validate_image_attachment(attachment, label)
+            if validation_error:
+                await ctx.followup.send(validation_error, ephemeral=True)
+                return
+
+        if mask is not None and not getattr(
+            ctx.bot.pipeline_manager.pipeline, "supports_inpaint", False
+        ):
+            await ctx.followup.send(
+                "❌ The active model does not support inpainting masks.",
+                ephemeral=True,
+            )
+            return
+
         # Download image if provided for img2img
         init_image_bytes: bytes | None = None
         if image is not None:
@@ -218,12 +274,19 @@ def register_commands(bot: "OneiroBot") -> None:
                 await ctx.followup.send(f"❌ Failed to read image: {e}", ephemeral=True)
                 return
 
-        # Get model-specific defaults from config
-        current_model = ctx.bot.pipeline_manager.current_model or "zimage-turbo"
-        model_config = (
-            ctx.bot.config.get("models", current_model, default={}) if ctx.bot.config else {}
-        )
-        pipeline_type = model_config.get("type") if model_config else None
+        mask_image_bytes: bytes | None = None
+        if mask is not None:
+            if init_image_bytes is None:
+                await ctx.followup.send(
+                    "❌ Inpainting requires both `image` and `mask` attachments.",
+                    ephemeral=True,
+                )
+                return
+            try:
+                mask_image_bytes = await mask.read()
+            except Exception as e:
+                await ctx.followup.send(f"❌ Failed to read mask image: {e}", ephemeral=True)
+                return
 
         # Get model config defaults
         model_steps = model_config.get("steps", 9)
@@ -293,6 +356,8 @@ def register_commands(bot: "OneiroBot") -> None:
         if init_image_bytes is not None:
             request["init_image"] = init_image_bytes
             request["strength"] = strength
+            if mask_image_bytes is not None:
+                request["mask_image"] = mask_image_bytes
 
         dream_context = DreamContext(
             ctx=ctx,
@@ -303,6 +368,7 @@ def register_commands(bot: "OneiroBot") -> None:
             lora_configs=lora_configs,
             auto_detected_loras=auto_detected_loras,
             is_img2img=init_image_bytes is not None,
+            is_inpaint=mask_image_bytes is not None,
             strength=strength,
             pipeline_manager=ctx.bot.pipeline_manager,  # type: ignore[arg-type]
         )

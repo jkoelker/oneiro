@@ -4,6 +4,7 @@ import io
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
+import pytest
 import torch
 from PIL import Image
 
@@ -57,6 +58,8 @@ class TestGenerationResult:
 class ConcretePipeline(BasePipeline):
     """Concrete implementation for testing abstract base class."""
 
+    supports_inpaint = True
+
     def load(self, model_config):
         pass
 
@@ -74,7 +77,7 @@ class ConcretePipeline(BasePipeline):
         **kwargs,
     ):
         """Build generation kwargs for testing."""
-        return {
+        gen_kwargs = {
             "prompt": prompt,
             "negative_prompt": negative_prompt,
             "width": width,
@@ -83,6 +86,9 @@ class ConcretePipeline(BasePipeline):
             "guidance_scale": guidance_scale,
             "generator": generator,
         }
+        if "mask_image" in kwargs:
+            gen_kwargs["mask_image"] = kwargs["mask_image"]
+        return gen_kwargs
 
 
 class TestBasePipelineInit:
@@ -205,6 +211,58 @@ class TestBasePipelineLoadInitImage:
 
         result = pipeline._load_init_image(img_bytes)
         assert result.mode == "RGB"
+
+    @patch("oneiro.pipelines.base.torch.cuda.is_available", return_value=False)
+    def test_generate_decodes_mask_image_from_bytes(self, mock_cuda):
+        """generate decodes mask_image bytes before building generation kwargs."""
+        pipeline = ConcretePipeline()
+        pipeline.pipe = Mock()
+        output = Image.new("RGB", (32, 32))
+        pipeline.pipe.return_value.images = [output]
+
+        mask = Image.new("L", (16, 16), color=255)
+        buffer = io.BytesIO()
+        mask.save(buffer, format="PNG")
+
+        pipeline.generate("test", mask_image=buffer.getvalue())
+
+        call_kwargs = pipeline.pipe.call_args.kwargs
+        assert isinstance(call_kwargs["mask_image"], Image.Image)
+        assert call_kwargs["mask_image"].size == (16, 16)
+        assert call_kwargs["mask_image"].mode == "RGB"
+
+    @patch("oneiro.pipelines.base.torch.cuda.is_available", return_value=False)
+    def test_generate_rejects_mask_when_pipeline_does_not_support_inpaint(self, mock_cuda):
+        """generate rejects mask_image for pipelines without inpaint support."""
+
+        class NoInpaintPipeline(ConcretePipeline):
+            supports_inpaint = False
+
+        pipeline = NoInpaintPipeline()
+        pipeline.pipe = Mock()
+
+        with pytest.raises(ValueError, match="does not support inpainting masks"):
+            pipeline.generate("test", mask_image=b"not-used")
+
+    @patch("oneiro.pipelines.base.torch.cuda.is_available", return_value=False)
+    def test_load_init_image_rejects_invalid_image_bytes(self, mock_cuda):
+        """_load_init_image reports invalid bytes as a user-facing ValueError."""
+        pipeline = ConcretePipeline()
+
+        with pytest.raises(ValueError, match="Invalid image attachment"):
+            pipeline._load_init_image(b"not an image")
+
+    @patch("oneiro.pipelines.base.torch.cuda.is_available", return_value=False)
+    def test_load_init_image_rejects_oversized_images(self, mock_cuda):
+        """_load_init_image rejects decoded images above the pixel limit."""
+        pipeline = ConcretePipeline()
+        image = Image.new("RGB", (11, 10), color="blue")
+        buffer = io.BytesIO()
+        image.save(buffer, format="PNG")
+
+        with patch("oneiro.pipelines.base.MAX_INPUT_IMAGE_PIXELS", 100):
+            with pytest.raises(ValueError, match="Input image is too large"):
+                pipeline._load_init_image(buffer.getvalue())
 
 
 class TestBasePipelineConfigureCpuThreads:
