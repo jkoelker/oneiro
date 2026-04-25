@@ -559,11 +559,17 @@ class TestCivitaiCheckpointPipelineLoad:
         mock_pipeline_class = MagicMock()
         mock_pipe = MagicMock()
         mock_transformer = MagicMock()
+        flux2_state_dict = {"double_blocks.0.img_attn.norm.key_norm.weight": MagicMock()}
         mock_policy = DevicePolicy(device="cpu", dtype=torch.bfloat16, offload=OffloadMode.NEVER)
 
         with (
             patch.object(CivitaiCheckpointPipeline, "configure_scheduler"),
             patch.object(DevicePolicy, "auto_detect", return_value=mock_policy),
+            patch.object(
+                CivitaiCheckpointPipeline,
+                "_load_flux2_transformer_checkpoint",
+                return_value=flux2_state_dict,
+            ) as mock_load_checkpoint,
             patch(
                 "oneiro.pipelines.civitai_checkpoint.get_diffusers_pipeline_class",
                 return_value=mock_pipeline_class,
@@ -584,8 +590,9 @@ class TestCivitaiCheckpointPipelineLoad:
 
         mock_get_class.assert_not_called()
         mock_pipeline_class.from_single_file.assert_not_called()
+        mock_load_checkpoint.assert_called_once_with(checkpoint)
         mock_transformer_class.from_single_file.assert_called_once_with(
-            str(checkpoint),
+            flux2_state_dict,
             torch_dtype=torch.bfloat16,
             config="black-forest-labs/FLUX.2-klein-9B",
             subfolder="transformer",
@@ -602,6 +609,38 @@ class TestCivitaiCheckpointPipelineLoad:
         pipeline._base_model = "Flux.2 Klein 4B-base"
 
         assert pipeline._default_flux2_component_repo() == "black-forest-labs/FLUX.2-klein-base-4B"
+
+    def test_flux2_checkpoint_strips_comfy_diffusion_model_prefix(self, tmp_path):
+        """FLUX.2 CivitAI/Comfy checkpoints are normalized before Diffusers conversion."""
+        checkpoint = tmp_path / "flux2.safetensors"
+        prefixed_key = "model.diffusion_model.double_blocks.0.img_attn.norm.key_norm.weight"
+        second_prefixed_key = "model.diffusion_model.single_blocks.0.norm.query_norm.weight"
+        prefixed_tensor = torch.ones(2)
+        second_prefixed_tensor = torch.zeros(2)
+
+        pipeline = CivitaiCheckpointPipeline()
+        with patch("safetensors.torch.load_file") as mock_load_file:
+            mock_load_file.return_value = {
+                prefixed_key: prefixed_tensor,
+                second_prefixed_key: second_prefixed_tensor,
+            }
+
+            result = pipeline._load_flux2_transformer_checkpoint(checkpoint)
+
+        mock_load_file.assert_called_once_with(checkpoint, device="cpu")
+        assert result["double_blocks.0.img_attn.norm.key_norm.weight"] is prefixed_tensor
+        assert result["single_blocks.0.norm.query_norm.weight"] is second_prefixed_tensor
+
+    def test_flux2_checkpoint_keeps_diffusers_keys(self, tmp_path):
+        """Already-unwrapped FLUX.2 checkpoints pass through unchanged."""
+        checkpoint = tmp_path / "flux2.safetensors"
+        state_dict = {"double_blocks.0.img_attn.norm.key_norm.weight": torch.ones(2)}
+
+        pipeline = CivitaiCheckpointPipeline()
+        with patch("safetensors.torch.load_file", return_value=state_dict):
+            result = pipeline._load_flux2_transformer_checkpoint(checkpoint)
+
+        assert result is state_dict
 
     def test_load_non_zimage_single_file_does_not_load_text_components(self, tmp_path):
         """Non-Z-Image checkpoints keep the original single-file loading behavior."""
