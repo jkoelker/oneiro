@@ -531,8 +531,8 @@ class TestCivitaiCheckpointPipelineLoad:
         assert call_kwargs["tokenizer"] is mock_tokenizer_instance
         assert call_kwargs["vae"] is mock_vae
 
-    def test_load_zimage_single_file_uses_checkpoint_vae_when_present(self, tmp_path):
-        """Z-Image checkpoints with VAE weights do not receive a duplicate repo VAE."""
+    def test_load_zimage_single_file_injects_repo_vae_when_checkpoint_vae_present(self, tmp_path):
+        """Z-Image checkpoints with prefixed VAE keys still receive an explicit repo VAE."""
         checkpoint = tmp_path / "model.safetensors"
         checkpoint.write_bytes(b"dummy")
 
@@ -541,6 +541,7 @@ class TestCivitaiCheckpointPipelineLoad:
         mock_pipeline_class.from_single_file.return_value = mock_pipe
         mock_text_encoder = MagicMock()
         mock_tokenizer_instance = MagicMock()
+        mock_vae = MagicMock()
         mock_policy = DevicePolicy(device="cpu", dtype=torch.bfloat16, offload=OffloadMode.NEVER)
 
         with (
@@ -561,6 +562,7 @@ class TestCivitaiCheckpointPipelineLoad:
         ):
             mock_qwen3_model.from_pretrained.return_value = mock_text_encoder
             mock_auto_tokenizer.from_pretrained.return_value = mock_tokenizer_instance
+            mock_autoencoder_kl.from_pretrained.return_value = mock_vae
 
             pipeline = CivitaiCheckpointPipeline()
             pipeline.load(
@@ -571,11 +573,15 @@ class TestCivitaiCheckpointPipelineLoad:
             )
 
         mock_has_component.assert_called_once_with(checkpoint, "vae")
-        mock_autoencoder_kl.from_pretrained.assert_not_called()
+        mock_autoencoder_kl.from_pretrained.assert_called_once_with(
+            "Tongyi-MAI/Z-Image-Turbo",
+            subfolder="vae",
+            torch_dtype=torch.bfloat16,
+        )
         call_kwargs = mock_pipeline_class.from_single_file.call_args.kwargs
         assert call_kwargs["text_encoder"] is mock_text_encoder
         assert call_kwargs["tokenizer"] is mock_tokenizer_instance
-        assert "vae" not in call_kwargs
+        assert call_kwargs["vae"] is mock_vae
 
     def test_load_qwen_single_file_assembles_qwen_pipeline(self, tmp_path):
         """CivitAI Qwen checkpoints load as Qwen transformer components, not SDXL."""
