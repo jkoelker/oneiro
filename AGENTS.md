@@ -47,6 +47,7 @@ tests/             # Mirrors src structure
 # Config access
 model = self.config.get("defaults", "model", default="zimage-turbo")
 
+
 # Discord commands - always defer first
 @bot.slash_command(name="dream", description="Generate an image")
 async def dream(ctx: discord.ApplicationContext, prompt: str):
@@ -54,8 +55,10 @@ async def dream(ctx: discord.ApplicationContext, prompt: str):
     # ... processing ...
     await ctx.followup.send(embed=embed, file=file)
 
+
 # Blocking ops in async context
 result = await asyncio.to_thread(self.pipeline.generate, prompt)
+
 
 # Task cancellation
 async def stop(self) -> None:
@@ -66,15 +69,19 @@ async def stop(self) -> None:
         except asyncio.CancelledError:
             pass
 
+
 # Dataclass with mutable default
 @dataclass
 class ModelVersion:
     files: list[ModelFile] = field(default_factory=list)  # Never default=[]
 
+
 # TYPE_CHECKING for circular imports
 from typing import TYPE_CHECKING
+
 if TYPE_CHECKING:
     from oneiro.config import Config
+
 
 class MyClass:
     def __init__(self, config: "Config"): ...
@@ -86,8 +93,10 @@ class MyClass:
 class CivitaiError(Exception):
     """Base exception for Civitai errors."""
 
+
 class CivitaiAuthError(CivitaiError):
     """Auth failed."""
+
 
 class CivitaiRateLimitError(CivitaiError):
     def __init__(self, message: str, retry_after: int | None = None):
@@ -100,11 +109,12 @@ class CivitaiRateLimitError(CivitaiError):
 ```python
 class TestConfigInit:
     """Tests for Config initialization."""
-    
+
     def test_accepts_string_path(self, tmp_path):
         base = tmp_path / "config.toml"
         base.write_text("[section]\nkey = 'value'\n")
         assert Config(str(base)).base_path == base
+
 
 # Async tests - no decorator needed (asyncio_mode = "auto")
 async def test_queue_start(self):
