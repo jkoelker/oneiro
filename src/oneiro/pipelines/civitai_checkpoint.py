@@ -23,7 +23,7 @@ from oneiro.pipelines.long_prompt import (
     get_weighted_text_embeddings_sd15,
     get_weighted_text_embeddings_sdxl,
 )
-from oneiro.pipelines.lora import LoraConfig, LoraLoaderMixin, parse_loras_from_model_config
+from oneiro.pipelines.lora import LoraConfig, LoraLoaderMixin
 
 if TYPE_CHECKING:
     from oneiro.civitai import CivitaiClient, ModelVersion
@@ -762,14 +762,6 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
                 self.pipe.vae.enable_tiling()
             if hasattr(self.pipe.vae, "enable_slicing"):
                 self.pipe.vae.enable_slicing()
-
-        loras = parse_loras_from_model_config(model_config)
-        if loras:
-            print(f"  Loading {len(loras)} LoRA(s)...")
-            self.load_loras_sync(loras)
-            self._static_lora_configs = list(loras)
-        else:
-            self._static_lora_configs = []
 
         # Load embeddings if full_config provided
         if self._full_config:

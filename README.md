@@ -29,6 +29,9 @@ Config uses layered TOML with hot-reload:
 - **Overlay config**: Optional, overrides base values
 - **State file**: JSON, runtime-persisted values
 
+The bundled config includes Krea 2 Turbo and Raw profiles. The official model repositories
+may require accepting their Hugging Face license and setting `HF_TOKEN` before loading.
+
 ### Environment Variables
 
 | Variable | Required | Description |
@@ -38,6 +41,7 @@ Config uses layered TOML with hot-reload:
 | `CONFIG_OVERLAY_PATH` | No | Overlay config for overrides |
 | `STATE_PATH` | No | Runtime state persistence (JSON) |
 | `HF_HOME` | No | Hugging Face cache directory |
+| `HF_TOKEN` | No | Hugging Face token for gated model repositories |
 | `CIVITAI_API_KEY` | No | Civitai API key for downloading restricted models |
 | `CIVITAI_CACHE_DIR` | No | Civitai cache directory (default: `~/.cache/civitai`) |
 | `ENABLE_PROGRESS_BARS` | No | Set to `1` to enable tqdm progress bars (disabled by default) |

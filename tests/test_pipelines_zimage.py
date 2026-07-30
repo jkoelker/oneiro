@@ -368,6 +368,7 @@ class TestZImagePipelineWrapperPostGenerate:
                 weight=0.8,
             )
             pipeline._loaded_adapters = ["static-adapter"]
+            pipeline._lora_configs = [static_lora]
             pipeline._static_lora_configs = [static_lora]
 
             pipeline.post_generate()
@@ -453,6 +454,7 @@ class TestZImagePipelineWrapperPostGenerate:
 
             # Only static adapters loaded, should reset weights
             pipeline._loaded_adapters = ["adapter-1", "adapter-2"]
+            pipeline._lora_configs = [static_lora1, static_lora2]
             pipeline._static_lora_configs = [static_lora1, static_lora2]
 
             pipeline.post_generate()
@@ -482,6 +484,7 @@ class TestZImagePipelineWrapperPostGenerate:
                 weight=0.8,
             )
             pipeline._loaded_adapters = ["static-adapter"]
+            pipeline._lora_configs = [static_lora]
             pipeline._static_lora_configs = [static_lora]
 
             # First generation
@@ -523,6 +526,7 @@ class TestZImagePipelineWrapperPostGenerate:
             )
 
             pipeline._loaded_adapters = ["actual-adapter-name", "fallback-name"]
+            pipeline._lora_configs = [lora_with_adapter_name, lora_without_adapter_name]
             pipeline._static_lora_configs = [lora_with_adapter_name, lora_without_adapter_name]
 
             pipeline.post_generate()

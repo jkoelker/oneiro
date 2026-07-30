@@ -2,7 +2,7 @@
 
 import io
 from pathlib import Path
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
 import torch
@@ -11,8 +11,11 @@ from PIL import Image
 from oneiro.device import DevicePolicy, OffloadMode, OffloadType
 from oneiro.pipelines import PipelineManager
 from oneiro.pipelines.base import BasePipeline, GenerationResult
+from oneiro.pipelines.flux2 import Flux2PipelineWrapper
 from oneiro.pipelines.flux2_klein import Flux2KleinPipelineWrapper
+from oneiro.pipelines.krea2 import Krea2PipelineWrapper
 from oneiro.pipelines.lora import LoraConfig, LoraSource
+from oneiro.pipelines.qwen import QwenPipelineWrapper
 
 
 class TestGenerationResult:
@@ -118,9 +121,398 @@ class TestBasePipelineInit:
 class TestPipelineManagerRegistry:
     """Tests for pipeline manager registration."""
 
+    def test_registers_krea2_pipeline_type(self):
+        """PipelineManager exposes the dedicated Krea 2 wrapper."""
+        assert PipelineManager.PIPELINE_TYPES["krea2"] is Krea2PipelineWrapper
+
     def test_registers_flux2_klein_pipeline_type(self):
         """PipelineManager exposes the dedicated FLUX.2 Klein wrapper."""
         assert PipelineManager.PIPELINE_TYPES["flux2-klein"] is Flux2KleinPipelineWrapper
+
+
+class TestPipelineManagerLoad:
+    """Tests for model configuration flow during pipeline loading."""
+
+    @patch("oneiro.pipelines.base.torch.set_num_interop_threads")
+    @patch("oneiro.pipelines.base.torch.set_num_threads")
+    @patch("diffusers.Krea2Pipeline", create=True)
+    async def test_resolves_named_local_lora_before_krea_load(
+        self, mock_krea2_pipeline, mock_threads, mock_interop, tmp_path
+    ):
+        """Krea loading resolves local named LoRAs before synchronous model setup."""
+        lora_path = tmp_path / "portrait.safetensors"
+        lora_path.write_bytes(b"test")
+        model_config = {
+            "type": "krea2",
+            "repo": "krea/Krea-2-Turbo",
+            "cpu_offload": False,
+            "loras": ["portrait"],
+        }
+        full_config = {
+            "models": {"krea2-turbo": model_config},
+            "loras": {"portrait": {"source": "local", "path": str(lora_path)}},
+        }
+        config = Mock()
+        config.get.return_value = model_config
+        config.data = full_config
+        manager = PipelineManager(config)
+        mock_krea2_pipeline.from_pretrained.return_value = MagicMock()
+
+        await manager.load_model("krea2-turbo")
+
+        assert manager.pipeline is not None
+        assert manager.pipeline.active_loras == ["portrait"]
+
+    async def test_does_not_pass_full_config_to_other_pipelines(self):
+        """Shared Krea resource config does not activate sibling embedding loading."""
+        model_config = {"type": "flux2", "repo": "example/flux2"}
+        config = Mock()
+        config.get.return_value = model_config
+        config.data = {"embeddings": {"example": {"source": "local", "path": "/tmp/x"}}}
+        manager = PipelineManager(config)
+
+        with patch.object(Flux2PipelineWrapper, "load") as mock_load:
+            await manager.load_model("flux2")
+
+        mock_load.assert_called_once_with(model_config)
+
+    async def test_resolves_named_local_lora_for_any_lora_pipeline(self, tmp_path):
+        """Named LoRA resolution is based on wrapper capability, not model type."""
+        lora_path = tmp_path / "portrait.safetensors"
+        lora_path.write_bytes(b"test")
+        model_config = {"type": "qwen", "repo": "example/qwen", "loras": ["portrait"]}
+        config = Mock()
+        config.get.return_value = model_config
+        config.data = {
+            "models": {"qwen": model_config},
+            "loras": {"portrait": {"source": "local", "path": str(lora_path)}},
+        }
+        manager = PipelineManager(config)
+
+        def load_without_external_model(pipeline, config):
+            pipeline.pipe = MagicMock()
+
+        with patch.object(
+            QwenPipelineWrapper, "load", autospec=True, side_effect=load_without_external_model
+        ):
+            await manager.load_model("qwen")
+
+        assert manager.pipeline is not None
+        assert manager.pipeline.active_loras == ["portrait"]
+
+    async def test_loads_legacy_huggingface_lora_through_shared_path(self):
+        """Legacy model LoRA fields remain supported by centralized loading."""
+        model_config = {
+            "type": "qwen",
+            "repo": "example/qwen",
+            "lora": "example/qwen-lightning",
+            "lora_weights": "lightning.safetensors",
+        }
+        config = Mock()
+        config.get.return_value = model_config
+        config.data = {"models": {"qwen": model_config}}
+        manager = PipelineManager(config)
+
+        def load_without_external_model(pipeline, config):
+            pipeline.pipe = MagicMock()
+
+        with patch.object(
+            QwenPipelineWrapper, "load", autospec=True, side_effect=load_without_external_model
+        ):
+            await manager.load_model("qwen")
+
+        assert manager.pipeline is not None
+        assert manager.pipeline.active_loras == ["legacy_lora"]
+        manager.pipeline.pipe.load_lora_weights.assert_called_once_with(
+            "example/qwen-lightning",
+            weight_name="lightning.safetensors",
+            adapter_name="legacy_lora",
+        )
+
+    async def test_failed_auto_load_lora_does_not_block_model(self, capsys):
+        """A broken global auto-load LoRA is skipped without blocking the model."""
+        model_config = {"type": "qwen", "repo": "example/qwen"}
+        config = Mock()
+        config.get.return_value = model_config
+        config.data = {
+            "models": {"qwen": model_config},
+            "loras": {
+                "auto_load": ["missing"],
+                "missing": {"source": "local", "path": "/missing/lora.safetensors"},
+            },
+        }
+        manager = PipelineManager(config)
+
+        def load_without_external_model(pipeline, config):
+            pipeline.pipe = MagicMock()
+
+        with patch.object(
+            QwenPipelineWrapper, "load", autospec=True, side_effect=load_without_external_model
+        ):
+            await manager.load_model("qwen")
+
+        assert manager.current_model == "qwen"
+        assert manager.pipeline is not None
+        assert manager.pipeline.active_loras == []
+        assert "Warning: Failed to resolve auto-load LoRA missing" in capsys.readouterr().out
+
+    async def test_malformed_auto_load_lora_does_not_block_model(self, capsys):
+        """A malformed global auto-load LoRA is skipped without blocking the model."""
+        model_config = {"type": "qwen", "repo": "example/qwen"}
+        config = Mock()
+        config.get.return_value = model_config
+        config.data = {
+            "models": {"qwen": model_config},
+            "loras": {
+                "auto_load": ["malformed"],
+                "malformed": {"source": "unsupported"},
+            },
+        }
+        manager = PipelineManager(config)
+
+        def load_without_external_model(pipeline, config):
+            pipeline.pipe = MagicMock()
+
+        with patch.object(
+            QwenPipelineWrapper, "load", autospec=True, side_effect=load_without_external_model
+        ):
+            await manager.load_model("qwen")
+
+        assert manager.current_model == "qwen"
+        assert manager.pipeline is not None
+        assert "Warning: Failed to parse auto-load LoRA malformed" in capsys.readouterr().out
+
+    async def test_auto_load_adapter_failure_does_not_block_model(self, capsys):
+        """A global adapter load failure is skipped without blocking the model."""
+        model_config = {"type": "qwen", "repo": "example/qwen"}
+        config = Mock()
+        config.get.return_value = model_config
+        config.data = {
+            "models": {"qwen": model_config},
+            "loras": {
+                "auto_load": ["broken"],
+                "broken": {"source": "huggingface", "repo": "missing/lora"},
+            },
+        }
+        manager = PipelineManager(config)
+
+        def load_without_external_model(pipeline, config):
+            pipeline.pipe = MagicMock()
+            pipeline.pipe.load_lora_weights.side_effect = RuntimeError("adapter load failed")
+
+        with patch.object(
+            QwenPipelineWrapper, "load", autospec=True, side_effect=load_without_external_model
+        ):
+            await manager.load_model("qwen")
+
+        assert manager.current_model == "qwen"
+        assert manager.pipeline is not None
+        assert manager.pipeline.active_loras == []
+        assert "Warning: Failed to load auto-load LoRA broken" in capsys.readouterr().out
+
+    async def test_failed_auto_duplicate_falls_back_to_explicit_lora(self):
+        """A failed auto adapter does not suppress the model's explicit reference."""
+        model_config = {
+            "type": "qwen",
+            "repo": "example/qwen",
+            "loras": ["shared"],
+        }
+        config = Mock()
+        config.get.return_value = model_config
+        config.data = {
+            "models": {"qwen": model_config},
+            "loras": {
+                "auto_load": ["shared"],
+                "shared": {"source": "huggingface", "repo": "example/shared"},
+            },
+        }
+        manager = PipelineManager(config)
+
+        def load_without_external_model(pipeline, config):
+            pipeline.pipe = MagicMock()
+            pipeline.pipe.load_lora_weights.side_effect = [RuntimeError("auto failed"), None]
+
+        with patch.object(
+            QwenPipelineWrapper, "load", autospec=True, side_effect=load_without_external_model
+        ):
+            await manager.load_model("qwen")
+
+        assert manager.pipeline is not None
+        assert manager.pipeline.pipe.load_lora_weights.call_count == 2
+        assert manager.pipeline.active_loras == ["shared"]
+
+    async def test_failed_auto_adapter_rolls_back_partial_external_state(self):
+        """A failed auto adapter removes weights mutated before the loader raised."""
+        model_config = {"type": "qwen", "repo": "example/qwen"}
+        config = Mock()
+        config.get.return_value = model_config
+        config.data = {
+            "models": {"qwen": model_config},
+            "loras": {
+                "auto_load": ["broken"],
+                "broken": {"source": "huggingface", "repo": "example/broken"},
+            },
+        }
+        manager = PipelineManager(config)
+
+        def load_without_external_model(pipeline, config):
+            pipeline.pipe = MagicMock()
+            pipeline.pipe.adapter_resident = False
+
+            def fail_after_mutation(*args, **kwargs):
+                pipeline.pipe.adapter_resident = True
+                raise RuntimeError("adapter load failed")
+
+            def clear_external_adapters():
+                pipeline.pipe.adapter_resident = False
+
+            pipeline.pipe.load_lora_weights.side_effect = fail_after_mutation
+            pipeline.pipe.unload_lora_weights.side_effect = clear_external_adapters
+
+        with patch.object(
+            QwenPipelineWrapper, "load", autospec=True, side_effect=load_without_external_model
+        ):
+            await manager.load_model("qwen")
+
+        assert manager.pipeline is not None
+        assert manager.pipeline.pipe.adapter_resident is False
+        manager.pipeline.pipe.unload_lora_weights.assert_called_once()
+
+    async def test_auto_adapter_activation_failure_does_not_block_model(self, capsys):
+        """A global adapter activation failure is skipped without blocking the model."""
+        model_config = {"type": "qwen", "repo": "example/qwen"}
+        config = Mock()
+        config.get.return_value = model_config
+        config.data = {
+            "models": {"qwen": model_config},
+            "loras": {
+                "auto_load": ["broken"],
+                "broken": {"source": "huggingface", "repo": "example/broken"},
+            },
+        }
+        manager = PipelineManager(config)
+
+        def load_without_external_model(pipeline, config):
+            pipeline.pipe = MagicMock()
+            pipeline.pipe.set_adapters.side_effect = RuntimeError("activation failed")
+
+        with patch.object(
+            QwenPipelineWrapper, "load", autospec=True, side_effect=load_without_external_model
+        ):
+            await manager.load_model("qwen")
+
+        assert manager.current_model == "qwen"
+        assert manager.pipeline is not None
+        assert manager.pipeline.active_loras == []
+        assert "Warning: Failed to activate auto-load LoRAs" in capsys.readouterr().out
+
+    async def test_failed_auto_rollback_aborts_contaminated_pipeline(self):
+        """An adapter that cannot be rolled back prevents the pipeline from becoming active."""
+        model_config = {"type": "qwen", "repo": "example/qwen"}
+        config = Mock()
+        config.get.return_value = model_config
+        config.data = {
+            "models": {"qwen": model_config},
+            "loras": {
+                "auto_load": ["broken"],
+                "broken": {"source": "huggingface", "repo": "example/broken"},
+            },
+        }
+        manager = PipelineManager(config)
+
+        def load_without_external_model(pipeline, config):
+            pipeline.pipe = MagicMock()
+            pipeline.pipe.load_lora_weights.side_effect = RuntimeError("adapter load failed")
+            pipeline.pipe.unload_lora_weights.side_effect = RuntimeError("rollback failed")
+
+        with (
+            patch.object(
+                QwenPipelineWrapper, "load", autospec=True, side_effect=load_without_external_model
+            ),
+            pytest.raises(RuntimeError, match="rollback failed"),
+        ):
+            await manager.load_model("qwen")
+
+        assert manager.pipeline is None
+        assert manager.current_model is None
+
+    async def test_failed_validation_preserves_current_model(self):
+        """Invalid target resources do not unload the current model."""
+        model_config = {"type": "krea2", "loras": ["missing"]}
+        config = Mock()
+        config.get.return_value = model_config
+        config.data = {
+            "models": {"krea2": model_config},
+            "loras": {"missing": {"source": "local", "path": "/missing/lora.safetensors"}},
+        }
+        manager = PipelineManager(config)
+        previous_pipeline = Mock()
+        manager.pipeline = previous_pipeline
+        manager.current_model = "previous"
+
+        with pytest.raises(FileNotFoundError, match="not found"):
+            await manager.load_model("krea2")
+
+        previous_pipeline.unload.assert_not_called()
+        assert manager.pipeline is previous_pipeline
+        assert manager.current_model == "previous"
+
+    async def test_failed_load_unloads_partial_pipeline(self):
+        """A failed load releases a pipeline created before the error."""
+        model_config = {"type": "qwen", "repo": "example/qwen"}
+        config = Mock()
+        config.get.return_value = model_config
+        config.data = {"models": {"qwen": model_config}}
+        manager = PipelineManager(config)
+        partial_pipeline = None
+
+        def fail_after_pipe_creation(pipeline, config):
+            nonlocal partial_pipeline
+            pipeline.pipe = MagicMock()
+            partial_pipeline = pipeline
+            raise RuntimeError("load failed")
+
+        with (
+            patch.object(
+                QwenPipelineWrapper,
+                "load",
+                autospec=True,
+                side_effect=fail_after_pipe_creation,
+            ),
+            pytest.raises(RuntimeError, match="load failed"),
+        ):
+            await manager.load_model("qwen")
+
+        assert partial_pipeline is not None
+        assert partial_pipeline.pipe is None
+
+    async def test_cleanup_error_does_not_mask_load_error(self, capsys):
+        """Cleanup failures preserve the original model-load exception."""
+        model_config = {"type": "qwen", "repo": "example/qwen"}
+        config = Mock()
+        config.get.return_value = model_config
+        config.data = {"models": {"qwen": model_config}}
+        manager = PipelineManager(config)
+
+        def fail_after_pipe_creation(pipeline, config):
+            pipeline.pipe = MagicMock()
+            raise RuntimeError("load failed")
+
+        with (
+            patch.object(
+                QwenPipelineWrapper,
+                "load",
+                autospec=True,
+                side_effect=fail_after_pipe_creation,
+            ),
+            patch.object(QwenPipelineWrapper, "unload", side_effect=RuntimeError("cleanup failed")),
+            pytest.raises(RuntimeError, match="load failed"),
+        ):
+            await manager.load_model("qwen")
+
+        assert manager.pipeline is None
+        assert manager.current_model is None
+        assert "Warning: Failed to unload partial pipeline" in capsys.readouterr().out
 
 
 class TestBasePipelineUnload:
