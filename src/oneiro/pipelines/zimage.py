@@ -8,7 +8,7 @@ from PIL import Image
 from oneiro.device import DevicePolicy, OffloadType
 from oneiro.pipelines.base import BasePipeline, GenerationResult
 from oneiro.pipelines.embedding import EmbeddingLoaderMixin, parse_embeddings_from_config
-from oneiro.pipelines.lora import LoraLoaderMixin, parse_loras_from_model_config
+from oneiro.pipelines.lora import LoraLoaderMixin
 
 
 class ZImagePipelineWrapper(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipeline):
@@ -50,12 +50,6 @@ class ZImagePipelineWrapper(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipeline)
         self.img2img_pipe = ZImageImg2ImgPipeline(**self.pipe.components)
         self.inpaint_pipe = ZImageInpaintPipeline(**self.pipe.components)
         self._active_pipe = self.pipe
-
-        loras = parse_loras_from_model_config(model_config)
-        if loras:
-            print(f"  Loading {len(loras)} LoRA(s)...")
-            self.load_loras_sync(loras)
-            self.set_static_loras(loras)
 
         # Load embeddings if full_config provided
         if full_config:

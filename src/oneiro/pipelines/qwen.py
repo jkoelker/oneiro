@@ -10,7 +10,7 @@ from PIL import Image
 from oneiro.device import DevicePolicy
 from oneiro.pipelines.base import BasePipeline, GenerationResult
 from oneiro.pipelines.embedding import EmbeddingLoaderMixin, parse_embeddings_from_config
-from oneiro.pipelines.lora import LoraLoaderMixin, parse_loras_from_model_config
+from oneiro.pipelines.lora import LoraLoaderMixin
 
 
 class QwenPipelineWrapper(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipeline):
@@ -150,12 +150,6 @@ class QwenPipelineWrapper(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipeline):
             pipeline_kwargs["transformer"] = transformer
 
         self.pipe = DiffusionPipeline.from_pretrained(repo, **pipeline_kwargs)
-
-        loras = parse_loras_from_model_config(model_config)
-        if loras:
-            print(f"  Loading {len(loras)} LoRA(s)...")
-            self.load_loras_sync(loras)
-            self.set_static_loras(loras)
 
         if full_config:
             embeddings = parse_embeddings_from_config(full_config, model_config)

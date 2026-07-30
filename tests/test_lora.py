@@ -363,6 +363,28 @@ class TestParseLORAsFromConfig:
         assert loras[0].civitai_id == 123456
         assert loras[0].weight == 0.5
 
+    def test_malformed_auto_load_lora_is_not_returned(self, capsys):
+        """An auto-load entry rejected during bookkeeping is fully discarded."""
+        full_config = {
+            "loras": {
+                "auto_load": ["malformed"],
+                "malformed": {
+                    "name": ["not", "a", "string"],
+                    "source": "huggingface",
+                    "repo": "user/lora",
+                },
+            }
+        }
+
+        loras = parse_loras_from_config(
+            full_config,
+            {},
+            ignore_auto_load_errors=True,
+        )
+
+        assert loras == []
+        assert "Warning: Failed to parse auto-load LoRA malformed" in capsys.readouterr().out
+
     def test_named_reference_loras(self):
         """Parses named reference LoRAs from model config."""
         full_config = {
@@ -406,6 +428,23 @@ class TestParseLORAsFromConfig:
         assert len(loras) == 1
         assert loras[0].adapter_name == "inline-style"
         assert loras[0].civitai_id == 99999
+
+    def test_inline_lora_table(self):
+        """Parses a single inline LoRA defined as a table."""
+        model_config = {
+            "type": "qwen",
+            "loras": {
+                "source": "huggingface",
+                "repo": "user/detail-lora",
+                "weight": 0.8,
+            },
+        }
+
+        loras = parse_loras_from_config({"loras": {}}, model_config)
+
+        assert len(loras) == 1
+        assert loras[0].repo == "user/detail-lora"
+        assert loras[0].weight == 0.8
 
     def test_inline_loras_section(self):
         """Parses inline_loras section in model config."""
@@ -588,6 +627,12 @@ class TestIsLoraCompatible:
         assert not is_resource_compatible("flux2", "Flux.2 Klein 9B")
         assert not is_resource_compatible("flux2-klein", "Flux.2")
 
+    def test_krea2_compatible(self):
+        """Krea 2 LoRAs are restricted to the Krea 2 pipeline."""
+        assert is_resource_compatible("krea2", "Krea 2")
+        assert is_resource_compatible("krea2", "Krea-2")
+        assert not is_resource_compatible("krea2", "Qwen-Image")
+
     def test_sdxl_compatible(self):
         """SDXL LoRAs compatible with sdxl pipeline."""
         assert is_resource_compatible("sdxl", "SDXL 1.0")
@@ -637,7 +682,7 @@ class TestPipelineBaseModelMap:
 
     def test_all_pipeline_types_have_mappings(self):
         """All common pipeline types have base model mappings."""
-        expected_types = ["flux2", "flux2-klein", "zimage", "qwen", "sdxl", "sd15"]
+        expected_types = ["flux2", "flux2-klein", "krea2", "zimage", "qwen", "sdxl", "sd15"]
         for pipeline_type in expected_types:
             assert pipeline_type in PIPELINE_BASE_MODEL_MAP
             assert len(PIPELINE_BASE_MODEL_MAP[pipeline_type]) > 0
@@ -870,6 +915,7 @@ class TestLoraLoaderMixinStaticLoras:
         ]
         mixin.set_static_loras(loras)
         mixin._loaded_adapters = ["lora1", "lora2"]
+        mixin._lora_configs = list(loras)
 
         mixin.unload_loras = Mock()
         mixin.load_loras_sync = Mock()
@@ -944,6 +990,7 @@ class TestLoraLoaderMixinStaticLoras:
         ]
         mixin.set_static_loras(loras)
         mixin._loaded_adapters = ["custom_adapter"]
+        mixin._lora_configs = list(loras)
 
         mixin.unload_loras = Mock()
         mixin.load_loras_sync = Mock()

@@ -35,6 +35,24 @@ group_offload_type = "leaf_level"
 steps = 4
 guidance_scale = 1.0  # Distilled Klein model-card default; base variants use 4.0/50 steps
 
+[models.krea2-turbo]
+type = "krea2"
+repo = "krea/Krea-2-Turbo"
+cpu_offload = true
+offload_type = "group"
+group_offload_type = "leaf_level"
+steps = 8
+guidance_scale = 0.0
+
+[models.krea2-raw]
+type = "krea2"
+repo = "krea/Krea-2-Raw"
+cpu_offload = true
+offload_type = "group"
+group_offload_type = "leaf_level"
+steps = 28
+guidance_scale = 4.5
+
 [models.qwen-image]
 type = "qwen"
 repo = "Qwen/Qwen-Image"

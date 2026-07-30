@@ -354,6 +354,9 @@ def parse_loras_from_model_config(model_config: dict[str, Any]) -> list[LoraConf
 def parse_loras_from_config(
     full_config: dict[str, Any],
     model_config: dict[str, Any],
+    *,
+    include_auto_load: bool = True,
+    ignore_auto_load_errors: bool = False,
 ) -> list[LoraConfig]:
     """Parse all LoRA configurations for a model from full config.
 
@@ -401,22 +404,27 @@ def parse_loras_from_config(
     loaded_names: set[str] = set()
 
     # 1. Global auto_load LoRAs
-    auto_load = loras_section.get("auto_load", [])
+    auto_load = loras_section.get("auto_load", []) if include_auto_load else []
     if isinstance(auto_load, list):
         for ref_name in auto_load:
-            if ref_name in loaded_names:
-                continue
-            if ref_name in loras_section and isinstance(loras_section[ref_name], dict):
-                lora_config = loras_section[ref_name]
-                parsed = parse_lora_config(lora_config, index=len(loras))
-                if not lora_config.get("name"):
-                    parsed.name = ref_name
-                    if lora_config.get("adapter_name") is None:
-                        parsed.adapter_name = ref_name
-                loras.append(parsed)
-                loaded_names.add(parsed.name)
-            else:
-                print(f"Warning: auto_load LoRA '{ref_name}' not found in [loras] section")
+            try:
+                if ref_name in loaded_names:
+                    continue
+                if ref_name in loras_section and isinstance(loras_section[ref_name], dict):
+                    lora_config = loras_section[ref_name]
+                    parsed = parse_lora_config(lora_config, index=len(loras))
+                    if not lora_config.get("name"):
+                        parsed.name = ref_name
+                        if lora_config.get("adapter_name") is None:
+                            parsed.adapter_name = ref_name
+                    loaded_names.add(parsed.name)
+                    loras.append(parsed)
+                else:
+                    print(f"Warning: auto_load LoRA '{ref_name}' not found in [loras] section")
+            except Exception as error:
+                if not ignore_auto_load_errors:
+                    raise
+                print(f"Warning: Failed to parse auto-load LoRA {ref_name}: {error}")
 
     # 2. Named references from model config
     model_loras = model_config.get("loras", [])
@@ -441,6 +449,11 @@ def parse_loras_from_config(
                 if parsed.name not in loaded_names:
                     loras.append(parsed)
                     loaded_names.add(parsed.name)
+    elif isinstance(model_loras, dict):
+        parsed = parse_lora_config(model_loras, index=len(loras))
+        if parsed.name not in loaded_names:
+            loras.append(parsed)
+            loaded_names.add(parsed.name)
 
     # 3. Inline definitions via [[models.X.inline_loras]]
     inline_loras = model_config.get("inline_loras", [])
@@ -452,6 +465,12 @@ def parse_loras_from_config(
                     loras.append(parsed)
                     loaded_names.add(parsed.name)
 
+    if "loras" not in model_config:
+        for parsed in parse_loras_from_model_config(model_config):
+            if parsed.name not in loaded_names:
+                loras.append(parsed)
+                loaded_names.add(parsed.name)
+
     return loras
 
 
@@ -461,6 +480,7 @@ PIPELINE_BASE_MODEL_MAP: dict[str, list[str]] = {
     "flux1": ["Flux.1 D", "Flux.1 S", "Flux.1", "Flux.1 Dev", "Flux.1 Schnell"],
     "flux2": ["Flux.2"],
     "flux2-klein": ["Flux.2 Klein", "FLUX.2-klein"],
+    "krea2": ["Krea 2", "Krea-2"],
     "zimage": ["ZImageTurbo", "ZImageBase", "Z-Image"],
     "qwen": ["Qwen", "Qwen-Image"],
     "sdxl": ["SDXL 1.0", "SDXL Turbo", "SDXL Lightning", "Pony", "Illustrious"],
@@ -758,9 +778,9 @@ class LoraLoaderMixin:
 
         self.set_lora_adapters(self._loaded_adapters, adapter_weights)
 
-    def unload_loras(self) -> None:
+    def unload_loras(self, force: bool = False) -> None:
         """Completely unload all LoRA adapters and free memory."""
-        if self.pipe is None or not self._loaded_adapters:
+        if self.pipe is None or (not self._loaded_adapters and not force):
             return
 
         print(f"Unloading {len(self._loaded_adapters)} LoRA adapter(s)")
@@ -768,9 +788,11 @@ class LoraLoaderMixin:
             self.pipe.unload_lora_weights()
         except Exception as e:
             print(f"Warning: Error unloading LoRAs: {e}")
-
-        self._loaded_adapters.clear()
-        self._lora_configs.clear()
+            if force:
+                raise
+        finally:
+            self._loaded_adapters.clear()
+            self._lora_configs.clear()
 
     def fuse_loras(self, lora_scale: float = 1.0) -> None:
         """Fuse LoRA weights into base model for faster inference.
@@ -829,8 +851,9 @@ class LoraLoaderMixin:
         """
         static_names = [lora.adapter_name or lora.name for lora in self._static_lora_configs]
         adapters_match = self._loaded_adapters == static_names
+        configs_match = self._lora_configs == self._static_lora_configs
 
-        if adapters_match:
+        if adapters_match and configs_match:
             # Adapters match - just reset weights if there are static LoRAs
             if self._static_lora_configs:
                 adapter_weights = [lora.weight for lora in self._static_lora_configs]
