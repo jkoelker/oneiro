@@ -1,15 +1,26 @@
 """Slash command definitions for Oneiro Discord bot."""
 
 import re
+from contextlib import suppress
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import discord
 from discord import option
 
-from oneiro.civitai import CivitaiError, parse_civitai_url
+from oneiro.civitai import CivitaiClient, CivitaiError, ModelFile, parse_civitai_url
+from oneiro.device import DevicePolicy
 from oneiro.discord.handlers import DreamContext, create_dream_callbacks
 from oneiro.pipelines import SCHEDULER_CHOICES
-from oneiro.pipelines.civitai_checkpoint import CivitaiCheckpointPipeline
+from oneiro.pipelines.civitai_checkpoint import (
+    DEFAULT_KREA2_COMPONENT_REPO,
+    DEFAULT_KREA2_RAW_COMPONENT_REPO,
+    CivitaiCheckpointPipeline,
+    get_krea2_checkpoint_precision,
+    get_krea2_checkpoint_precision_from_header,
+    get_krea2_generation_defaults,
+    get_pipeline_config_for_base_model,
+)
 from oneiro.pipelines.lora import is_resource_compatible
 from oneiro.queue import QueueStatus
 from oneiro.services.generation import (
@@ -49,6 +60,48 @@ def slugify(text: str) -> str:
     # Remove leading/trailing hyphens
     slug = slug.strip("-")
     return slug or "unnamed"
+
+
+def is_krea2_base_model(base_model: str | None) -> bool:
+    """Return whether CivitAI metadata resolves to the Krea 2 pipeline."""
+    if base_model is None:
+        return False
+    try:
+        return get_pipeline_config_for_base_model(base_model).pipeline_class == "Krea2Pipeline"
+    except ValueError:
+        return False
+
+
+def krea2_component_repo(
+    model_name: str,
+    version_name: str,
+    variant: str = "auto",
+) -> str:
+    """Choose hosted Krea components from CivitAI model and version names."""
+    if variant == "raw":
+        return DEFAULT_KREA2_RAW_COMPONENT_REPO
+    if variant == "turbo":
+        return DEFAULT_KREA2_COMPONENT_REPO
+    for name in (version_name, model_name):
+        normalized = name.lower()
+        if re.search(r"(?<![a-z])turbo(?![a-z])", normalized):
+            return DEFAULT_KREA2_COMPONENT_REPO
+        if re.search(r"(?<![a-z])raw(?![a-z])", normalized):
+            return DEFAULT_KREA2_RAW_COMPONENT_REPO
+    return DEFAULT_KREA2_COMPONENT_REPO
+
+
+def _discard_invalid_civitai_download(
+    client: CivitaiClient,
+    model_file: ModelFile,
+    path: Path,
+) -> None:
+    """Best-effort removal of a rejected download and its cache entry."""
+    if model_file.sha256:
+        with suppress(Exception):
+            client.cache.remove(model_file.sha256)
+    with suppress(OSError):
+        path.unlink(missing_ok=True)
 
 
 def validate_image_attachment(attachment: discord.Attachment, label: str) -> str | None:
@@ -609,10 +662,26 @@ def register_commands(bot: "OneiroBot") -> None:
         description="Custom name for the resource (default: slugified model name)",
         required=False,
     )
+    @option(
+        "precision",
+        str,
+        description="Checkpoint precision (Krea 2 only)",
+        required=False,
+        choices=["auto", "bf16", "fp16", "fp32"],
+    )
+    @option(
+        "krea2_variant",
+        str,
+        description="Krea 2 component recipe override",
+        required=False,
+        choices=["auto", "turbo", "raw"],
+    )
     async def fetch_command(
         ctx: discord.ApplicationContext,
         url: str,
         name: str | None = None,
+        precision: str = "auto",
+        krea2_variant: str = "auto",
     ) -> None:
         """Fetch a model from Civitai and auto-configure it."""
         if ctx.bot.config is None or ctx.bot.civitai_client is None:
@@ -687,7 +756,57 @@ def register_commands(bot: "OneiroBot") -> None:
             )
 
             # Download the model
-            downloaded_path = await ctx.bot.civitai_client.download_model_version(version)
+            selected_file = None
+            selected_precision = None
+            component_repo = None
+            cached_checkpoint = None
+            if model_type == "CHECKPOINT" and is_krea2_base_model(version.base_model):
+                policy_precision = {
+                    "bfloat16": "bf16",
+                    "float16": "fp16",
+                    "float32": "fp32",
+                }[str(DevicePolicy.auto_detect().dtype).removeprefix("torch.")]
+                selected_file = version.select_checkpoint_file(
+                    precision,
+                    preferred_precision=policy_precision,
+                )
+                component_repo = krea2_component_repo(
+                    model.name,
+                    version.name,
+                    krea2_variant,
+                )
+                if selected_file.sha256:
+                    cached_checkpoint = ctx.bot.civitai_client.cache.get(selected_file.sha256)
+                try:
+                    if cached_checkpoint:
+                        selected_precision = get_krea2_checkpoint_precision(cached_checkpoint)
+                    else:
+                        header = await ctx.bot.civitai_client.get_safetensor_header(
+                            selected_file.download_url
+                        )
+                        selected_precision = get_krea2_checkpoint_precision_from_header(header)
+                except Exception as error:
+                    if cached_checkpoint:
+                        _discard_invalid_civitai_download(
+                            ctx.bot.civitai_client,
+                            selected_file,
+                            cached_checkpoint,
+                        )
+                    raise CivitaiError(str(error)) from error
+            downloaded_path = await ctx.bot.civitai_client.download_model_version(
+                version,
+                model_file=selected_file,
+            )
+            if selected_file:
+                try:
+                    selected_precision = get_krea2_checkpoint_precision(downloaded_path)
+                except Exception as error:
+                    _discard_invalid_civitai_download(
+                        ctx.bot.civitai_client,
+                        selected_file,
+                        downloaded_path,
+                    )
+                    raise CivitaiError(str(error)) from error
 
             # Get current pipeline type for compatibility info
             pipeline_type = None
@@ -746,17 +865,27 @@ def register_commands(bot: "OneiroBot") -> None:
 
             elif model_type == "CHECKPOINT":
                 # For checkpoints, we need to add to models section
+                checkpoint_config = {
+                    "type": "civitai",
+                    "civitai_id": model_id,
+                    "civitai_version": version.id,
+                    "name": model.name,
+                    "base_model": version.base_model,
+                    "checkpoint_path": str(downloaded_path),
+                }
+                if component_repo:
+                    default_steps, default_guidance = get_krea2_generation_defaults(component_repo)
+                    checkpoint_config.update(
+                        {
+                            "krea2_component_repo": component_repo,
+                            "steps": default_steps,
+                            "guidance_scale": default_guidance,
+                        }
+                    )
                 ctx.bot.config.set(
                     "models",
                     resource_name,
-                    value={
-                        "type": "civitai",
-                        "civitai_id": model_id,
-                        "civitai_version": version.id,
-                        "name": model.name,
-                        "base_model": version.base_model,
-                        "checkpoint_path": str(downloaded_path),
-                    },
+                    value=checkpoint_config,
                 )
 
                 embed = discord.Embed(
@@ -818,10 +947,31 @@ def register_commands(bot: "OneiroBot") -> None:
                 )
 
             # Add common fields
-            primary_file = version.primary_file
-            if primary_file:
-                size_mb = primary_file.size_kb / 1024
+            downloaded_file = selected_file or version.primary_file
+            if downloaded_file:
+                size_mb = downloaded_file.size_kb / 1024
                 embed.add_field(name="Size", value=f"{size_mb:.1f} MB", inline=True)
+            if selected_file:
+                embed.add_field(
+                    name="Precision",
+                    value=f"`{selected_precision}`",
+                    inline=True,
+                )
+            elif precision != "auto":
+                embed.add_field(
+                    name="Precision",
+                    value=f"`{precision}` ignored; selection is only supported for Krea 2 checkpoints",
+                    inline=False,
+                )
+            if not selected_file and krea2_variant != "auto":
+                embed.add_field(
+                    name="Krea 2 Variant",
+                    value=(
+                        f"`{krea2_variant}` ignored; component selection is only supported "
+                        "for Krea 2 checkpoints"
+                    ),
+                    inline=False,
+                )
 
             embed.set_footer(text=f"Civitai Model ID: {model_id} | Version: {version.id}")
 

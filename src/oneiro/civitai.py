@@ -165,6 +165,34 @@ class ModelVersion:
                 return f
         return self.files[0] if self.files else None
 
+    def select_checkpoint_file(
+        self,
+        precision: str = "auto",
+        preferred_precision: str = "bf16",
+    ) -> ModelFile:
+        """Select the best floating-point SafeTensor checkpoint for Diffusers."""
+        supported_precisions = ("bf16", "fp16", "fp32")
+        weight_file_types = {"model", "unet", "diffusion model"}
+        candidates = [
+            file
+            for file in self.files
+            if file.type.lower() in weight_file_types
+            and (file.format or "").lower() == "safetensor"
+            and (file.fp or "").lower() in supported_precisions
+        ]
+        if not candidates:
+            raise CivitaiError("No Diffusers-compatible floating-point SafeTensor checkpoint found")
+
+        if precision != "auto":
+            candidates = [file for file in candidates if (file.fp or "").lower() == precision]
+            if not candidates:
+                raise CivitaiError(f"No {precision} SafeTensor checkpoint found")
+
+        precision_order = (preferred_precision,) + tuple(
+            item for item in supported_precisions if item != preferred_precision
+        )
+        return min(candidates, key=lambda file: precision_order.index((file.fp or "").lower()))
+
 
 @dataclass
 class Model:
@@ -336,6 +364,7 @@ class CivitaiClient:
 
     BASE_URL = "https://civitai.com/api/v1"
     DEFAULT_CACHE_DIR = Path.home() / ".cache" / "civitai"
+    MAX_SAFETENSOR_HEADER_BYTES = 1_000_000
 
     def __init__(
         self,
@@ -618,10 +647,7 @@ class CivitaiClient:
         client = await self._ensure_client()
 
         # Add API key as query param for download URLs if authenticated
-        download_url = url
-        if self.api_key and "civitai.com" in url:
-            separator = "&" if "?" in url else "?"
-            download_url = f"{url}{separator}token={self.api_key}"
+        download_url = self._authenticated_download_url(url)
 
         try:
             async with client.stream(
@@ -680,53 +706,137 @@ class CivitaiClient:
 
         return dest
 
+    def _authenticated_download_url(self, url: str) -> str:
+        """Add the CivitAI download token when configured."""
+        if self.api_key and "civitai.com" in url:
+            separator = "&" if "?" in url else "?"
+            return f"{url}{separator}token={self.api_key}"
+        return url
+
+    async def _read_download_prefix(self, url: str, length: int) -> bytes:
+        """Read only the requested prefix of a remote download."""
+        client = await self._ensure_client()
+        try:
+            async with client.stream(
+                "GET",
+                self._authenticated_download_url(url),
+                headers={
+                    "Range": f"bytes=0-{length - 1}",
+                    "Accept-Encoding": "identity",
+                },
+                timeout=httpx.Timeout(self.download_timeout),
+            ) as response:
+                response.raise_for_status()
+                if response.status_code == 206 and not response.headers.get(
+                    "Content-Range", ""
+                ).startswith("bytes 0-"):
+                    raise CivitaiError("SafeTensor server returned an invalid byte range")
+                data = bytearray()
+                async for chunk in response.aiter_raw():
+                    data.extend(chunk[: length - len(data)])
+                    if len(data) == length:
+                        break
+        except httpx.HTTPStatusError as error:
+            raise CivitaiError(
+                f"SafeTensor header request failed: HTTP {error.response.status_code}"
+            ) from error
+        except httpx.RequestError as error:
+            raise CivitaiError(f"SafeTensor header request failed: {error}") from error
+
+        if len(data) != length:
+            raise CivitaiError("SafeTensor file ended before its header was complete")
+        return bytes(data)
+
+    async def get_safetensor_header(self, url: str) -> dict[str, Any]:
+        """Read a SafeTensor JSON header using two bounded range requests."""
+        prefix = await self._read_download_prefix(url, 8)
+        header_size = int.from_bytes(prefix, "little")
+        if not 0 < header_size <= self.MAX_SAFETENSOR_HEADER_BYTES:
+            raise CivitaiError("Invalid SafeTensor header size")
+
+        payload = await self._read_download_prefix(url, 8 + header_size)
+        try:
+            header = json.loads(payload[8:].decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise CivitaiError("Invalid SafeTensor header") from error
+        if not isinstance(header, dict):
+            raise CivitaiError("Invalid SafeTensor header")
+        metadata = header.get("__metadata__", {})
+        if not isinstance(metadata, dict):
+            raise CivitaiError("Invalid SafeTensor metadata")
+        for key, descriptor in header.items():
+            if key == "__metadata__":
+                continue
+            if not isinstance(descriptor, dict):
+                raise CivitaiError("Invalid SafeTensor tensor descriptor")
+            shape = descriptor.get("shape")
+            offsets = descriptor.get("data_offsets")
+            if (
+                not isinstance(descriptor.get("dtype"), str)
+                or not isinstance(shape, list)
+                or any(not isinstance(size, int) or size < 0 for size in shape)
+                or not isinstance(offsets, list)
+                or len(offsets) != 2
+                or any(not isinstance(offset, int) or offset < 0 for offset in offsets)
+                or offsets[0] > offsets[1]
+            ):
+                raise CivitaiError("Invalid SafeTensor tensor descriptor")
+        return header
+
     async def download_model_version(
         self,
         version: ModelVersion,
         dest_dir: Path | str | None = None,
         progress_callback: Callable[[int, int], Awaitable[None]] | None = None,
+        model_file: ModelFile | None = None,
     ) -> Path:
-        """Download the primary file for a model version.
+        """Download a selected or primary file for a model version.
 
         Args:
             version: ModelVersion to download
             dest_dir: Destination directory (default: cache_dir/models)
             progress_callback: Progress callback
+            model_file: Specific file to download (default: primary file)
 
         Returns:
             Path to downloaded file
         """
-        primary = version.primary_file
-        if not primary:
+        selected = model_file or version.primary_file
+        if not selected:
             raise CivitaiError(f"No files available for version {version.id}")
 
         # Check cache first
-        if primary.sha256:
-            cached = self._cache.get(primary.sha256)
+        if selected.sha256:
+            cached = self._cache.get(selected.sha256)
             if cached:
                 print(f"Model found in cache: {cached}")
                 return cached
 
         dest_dir = Path(dest_dir) if dest_dir else self.cache_dir / "models"
         dest_dir.mkdir(parents=True, exist_ok=True)
-        dest = dest_dir / primary.name
+        filename = selected.name
+        if model_file is not None:
+            path = Path(filename)
+            variant = f"{selected.fp}-{selected.id}" if selected.fp else str(selected.id)
+            filename = f"{path.stem}-{variant}{path.suffix}"
+        dest = dest_dir / filename
 
         downloaded = await self.download_file(
-            url=primary.download_url,
+            url=selected.download_url,
             dest=dest,
-            expected_hash=primary.sha256,
+            expected_hash=selected.sha256,
             progress_callback=progress_callback,
         )
 
         # Add to cache if we have a hash
-        if primary.sha256:
+        if selected.sha256:
             self._cache.add(
                 file_path=downloaded,
-                sha256=primary.sha256,
+                sha256=selected.sha256,
                 model_id=version.model_id,
                 version_id=version.id,
-                filename=primary.name,
-                size_kb=primary.size_kb,
+                filename=filename,
+                size_kb=selected.size_kb,
             )
 
         return downloaded

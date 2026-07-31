@@ -11,6 +11,7 @@ from oneiro.civitai import (
     CivitaiAuthError,
     CivitaiCache,
     CivitaiClient,
+    CivitaiError,
     CivitaiNotFoundError,
     CivitaiRateLimitError,
     Model,
@@ -199,6 +200,125 @@ class TestModelVersion:
 
         assert version.primary_file is not None
         assert version.primary_file.name == "first.bin"
+
+    def test_select_checkpoint_file_auto_prefers_diffusers_compatible_precision(self):
+        """Automatic checkpoint selection skips unsupported quantized files."""
+        version = ModelVersion.from_dict(
+            {
+                "id": 1,
+                "name": "Krea",
+                "files": [
+                    {
+                        "id": 1,
+                        "name": "krea.safetensors",
+                        "downloadUrl": "http://x/fp8",
+                        "metadata": {"format": "SafeTensor", "fp": "fp8"},
+                        "primary": True,
+                    },
+                    {
+                        "id": 2,
+                        "name": "krea.safetensors",
+                        "downloadUrl": "http://x/bf16",
+                        "metadata": {"format": "SafeTensor", "fp": "bf16"},
+                    },
+                ],
+            }
+        )
+
+        selected = version.select_checkpoint_file()
+
+        assert selected.id == 2
+
+    def test_select_checkpoint_file_honors_explicit_precision(self):
+        """Explicit checkpoint precision overrides the automatic ranking."""
+        version = ModelVersion.from_dict(
+            {
+                "id": 1,
+                "name": "Krea",
+                "files": [
+                    {
+                        "id": 1,
+                        "name": "krea-bf16.safetensors",
+                        "downloadUrl": "http://x/bf16",
+                        "metadata": {"format": "SafeTensor", "fp": "bf16"},
+                        "primary": True,
+                    },
+                    {
+                        "id": 2,
+                        "name": "krea-fp16.safetensors",
+                        "downloadUrl": "http://x/fp16",
+                        "metadata": {"format": "SafeTensor", "fp": "fp16"},
+                    },
+                ],
+            }
+        )
+
+        selected = version.select_checkpoint_file("fp16")
+
+        assert selected.id == 2
+
+    def test_select_checkpoint_file_auto_prefers_policy_precision(self):
+        """Automatic checkpoint selection follows the resolved device policy dtype."""
+        version = ModelVersion.from_dict(
+            {
+                "id": 1,
+                "name": "Krea",
+                "files": [
+                    {
+                        "id": 1,
+                        "name": "krea-bf16.safetensors",
+                        "downloadUrl": "http://x/bf16",
+                        "metadata": {"format": "SafeTensor", "fp": "bf16"},
+                    },
+                    {
+                        "id": 2,
+                        "name": "krea-fp16.safetensors",
+                        "downloadUrl": "http://x/fp16",
+                        "metadata": {"format": "SafeTensor", "fp": "fp16"},
+                    },
+                ],
+            }
+        )
+
+        selected = version.select_checkpoint_file(preferred_precision="fp16")
+
+        assert selected.id == 2
+
+    def test_select_checkpoint_file_reports_unavailable_precision_as_civitai_error(self):
+        """Unavailable checkpoint precision is not reported as a URL parsing failure."""
+        version = ModelVersion.from_dict(SAMPLE_VERSION_RESPONSE)
+
+        with pytest.raises(CivitaiError, match="No fp32 SafeTensor checkpoint found"):
+            version.select_checkpoint_file("fp32")
+
+    def test_select_checkpoint_file_never_returns_vae(self):
+        """Floating-point VAE siblings are not mistaken for transformer checkpoints."""
+        version = ModelVersion.from_dict(
+            {
+                "id": 1,
+                "name": "Krea",
+                "files": [
+                    {
+                        "id": 1,
+                        "name": "krea-fp8.safetensors",
+                        "type": "Model",
+                        "downloadUrl": "http://x/model",
+                        "metadata": {"format": "SafeTensor", "fp": "fp8"},
+                        "primary": True,
+                    },
+                    {
+                        "id": 2,
+                        "name": "vae.safetensors",
+                        "type": "VAE",
+                        "downloadUrl": "http://x/vae",
+                        "metadata": {"format": "SafeTensor", "fp": "bf16"},
+                    },
+                ],
+            }
+        )
+
+        with pytest.raises(CivitaiError, match="No Diffusers-compatible"):
+            version.select_checkpoint_file()
 
 
 class TestModel:
@@ -676,6 +796,90 @@ class TestCivitaiClientDownload:
         assert progress_calls[-1][0] == progress_calls[-1][1]
 
     @respx.mock
+    async def test_get_safetensor_header_uses_two_ranged_requests(self, tmp_path):
+        """SafeTensor metadata is read without transferring the tensor payload."""
+        import torch
+        from safetensors.torch import save_file
+
+        checkpoint = tmp_path / "krea.safetensors"
+        save_file({"first.weight": torch.ones(4, dtype=torch.bfloat16)}, checkpoint)
+        contents = checkpoint.read_bytes()
+        header_size = int.from_bytes(contents[:8], "little")
+        route = respx.get("https://civitai.com/api/download/models/1")
+        route.side_effect = [
+            httpx.Response(
+                206,
+                content=contents[:8],
+                headers={"Content-Range": f"bytes 0-7/{len(contents)}"},
+            ),
+            httpx.Response(
+                206,
+                content=contents[: 8 + header_size],
+                headers={"Content-Range": f"bytes 0-{7 + header_size}/{len(contents)}"},
+            ),
+        ]
+
+        async with CivitaiClient(cache_dir=tmp_path) as client:
+            header = await client.get_safetensor_header("https://civitai.com/api/download/models/1")
+
+        assert header["first.weight"]["dtype"] == "BF16"
+        assert [call.request.headers["Range"] for call in route.calls] == [
+            "bytes=0-7",
+            f"bytes=0-{7 + header_size}",
+        ]
+        assert all(call.request.headers["Accept-Encoding"] == "identity" for call in route.calls)
+
+    @respx.mock
+    async def test_get_safetensor_header_rejects_oversized_header(self, tmp_path):
+        """Remote header size is bounded before the JSON payload is requested."""
+        route = respx.get("https://civitai.com/api/download/models/1").mock(
+            return_value=httpx.Response(
+                206,
+                content=(1_000_001).to_bytes(8, "little"),
+                headers={"Content-Range": "bytes 0-7/1000009"},
+            )
+        )
+
+        async with CivitaiClient(cache_dir=tmp_path) as client:
+            with pytest.raises(CivitaiError, match="Invalid SafeTensor header size"):
+                await client.get_safetensor_header("https://civitai.com/api/download/models/1")
+
+        assert route.call_count == 1
+
+    @respx.mock
+    async def test_get_safetensor_header_rejects_invalid_descriptor(self, tmp_path):
+        """Preflight rejects malformed tensor descriptors before downloading weights."""
+        import json
+
+        header = json.dumps(
+            {
+                "first.weight": {
+                    "dtype": "BF16",
+                    "shape": "invalid",
+                    "data_offsets": [0, 2],
+                }
+            }
+        ).encode()
+        contents = len(header).to_bytes(8, "little") + header
+        route = respx.get("https://civitai.com/api/download/models/1")
+        route.side_effect = [
+            httpx.Response(
+                206,
+                content=contents[:8],
+                headers={"Content-Range": f"bytes 0-7/{len(contents)}"},
+            ),
+            httpx.Response(
+                206,
+                content=contents,
+                headers={"Content-Range": f"bytes 0-{len(contents) - 1}/{len(contents)}"},
+            ),
+        ]
+
+        async with CivitaiClient(cache_dir=tmp_path) as client:
+            with pytest.raises(CivitaiError, match="Invalid SafeTensor tensor descriptor"):
+                await client.get_safetensor_header("https://civitai.com/api/download/models/1")
+
+    @respx.mock
     async def test_download_uses_cache(self, tmp_path):
         """download_file returns cached file if hash matches."""
         # Create cached file
@@ -723,3 +927,80 @@ class TestCivitaiClientDownload:
 
         assert result.name == "test_model.safetensors"
         assert result.read_bytes() == test_content
+
+    @respx.mock
+    async def test_download_model_version_keeps_duplicate_precisions_separate(self, tmp_path):
+        """Checkpoint variants with the same source name cannot overwrite each other."""
+        respx.get("https://civitai.com/api/download/models/2").mock(
+            return_value=httpx.Response(200, content=b"fp16")
+        )
+        version = ModelVersion.from_dict(
+            {
+                "id": 1,
+                "name": "Krea",
+                "files": [
+                    {
+                        "id": 1,
+                        "name": "krea.safetensors",
+                        "downloadUrl": "https://civitai.com/api/download/models/1",
+                        "metadata": {"format": "SafeTensor", "fp": "bf16"},
+                        "primary": True,
+                    },
+                    {
+                        "id": 2,
+                        "name": "krea.safetensors",
+                        "downloadUrl": "https://civitai.com/api/download/models/2",
+                        "metadata": {"format": "SafeTensor", "fp": "fp16"},
+                    },
+                ],
+            }
+        )
+        selected = version.select_checkpoint_file("fp16")
+
+        async with CivitaiClient(cache_dir=tmp_path, verify_hashes=False) as client:
+            result = await client.download_model_version(version, model_file=selected)
+
+        assert result.name == "krea-fp16-2.safetensors"
+        assert result.read_bytes() == b"fp16"
+
+    @respx.mock
+    async def test_download_model_version_ids_prevent_cross_version_overwrite(self, tmp_path):
+        """Identical filenames from separate versions use distinct cache paths."""
+        respx.get("https://civitai.com/api/download/models/1").mock(
+            return_value=httpx.Response(200, content=b"first")
+        )
+        respx.get("https://civitai.com/api/download/models/2").mock(
+            return_value=httpx.Response(200, content=b"second")
+        )
+
+        def version(version_id, file_id, download_url):
+            return ModelVersion.from_dict(
+                {
+                    "id": version_id,
+                    "name": "Krea",
+                    "files": [
+                        {
+                            "id": file_id,
+                            "name": "model.safetensors",
+                            "downloadUrl": download_url,
+                            "metadata": {"format": "SafeTensor", "fp": "bf16"},
+                            "primary": True,
+                        }
+                    ],
+                }
+            )
+
+        async with CivitaiClient(cache_dir=tmp_path, verify_hashes=False) as client:
+            first_version = version(1, 101, "https://civitai.com/api/download/models/1")
+            second_version = version(2, 202, "https://civitai.com/api/download/models/2")
+            first = await client.download_model_version(
+                first_version, model_file=first_version.primary_file
+            )
+            second = await client.download_model_version(
+                second_version, model_file=second_version.primary_file
+            )
+
+        assert first.name == "model-bf16-101.safetensors"
+        assert second.name == "model-bf16-202.safetensors"
+        assert first.read_bytes() == b"first"
+        assert second.read_bytes() == b"second"
