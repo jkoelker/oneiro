@@ -15,6 +15,7 @@ from oneiro.pipelines.civitai_checkpoint import (
     CivitaiCheckpointPipeline,
     PipelineConfig,
     get_diffusers_pipeline_class,
+    get_krea2_checkpoint_precision,
     get_pipeline_config_for_base_model,
 )
 from oneiro.pipelines.lora import LoraConfig, LoraSource
@@ -90,6 +91,22 @@ class TestGetPipelineConfigForBaseModel:
         assert config.supports_negative_prompt is False
         assert config.default_steps == 4
         assert config.default_guidance_scale == 1.0
+
+    def test_exact_match_krea2(self):
+        """CivitAI Krea 2 checkpoints use the Krea pipeline."""
+        config = get_pipeline_config_for_base_model("Krea 2")
+
+        assert config.pipeline_class == "Krea2Pipeline"
+        assert config.supports_negative_prompt is True
+        assert config.default_steps == 8
+        assert config.default_guidance_scale == 0.0
+
+    @pytest.mark.parametrize("base_model", ["Krea-2", "Krea2", "Krea 2 Turbo"])
+    def test_partial_match_krea2(self, base_model):
+        """CivitAI Krea spelling variants use the Krea pipeline."""
+        config = get_pipeline_config_for_base_model(base_model)
+
+        assert config.pipeline_class == "Krea2Pipeline"
 
     def test_partial_match_flux(self):
         """Partial match for Flux variants."""
@@ -946,12 +963,458 @@ class TestCivitaiCheckpointPipelineLoad:
             torch_dtype=torch.bfloat16,
         )
 
+    def test_load_krea2_single_file_assembles_krea_pipeline(self, tmp_path):
+        """CivitAI Krea checkpoints replace the transformer in the hosted pipeline."""
+        checkpoint = tmp_path / "krea2.safetensors"
+        checkpoint.write_bytes(b"dummy")
+        mock_pipe = MagicMock()
+        mock_transformer = MagicMock()
+        mock_policy = DevicePolicy(device="cpu", dtype=torch.bfloat16, offload=OffloadMode.NEVER)
+
+        with (
+            patch.object(CivitaiCheckpointPipeline, "configure_scheduler"),
+            patch.object(DevicePolicy, "auto_detect", return_value=mock_policy),
+            patch.object(
+                CivitaiCheckpointPipeline,
+                "_load_krea2_transformer_from_single_file",
+                create=True,
+                return_value=mock_transformer,
+            ) as mock_load_transformer,
+            patch(
+                "oneiro.pipelines.civitai_checkpoint.get_diffusers_pipeline_class"
+            ) as mock_get_class,
+            patch("diffusers.Krea2Pipeline") as mock_krea2_pipeline,
+        ):
+            mock_krea2_pipeline.from_pretrained.return_value = mock_pipe
+
+            pipeline = CivitaiCheckpointPipeline()
+            pipeline.load(
+                {
+                    "checkpoint_path": str(checkpoint),
+                    "base_model": "Krea 2",
+                }
+            )
+
+        mock_get_class.assert_not_called()
+        mock_load_transformer.assert_called_once_with(
+            checkpoint,
+            "krea/Krea-2-Turbo",
+            "transformer",
+        )
+        mock_krea2_pipeline.from_pretrained.assert_called_once_with(
+            "krea/Krea-2-Turbo",
+            transformer=mock_transformer,
+            torch_dtype=torch.bfloat16,
+        )
+
+    @pytest.mark.parametrize(
+        ("component_repo", "expected_steps", "expected_guidance"),
+        [
+            ("krea/Krea-2-Raw", 28, 4.5),
+            ("drawthings/krea2-turbo", 8, 0.0),
+        ],
+    )
+    def test_load_krea2_component_repo_uses_matching_defaults(
+        self,
+        tmp_path,
+        component_repo,
+        expected_steps,
+        expected_guidance,
+    ):
+        """Krea component model names, not organization names, select the recipe."""
+        checkpoint = tmp_path / "krea2-raw.safetensors"
+        checkpoint.write_bytes(b"dummy")
+        mock_transformer = MagicMock()
+        mock_policy = DevicePolicy(device="cpu", dtype=torch.bfloat16, offload=OffloadMode.NEVER)
+
+        with (
+            patch.object(CivitaiCheckpointPipeline, "configure_scheduler"),
+            patch.object(DevicePolicy, "auto_detect", return_value=mock_policy),
+            patch.object(
+                CivitaiCheckpointPipeline,
+                "_load_krea2_transformer_from_single_file",
+                return_value=mock_transformer,
+            ),
+            patch("diffusers.Krea2Pipeline") as mock_krea2_pipeline,
+        ):
+            mock_krea2_pipeline.from_pretrained.return_value = MagicMock()
+            pipeline = CivitaiCheckpointPipeline()
+            pipeline.load(
+                {
+                    "checkpoint_path": str(checkpoint),
+                    "base_model": "Krea 2",
+                    "krea2_component_repo": component_repo,
+                }
+            )
+
+        assert pipeline.pipeline_config is not None
+        assert pipeline.pipeline_config.default_steps == expected_steps
+        assert pipeline.pipeline_config.default_guidance_scale == expected_guidance
+        mock_krea2_pipeline.from_pretrained.assert_called_once_with(
+            component_repo,
+            transformer=mock_transformer,
+            torch_dtype=torch.bfloat16,
+        )
+
+    def test_get_krea2_checkpoint_precision_rejects_quantized_tensor_header(self, tmp_path):
+        """Tensor dtypes override incorrect floating-point CivitAI metadata."""
+        from safetensors.torch import save_file
+
+        checkpoint = tmp_path / "mislabeled-bf16.safetensors"
+        save_file(
+            {
+                "first.weight": torch.ones(2, dtype=torch.int8),
+                "last.linear.weight": torch.ones(2, dtype=torch.int8),
+                "blocks.0.attn.wq.weight": torch.ones(2, dtype=torch.int8),
+            },
+            checkpoint,
+        )
+
+        with pytest.raises(ValueError, match="Quantized Krea 2"):
+            get_krea2_checkpoint_precision(checkpoint)
+
+    def test_get_krea2_checkpoint_precision_reads_tensor_header(self, tmp_path):
+        """Displayed checkpoint precision comes from the SafeTensor header."""
+        from safetensors.torch import save_file
+
+        checkpoint = tmp_path / "mislabeled-fp16.safetensors"
+        save_file(
+            {
+                "model.diffusion_model.first.weight": torch.ones(2, dtype=torch.bfloat16),
+                "model.diffusion_model.last.linear.weight": torch.ones(2, dtype=torch.bfloat16),
+                "model.diffusion_model.blocks.0.attn.wq.weight": torch.ones(
+                    2, dtype=torch.bfloat16
+                ),
+            },
+            checkpoint,
+        )
+
+        assert get_krea2_checkpoint_precision(checkpoint) == "bf16"
+
+    def test_get_krea2_checkpoint_precision_reports_dominant_weight_dtype(self, tmp_path):
+        """FP32 norms do not make a BF16 checkpoint report compound precision."""
+        from safetensors.torch import save_file
+
+        checkpoint = tmp_path / "mixed.safetensors"
+        save_file(
+            {
+                "first.weight": torch.ones(100, dtype=torch.bfloat16),
+                "last.linear.weight": torch.ones(100, dtype=torch.bfloat16),
+                "blocks.0.attn.wq.weight": torch.ones(100, dtype=torch.bfloat16),
+                "last.norm.scale": torch.ones(10, dtype=torch.float32),
+            },
+            checkpoint,
+        )
+
+        assert get_krea2_checkpoint_precision(checkpoint) == "bf16"
+
+    def test_get_krea2_checkpoint_precision_rejects_quantization_metadata(self, tmp_path):
+        """Quantization metadata is rejected even when every tensor claims BF16."""
+        from safetensors.torch import save_file
+
+        checkpoint = tmp_path / "quantized-bf16.safetensors"
+        save_file(
+            {
+                "first.weight": torch.ones(2, dtype=torch.bfloat16),
+                "last.linear.weight": torch.ones(2, dtype=torch.bfloat16),
+                "blocks.0.attn.wq.weight": torch.ones(2, dtype=torch.bfloat16),
+            },
+            checkpoint,
+            metadata={"_quantization_metadata": "{}"},
+        )
+
+        with pytest.raises(ValueError, match="Quantized Krea 2"):
+            get_krea2_checkpoint_precision(checkpoint)
+
+    def test_load_krea2_transformer_uses_policy_dtype_and_keeps_norms_fp32(self, tmp_path):
+        """Krea weights follow the policy while declared norm modules remain FP32."""
+        from safetensors.torch import save_file
+
+        checkpoint = tmp_path / "krea2.safetensors"
+        source_weight = torch.arange(8, dtype=torch.float32).reshape(4, 2)
+        source_bias = torch.arange(4, dtype=torch.float32)
+        source_norm = torch.arange(4, dtype=torch.float32)
+        source_linear = torch.arange(8, dtype=torch.float32).reshape(4, 2)
+        source_query = torch.arange(8, dtype=torch.float32).reshape(4, 2)
+        save_file(
+            {
+                "first.weight": source_weight,
+                "first.bias": source_bias,
+                "last.norm.scale": source_norm,
+                "last.linear.weight": source_linear,
+                "blocks.0.attn.wq.weight": source_query,
+            },
+            checkpoint,
+        )
+
+        with torch.device("meta"):
+            transformer = torch.nn.Module()
+            transformer.img_in = torch.nn.Linear(2, 4)
+            transformer.final_layer = torch.nn.Module()
+            transformer.final_layer.norm = torch.nn.LayerNorm(4, bias=False)
+            transformer.final_layer.linear = torch.nn.Linear(2, 4, bias=False)
+            block = torch.nn.Module()
+            block.attn = torch.nn.Module()
+            block.attn.to_q = torch.nn.Linear(2, 4, bias=False)
+            transformer.transformer_blocks = torch.nn.ModuleList([block])
+        transformer._keep_in_fp32_modules = ["norm", "norm1", "norm2", "norm_q", "norm_k"]
+
+        pipeline = CivitaiCheckpointPipeline()
+        pipeline.policy = DevicePolicy(
+            device="cpu",
+            dtype=torch.bfloat16,
+            offload=OffloadMode.NEVER,
+        )
+
+        with patch("diffusers.Krea2Transformer2DModel") as mock_transformer_class:
+            mock_transformer_class.load_config.return_value = {"test": True}
+            mock_transformer_class.from_config.return_value = transformer
+
+            result = pipeline._load_krea2_transformer_from_single_file(
+                checkpoint,
+                "krea/Krea-2-Turbo",
+                "transformer",
+            )
+
+        assert result is transformer
+        assert result.img_in.weight.device.type == "cpu"
+        assert result.img_in.weight.dtype == torch.bfloat16
+        assert result.img_in.bias.dtype == torch.bfloat16
+        assert result.final_layer.norm.weight.dtype == torch.float32
+        assert torch.equal(result.img_in.weight, source_weight.to(torch.bfloat16))
+        assert torch.equal(result.img_in.bias, source_bias.to(torch.bfloat16))
+        assert torch.equal(result.final_layer.norm.weight, source_norm)
+
+    def test_load_krea2_transformer_rejects_quantized_checkpoint(self, tmp_path):
+        """Comfy quantization is rejected instead of being silently dequantized."""
+        from safetensors.torch import save_file
+
+        fp8_dtype = getattr(torch, "float8_e4m3fn", None)
+        if fp8_dtype is None:
+            pytest.skip("torch build does not expose float8_e4m3fn")
+
+        checkpoint = tmp_path / "krea2-fp8.safetensors"
+        save_file(
+            {
+                "first.weight": torch.zeros((4, 2), dtype=fp8_dtype),
+                "first.bias": torch.zeros(4),
+            },
+            checkpoint,
+            metadata={"_quantization_metadata": "{}"},
+        )
+        with torch.device("meta"):
+            transformer = torch.nn.Module()
+            transformer.img_in = torch.nn.Linear(2, 4)
+        transformer._keep_in_fp32_modules = ["norm", "norm1", "norm2", "norm_q", "norm_k"]
+
+        pipeline = CivitaiCheckpointPipeline()
+        pipeline.policy = DevicePolicy(
+            device="cpu",
+            dtype=torch.bfloat16,
+            offload=OffloadMode.NEVER,
+        )
+
+        with (
+            patch("diffusers.Krea2Transformer2DModel") as mock_transformer_class,
+            pytest.raises(ValueError, match="Quantized Krea 2 single-file checkpoints"),
+        ):
+            mock_transformer_class.load_config.return_value = {"test": True}
+            mock_transformer_class.from_config.return_value = transformer
+            pipeline._load_krea2_transformer_from_single_file(
+                checkpoint,
+                "krea/Krea-2-Turbo",
+                "transformer",
+            )
+
+    def test_load_krea2_transformer_rejects_incomplete_checkpoint(self, tmp_path):
+        """A truncated Krea checkpoint cannot leave meta parameters in the pipeline."""
+        from safetensors.torch import save_file
+
+        checkpoint = tmp_path / "krea2-incomplete.safetensors"
+        save_file(
+            {
+                "first.weight": torch.zeros((4, 2)),
+                "last.linear.weight": torch.zeros((4, 2)),
+                "blocks.0.attn.wq.weight": torch.zeros((4, 2)),
+            },
+            checkpoint,
+        )
+        with torch.device("meta"):
+            transformer = torch.nn.Module()
+            transformer.img_in = torch.nn.Linear(2, 4)
+            transformer.final_layer = torch.nn.Module()
+            transformer.final_layer.linear = torch.nn.Linear(2, 4, bias=False)
+            block = torch.nn.Module()
+            block.attn = torch.nn.Module()
+            block.attn.to_q = torch.nn.Linear(2, 4, bias=False)
+            transformer.transformer_blocks = torch.nn.ModuleList([block])
+        transformer._keep_in_fp32_modules = ["norm", "norm1", "norm2", "norm_q", "norm_k"]
+
+        pipeline = CivitaiCheckpointPipeline()
+        pipeline.policy = DevicePolicy(
+            device="cpu",
+            dtype=torch.bfloat16,
+            offload=OffloadMode.NEVER,
+        )
+
+        with (
+            patch("diffusers.Krea2Transformer2DModel") as mock_transformer_class,
+            pytest.raises(ValueError, match="Krea 2 checkpoint is missing tensors: img_in.bias"),
+        ):
+            mock_transformer_class.load_config.return_value = {"test": True}
+            mock_transformer_class.from_config.return_value = transformer
+            pipeline._load_krea2_transformer_from_single_file(
+                checkpoint,
+                "krea/Krea-2-Turbo",
+                "transformer",
+            )
+
+    def test_load_krea2_transformer_explains_gated_component_repo(self, tmp_path):
+        """A gated component failure tells operators how to authorize Hugging Face."""
+        pipeline = CivitaiCheckpointPipeline()
+
+        with (
+            patch("diffusers.Krea2Transformer2DModel") as mock_transformer_class,
+            pytest.raises(RuntimeError, match="accept its license.*HF_TOKEN"),
+        ):
+            mock_transformer_class.load_config.side_effect = OSError("not a valid model identifier")
+            pipeline._load_krea2_transformer_from_single_file(
+                tmp_path / "krea2.safetensors",
+                "krea/Krea-2-Turbo",
+                "transformer",
+            )
+
     def test_flux2_klein_4b_base_uses_4b_base_repo(self):
         """FLUX.2 Klein 4B base models default to the matching 4B base repo."""
         pipeline = CivitaiCheckpointPipeline()
         pipeline._base_model = "Flux.2 Klein 4B-base"
 
         assert pipeline._default_flux2_component_repo() == "black-forest-labs/FLUX.2-klein-base-4B"
+
+    @pytest.mark.parametrize(
+        ("source_key", "source_shape", "expected_key", "expected_shape"),
+        [
+            ("first.weight", (4, 2), "img_in.weight", (4, 2)),
+            (
+                "model.diffusion_model.first.weight",
+                (4, 2),
+                "img_in.weight",
+                (4, 2),
+            ),
+            ("tmlp.0.weight", (4, 2), "time_embed.linear_1.weight", (4, 2)),
+            ("tproj.1.bias", (24,), "time_mod_proj.bias", (24,)),
+            ("txtmlp.0.scale", (4,), "txt_in.norm.weight", (4,)),
+            (
+                "txtfusion.layerwise_blocks.0.attn.wq.weight",
+                (4, 4),
+                "text_fusion.layerwise_blocks.0.attn.to_q.weight",
+                (4, 4),
+            ),
+            (
+                "txtfusion.refiner_blocks.1.mlp.down.weight",
+                (4, 8),
+                "text_fusion.refiner_blocks.1.ff.down.weight",
+                (4, 8),
+            ),
+            (
+                "blocks.0.attn.qknorm.knorm.scale",
+                (2,),
+                "transformer_blocks.0.attn.norm_k.weight",
+                (2,),
+            ),
+            (
+                "blocks.0.attn.wo.weight",
+                (4, 4),
+                "transformer_blocks.0.attn.to_out.0.weight",
+                (4, 4),
+            ),
+            ("blocks.0.mod.lin", (24,), "transformer_blocks.0.scale_shift_table", (6, 4)),
+            ("last.modulation.lin", (8,), "final_layer.scale_shift_table", (2, 4)),
+            ("last.norm.scale", (4,), "final_layer.norm.weight", (4,)),
+        ],
+    )
+    def test_krea2_checkpoint_keys_convert_to_diffusers(
+        self,
+        source_key,
+        source_shape,
+        expected_key,
+        expected_shape,
+    ):
+        """Comfy Krea tensors map to the corresponding Diffusers parameters."""
+        tensor = torch.zeros(source_shape)
+
+        key, converted = CivitaiCheckpointPipeline._convert_krea2_checkpoint_tensor(
+            source_key, tensor
+        )
+
+        assert key == expected_key
+        assert converted.shape == expected_shape
+
+    def test_all_krea2_checkpoint_keys_exist_in_diffusers_model(self):
+        """Every published Comfy Krea tensor maps to a real Diffusers parameter."""
+        from accelerate import init_empty_weights
+        from diffusers import Krea2Transformer2DModel
+
+        source_keys = [
+            "first.bias",
+            "first.weight",
+            "last.linear.bias",
+            "last.linear.weight",
+            "last.modulation.lin",
+            "last.norm.scale",
+            "tmlp.0.bias",
+            "tmlp.0.weight",
+            "tmlp.2.bias",
+            "tmlp.2.weight",
+            "tproj.1.bias",
+            "tproj.1.weight",
+            "txtmlp.0.scale",
+            "txtmlp.1.bias",
+            "txtmlp.1.weight",
+            "txtmlp.3.bias",
+            "txtmlp.3.weight",
+            "txtfusion.projector.weight",
+        ]
+        block_suffixes = [
+            "attn.qknorm.knorm.scale",
+            "attn.qknorm.qnorm.scale",
+            "mod.lin",
+            "postnorm.scale",
+            "prenorm.scale",
+            "attn.gate.weight",
+            "attn.wk.weight",
+            "attn.wo.weight",
+            "attn.wq.weight",
+            "attn.wv.weight",
+            "mlp.down.weight",
+            "mlp.gate.weight",
+            "mlp.up.weight",
+        ]
+        text_block_suffixes = [suffix for suffix in block_suffixes if suffix != "mod.lin"]
+        source_keys.extend(
+            f"blocks.{index}.{suffix}" for index in range(28) for suffix in block_suffixes
+        )
+        source_keys.extend(
+            f"txtfusion.{group}.{index}.{suffix}"
+            for group in ("layerwise_blocks", "refiner_blocks")
+            for index in range(2)
+            for suffix in text_block_suffixes
+        )
+
+        with init_empty_weights():
+            model_keys = Krea2Transformer2DModel().state_dict().keys()
+
+        converted_keys = set()
+        for source_key in source_keys:
+            tensor_size = 6 if source_key.endswith(".mod.lin") else 2
+            key, _ = CivitaiCheckpointPipeline._convert_krea2_checkpoint_tensor(
+                source_key,
+                torch.empty(tensor_size),
+            )
+            assert key in model_keys
+            converted_keys.add(key)
+
+        assert len(source_keys) == len(converted_keys) == len(model_keys) == 430
 
     def test_transformer_checkpoint_strips_comfy_diffusion_model_prefix(self, tmp_path):
         """CivitAI/Comfy transformer checkpoints are normalized before conversion."""
@@ -1520,6 +1983,30 @@ class TestCivitaiCheckpointPipelineGenerate:
         assert call_kwargs["strength"] == 0.5
         assert "width" not in call_kwargs
         assert "height" not in call_kwargs
+
+    @pytest.mark.parametrize("argument", ["init_image", "mask_image"])
+    def test_generate_krea2_rejects_image_input(self, argument):
+        """CivitAI-backed Krea checkpoints remain text-to-image only."""
+        pipeline = CivitaiCheckpointPipeline()
+        pipeline._pipeline_config = PipelineConfig(pipeline_class="Krea2Pipeline")
+        pipeline.pipe = MagicMock()
+
+        with pytest.raises(ValueError, match="Krea 2 supports text-to-image only"):
+            pipeline.generate("test prompt", **{argument: b"dummy"})
+
+        pipeline.pipe.assert_not_called()
+
+    def test_generate_krea2_passes_negative_prompt(self):
+        """Fetched Krea Raw checkpoints keep user negative prompts for CFG."""
+        pipeline = CivitaiCheckpointPipeline()
+        pipeline._pipeline_config = get_pipeline_config_for_base_model("Krea 2")
+        mock_image = MagicMock(width=1024, height=1024)
+        pipeline.pipe = MagicMock(return_value=MagicMock(images=[mock_image]))
+
+        with patch.object(DevicePolicy, "clear_cache"):
+            pipeline.generate("test prompt", negative_prompt="blurry", guidance_scale=4.5)
+
+        assert pipeline.pipe.call_args.kwargs["negative_prompt"] == "blurry"
 
     def test_generate_flux2_klein_img2img_omits_strength(self):
         """Flux2 Klein accepts image input but not img2img strength."""

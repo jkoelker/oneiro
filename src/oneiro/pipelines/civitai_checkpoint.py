@@ -6,7 +6,8 @@ pipeline class based on CivitAI's baseModel metadata.
 """
 
 import math
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -87,6 +88,7 @@ class CivitaiBaseModel(StrEnum):
     # Other architectures
     Z_IMAGE = "Z-Image"
     Z_IMAGE_TURBO = "Z-Image Turbo"
+    KREA_2 = "Krea 2"
     PIXART_A = "PixArt a"
     PIXART_SIGMA = "PixArt Sigma"
     KOLORS = "Kolors"
@@ -427,6 +429,15 @@ CIVITAI_BASE_MODEL_PIPELINE_MAP: dict[str, PipelineConfig] = {
         default_height=1024,
         default_scheduler="default",
     ),
+    CivitaiBaseModel.KREA_2: PipelineConfig(
+        pipeline_class="Krea2Pipeline",
+        supports_negative_prompt=True,
+        default_steps=8,
+        default_guidance_scale=0.0,
+        default_width=1024,
+        default_height=1024,
+        default_scheduler="default",
+    ),
 }
 
 SCHEDULER_MAP: dict[str, tuple[str | None, dict[str, Any]]] = {
@@ -449,11 +460,24 @@ SCHEDULER_CHOICES: list[str] = list(SCHEDULER_MAP.keys())
 DEFAULT_SDXL_COMPONENT_REPO = "stabilityai/stable-diffusion-xl-base-1.0"
 DEFAULT_ZIMAGE_COMPONENT_REPO = "Tongyi-MAI/Z-Image-Turbo"
 DEFAULT_QWEN_COMPONENT_REPO = "Qwen/Qwen-Image"
+DEFAULT_KREA2_COMPONENT_REPO = "krea/Krea-2-Turbo"
+DEFAULT_KREA2_RAW_COMPONENT_REPO = "krea/Krea-2-Raw"
 DEFAULT_FLUX2_KLEIN_COMPONENT_REPO = "black-forest-labs/FLUX.2-klein-9B"
 DEFAULT_FLUX2_KLEIN_BASE_COMPONENT_REPO = "black-forest-labs/FLUX.2-klein-base-9B"
 DEFAULT_FLUX2_KLEIN_4B_COMPONENT_REPO = "black-forest-labs/FLUX.2-klein-4B"
 DEFAULT_FLUX2_KLEIN_4B_BASE_COMPONENT_REPO = "black-forest-labs/FLUX.2-klein-base-4B"
 COMFY_DIFFUSION_MODEL_PREFIX = "model.diffusion_model."
+KREA2_DTYPE_PRECISIONS = {
+    "BF16": "bf16",
+    "F16": "fp16",
+    "F32": "fp32",
+    "F64": "fp64",
+}
+KREA2_REQUIRED_TENSOR_KEYS = {
+    "first.weight",
+    "last.linear.weight",
+    "blocks.0.attn.wq.weight",
+}
 
 # Default fallback configuration
 DEFAULT_PIPELINE_CONFIG = PipelineConfig(
@@ -464,6 +488,69 @@ DEFAULT_PIPELINE_CONFIG = PipelineConfig(
     default_height=1024,
     default_scheduler="dpm++_karras",
 )
+
+
+def get_krea2_checkpoint_precision_from_header(header: dict[str, Any]) -> str:
+    """Validate a Krea SafeTensor header and return its dominant precision."""
+    metadata = header.get("__metadata__", {}) or {}
+    tensors = {key: value for key, value in header.items() if key != "__metadata__"}
+    if not isinstance(metadata, dict) or any(
+        not isinstance(value, dict) for value in tensors.values()
+    ):
+        raise ValueError("Invalid SafeTensor header")
+    source_keys = list(tensors)
+    dtypes = {str(value.get("dtype", "")) for value in tensors.values()}
+    if (
+        not source_keys
+        or "_quantization_metadata" in metadata
+        or any(key.endswith(".weight_scale") for key in source_keys)
+        or not dtypes.issubset(KREA2_DTYPE_PRECISIONS)
+    ):
+        raise ValueError("Quantized Krea 2 single-file checkpoints are not supported by Diffusers")
+    normalized_keys = {key.removeprefix(COMFY_DIFFUSION_MODEL_PREFIX) for key in source_keys}
+    if not KREA2_REQUIRED_TENSOR_KEYS.issubset(normalized_keys):
+        raise ValueError("SafeTensor file does not contain Krea 2 transformer weights")
+    element_counts = {
+        dtype: sum(
+            math.prod(value.get("shape", []))
+            for value in tensors.values()
+            if value.get("dtype") == dtype
+        )
+        for dtype in dtypes
+    }
+    dominant_dtype = max(
+        KREA2_DTYPE_PRECISIONS,
+        key=lambda dtype: element_counts.get(dtype, 0),
+    )
+    return KREA2_DTYPE_PRECISIONS[dominant_dtype]
+
+
+def _get_krea2_checkpoint_precision(checkpoint: Any) -> str:
+    """Validate an open Krea checkpoint and return its tensor precision."""
+    header: dict[str, Any] = {"__metadata__": checkpoint.metadata() or {}}
+    for key in checkpoint.keys():
+        tensor_slice = checkpoint.get_slice(key)
+        header[key] = {
+            "dtype": tensor_slice.get_dtype(),
+            "shape": tensor_slice.get_shape(),
+        }
+    return get_krea2_checkpoint_precision_from_header(header)
+
+
+def get_krea2_checkpoint_precision(checkpoint_path: Path) -> str:
+    """Read and validate Krea checkpoint precision from its SafeTensor header."""
+    from safetensors import safe_open
+
+    with safe_open(checkpoint_path, framework="pt", device="cpu") as checkpoint:
+        return _get_krea2_checkpoint_precision(checkpoint)
+
+
+def get_krea2_generation_defaults(component_repo: str) -> tuple[int, float]:
+    """Return the generation recipe for hosted Krea Raw or Turbo components."""
+    repo_name = component_repo.rsplit("/", 1)[-1]
+    if re.search(r"(?<![a-z])raw(?![a-z])", repo_name.lower()):
+        return 28, 4.5
+    return 8, 0.0
 
 
 def get_pipeline_config_for_base_model(base_model: str | None) -> PipelineConfig:
@@ -503,6 +590,9 @@ def get_pipeline_config_for_base_model(base_model: str | None) -> PipelineConfig
 
     if "qwen" in base_lower:
         return CIVITAI_BASE_MODEL_PIPELINE_MAP[CivitaiBaseModel.QWEN]
+
+    if "krea" in base_lower:
+        return CIVITAI_BASE_MODEL_PIPELINE_MAP[CivitaiBaseModel.KREA_2]
 
     if "sd 3.5" in base_lower or "sd3.5" in base_lower:
         if "turbo" in base_lower:
@@ -711,6 +801,14 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
             )
         else:
             self._pipeline_config = get_pipeline_config_for_base_model(base_model)
+            if self._pipeline_config.pipeline_class == "Krea2Pipeline":
+                component_repo = self._krea2_component_repo(model_config)
+                default_steps, default_guidance = get_krea2_generation_defaults(component_repo)
+                self._pipeline_config = replace(
+                    self._pipeline_config,
+                    default_steps=model_config.get("steps", default_steps),
+                    default_guidance_scale=model_config.get("guidance_scale", default_guidance),
+                )
 
         print(f"Loading checkpoint from {checkpoint_path}")
         print(f"  Base model: {base_model or 'unknown'}")
@@ -740,6 +838,7 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
         if self._pipeline_config.pipeline_class not in {
             "QwenImagePipeline",
             "Flux2KleinPipeline",
+            "Krea2Pipeline",
         }:
             pipeline_class = get_diffusers_pipeline_class(self._pipeline_config.pipeline_class)
 
@@ -798,6 +897,21 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
             if self._pipeline_config.pipeline_class == "Flux2KleinPipeline":
                 return self._load_flux2_klein_pipeline_from_single_file(
                     checkpoint_path, model_config
+                )
+            if self._pipeline_config.pipeline_class == "Krea2Pipeline":
+                from diffusers import Krea2Pipeline
+
+                component_repo = self._krea2_component_repo(model_config)
+                transformer_subfolder = model_config.get("transformer_subfolder", "transformer")
+                transformer = self._load_krea2_transformer_from_single_file(
+                    checkpoint_path,
+                    component_repo,
+                    transformer_subfolder,
+                )
+                return Krea2Pipeline.from_pretrained(
+                    component_repo,
+                    transformer=transformer,
+                    torch_dtype=self.policy.dtype,
                 )
 
         assert pipeline_class is not None
@@ -886,6 +1000,83 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
             torch_dtype=self.policy.dtype,
         )
 
+    def _load_krea2_transformer_from_single_file(
+        self,
+        checkpoint_path: Path,
+        component_repo: str,
+        transformer_subfolder: str,
+    ) -> Any:
+        """Stream a floating-point Comfy Krea checkpoint into a Diffusers transformer."""
+        from accelerate import init_empty_weights
+        from accelerate.utils import set_module_tensor_to_device
+        from diffusers import Krea2Transformer2DModel
+        from safetensors import safe_open
+
+        try:
+            transformer_config = Krea2Transformer2DModel.load_config(
+                component_repo,
+                subfolder=transformer_subfolder,
+            )
+        except OSError as error:
+            raise RuntimeError(
+                f"Unable to load Krea 2 components from '{component_repo}'; "
+                "accept its license on Hugging Face and set HF_TOKEN"
+            ) from error
+        with init_empty_weights():
+            transformer = Krea2Transformer2DModel.from_config(transformer_config)
+
+        expected_shapes = {
+            key: tuple(tensor.shape) for key, tensor in transformer.state_dict().items()
+        }
+        loaded_keys: set[str] = set()
+        keep_in_fp32_modules = set(transformer._keep_in_fp32_modules)
+
+        with safe_open(checkpoint_path, framework="pt", device="cpu") as checkpoint:
+            source_keys = list(checkpoint.keys())
+            _get_krea2_checkpoint_precision(checkpoint)
+
+            for source_key in source_keys:
+                tensor = checkpoint.get_tensor(source_key)
+                key, tensor = self._convert_krea2_checkpoint_tensor(source_key, tensor)
+                expected_shape = expected_shapes.get(key)
+                if expected_shape is None:
+                    raise ValueError(f"Unexpected Krea 2 checkpoint tensor: {source_key}")
+                if tuple(tensor.shape) != expected_shape:
+                    raise ValueError(
+                        f"Invalid shape for Krea 2 tensor {source_key}: "
+                        f"expected {expected_shape}, got {tuple(tensor.shape)}"
+                    )
+
+                set_module_tensor_to_device(
+                    transformer,
+                    key,
+                    "cpu",
+                    value=tensor,
+                    dtype=(
+                        torch.float32
+                        if keep_in_fp32_modules.intersection(key.split("."))
+                        else self.policy.dtype
+                    ),
+                )
+                loaded_keys.add(key)
+
+        missing_keys = expected_shapes.keys() - loaded_keys
+        if missing_keys:
+            missing = ", ".join(sorted(missing_keys)[:3])
+            raise ValueError(f"Krea 2 checkpoint is missing tensors: {missing}")
+
+        return transformer
+
+    @staticmethod
+    def _krea2_component_repo(model_config: dict[str, Any]) -> str:
+        """Return the hosted component repository for a Krea checkpoint."""
+        return (
+            model_config.get("krea2_component_repo")
+            or model_config.get("component_repo")
+            or model_config.get("repo")
+            or DEFAULT_KREA2_COMPONENT_REPO
+        )
+
     def _load_transformer_checkpoint(self, checkpoint_path: Path) -> dict[str, Any]:
         """Load and normalize CivitAI/Comfy transformer checkpoint keys for Diffusers.
 
@@ -911,6 +1102,51 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
             normalized_checkpoint[normalized_key] = tensor
 
         return normalized_checkpoint
+
+    @staticmethod
+    def _convert_krea2_checkpoint_tensor(
+        key: str,
+        tensor: torch.Tensor,
+    ) -> tuple[str, torch.Tensor]:
+        """Convert one Comfy Krea 2 tensor to its Diffusers name and shape."""
+        key = key.removeprefix(COMFY_DIFFUSION_MODEL_PREFIX)
+        prefix_replacements = (
+            ("first.", "img_in."),
+            ("tmlp.0.", "time_embed.linear_1."),
+            ("tmlp.2.", "time_embed.linear_2."),
+            ("tproj.1.", "time_mod_proj."),
+            ("txtmlp.0.scale", "txt_in.norm.weight"),
+            ("txtmlp.1.", "txt_in.linear_1."),
+            ("txtmlp.3.", "txt_in.linear_2."),
+            ("txtfusion.", "text_fusion."),
+            ("blocks.", "transformer_blocks."),
+            ("last.modulation.lin", "final_layer.scale_shift_table"),
+            ("last.norm.scale", "final_layer.norm.weight"),
+            ("last.linear.", "final_layer.linear."),
+        )
+        for source, target in prefix_replacements:
+            if key.startswith(source):
+                key = target + key.removeprefix(source)
+                break
+
+        key = key.replace(".attn.qknorm.qnorm.scale", ".attn.norm_q.weight")
+        key = key.replace(".attn.qknorm.knorm.scale", ".attn.norm_k.weight")
+        key = key.replace(".prenorm.scale", ".norm1.weight")
+        key = key.replace(".postnorm.scale", ".norm2.weight")
+        key = key.replace(".attn.wq.", ".attn.to_q.")
+        key = key.replace(".attn.wk.", ".attn.to_k.")
+        key = key.replace(".attn.wv.", ".attn.to_v.")
+        key = key.replace(".attn.gate.", ".attn.to_gate.")
+        key = key.replace(".attn.wo.", ".attn.to_out.0.")
+        key = key.replace(".mlp.", ".ff.")
+
+        if key == "final_layer.scale_shift_table":
+            tensor = tensor.reshape(2, -1)
+        elif key.endswith(".mod.lin"):
+            key = key.removesuffix(".mod.lin") + ".scale_shift_table"
+            tensor = tensor.reshape(6, -1)
+
+        return key, tensor
 
     def _resolve_qwen_transformer_dtype(
         self,
@@ -1287,6 +1523,13 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
             as the actual seed used, prompts, final image size, number of
             steps, and guidance scale.
         """
+        if (
+            self._pipeline_config is not None
+            and self._pipeline_config.pipeline_class == "Krea2Pipeline"
+            and (kwargs.get("init_image") is not None or kwargs.get("mask_image") is not None)
+        ):
+            raise ValueError("Krea 2 supports text-to-image only")
+
         # Apply defaults from pipeline config (validation happens in super().generate())
         # Note: We need to check _pipeline_config here before applying defaults,
         # but full validation happens in validate_pipeline() called by super()

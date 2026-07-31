@@ -1,8 +1,17 @@
 """Tests for bot helper functions."""
 
+from unittest.mock import AsyncMock, MagicMock, patch
+
 import pytest
 
-from oneiro.discord.commands import slugify
+from oneiro.civitai import ModelVersion
+from oneiro.discord.commands import (
+    is_krea2_base_model,
+    krea2_component_repo,
+    register_commands,
+    slugify,
+)
+from oneiro.queue import QueueStatus
 from oneiro.services.generation import (
     MAX_LORA_WEIGHT,
     MIN_LORA_WEIGHT,
@@ -38,6 +47,203 @@ class TestSlugify:
     def test_only_special_chars_returns_unnamed(self):
         """String with only special chars returns 'unnamed'."""
         assert slugify("!!!@@@") == "unnamed"
+
+
+@pytest.mark.parametrize(
+    ("base_model", "expected"),
+    [
+        ("Krea 2", True),
+        ("Krea-2", True),
+        ("Krea2", True),
+        ("Krea 2 Turbo", True),
+        ("Flux.1 Krea", False),
+        (None, False),
+    ],
+)
+def test_is_krea2_base_model_uses_pipeline_resolution(base_model, expected):
+    """Fetch precision selection uses the same architecture resolution as model loading."""
+    assert is_krea2_base_model(base_model) is expected
+
+
+@pytest.mark.parametrize(
+    ("model_name", "version_name", "expected"),
+    [
+        ("Krea 2 Raw", "v1", "krea/Krea-2-Raw"),
+        ("Krea 2", "raw v1", "krea/Krea-2-Raw"),
+        ("Krea 2 Turbo", "v1", "krea/Krea-2-Turbo"),
+        ("Krea 2 Turbo Raw", "v1 Turbo", "krea/Krea-2-Turbo"),
+    ],
+)
+def test_krea2_component_repo_follows_civitai_names(model_name, version_name, expected):
+    """Fetched Krea checkpoints carry the matching hosted component recipe."""
+    assert krea2_component_repo(model_name, version_name) == expected
+
+
+@pytest.mark.parametrize(
+    ("checkpoint_kind", "writes_config"),
+    [
+        ("krea", True),
+        ("quantized", False),
+        ("lora", False),
+        ("malformed", False),
+        ("cached", True),
+        ("cached_malformed", False),
+    ],
+)
+async def test_fetch_krea2_validates_header_before_writing_config(
+    checkpoint_kind, writes_config, tmp_path
+):
+    """Fetch persists only validated Krea checkpoints and reports header precision."""
+    commands = {}
+    bot = MagicMock()
+
+    def slash_command(**kwargs):
+        def register(command):
+            commands[kwargs["name"]] = command
+            return command
+
+        return register
+
+    bot.slash_command.side_effect = slash_command
+    register_commands(bot)
+
+    version = ModelVersion.from_dict(
+        {
+            "id": 2,
+            "modelId": 1,
+            "name": "v1 Turbo",
+            "baseModel": "Krea 2",
+            "files": [
+                {
+                    "id": 3,
+                    "name": "krea.safetensors",
+                    "type": "Model",
+                    "downloadUrl": "https://civitai.com/download/3",
+                    "metadata": {"format": "SafeTensor", "fp": "bf16"},
+                    "hashes": {"SHA256": "ABC123"},
+                    "primary": True,
+                }
+            ],
+        }
+    )
+    model = MagicMock()
+    model.name = "Krea 2 Turbo Raw"
+    model.type = "Checkpoint"
+    model.latest_version = version
+    model.versions = [version]
+
+    status = MagicMock()
+    status.edit = AsyncMock()
+    ctx = MagicMock()
+    ctx.defer = AsyncMock()
+    ctx.followup.send = AsyncMock(return_value=status)
+    ctx.bot.config.state_path = "state.toml"
+    ctx.bot.config.get.return_value = {}
+    ctx.bot.config.set = MagicMock()
+    ctx.bot.pipeline_manager = None
+    ctx.bot.civitai_client.get_model = AsyncMock(return_value=model)
+    downloaded_path = tmp_path / "krea.safetensors"
+    import torch
+    from safetensors.torch import save_file
+
+    dtype = torch.int8 if checkpoint_kind == "quantized" else torch.bfloat16
+    malformed = checkpoint_kind in {"malformed", "cached_malformed"}
+    tensors = (
+        {
+            "first.weight": torch.ones(1, dtype=dtype),
+            "last.linear.weight": torch.ones(1, dtype=dtype),
+            "blocks.0.attn.wq.weight": torch.ones(1, dtype=dtype),
+        }
+        if checkpoint_kind != "lora"
+        else {"lora_unet_blocks_0_attn_wq.alpha": torch.ones(1, dtype=torch.float16)}
+    )
+    if malformed:
+        downloaded_path.write_bytes(b"not a safetensor")
+    elif checkpoint_kind == "lora":
+        save_file(tensors, downloaded_path)
+    elif checkpoint_kind == "krea":
+        tensors["last.norm.scale"] = torch.ones(1, dtype=torch.float32)
+        save_file(tensors, downloaded_path)
+    else:
+        save_file(tensors, downloaded_path)
+
+    header_kind = "krea" if malformed or checkpoint_kind == "cached" else checkpoint_kind
+    header_dtype = "I8" if header_kind == "quantized" else "BF16"
+    header_keys = (
+        ["lora_unet_blocks_0_attn_wq.alpha"]
+        if header_kind == "lora"
+        else ["first.weight", "last.linear.weight", "blocks.0.attn.wq.weight"]
+    )
+    ctx.bot.civitai_client.get_safetensor_header = AsyncMock(
+        return_value={
+            key: {"dtype": header_dtype, "shape": [1], "data_offsets": [0, 2]}
+            for key in header_keys
+        }
+    )
+    ctx.bot.civitai_client.cache.get.return_value = (
+        downloaded_path if checkpoint_kind.startswith("cached") else None
+    )
+    ctx.bot.civitai_client.download_model_version = AsyncMock(return_value=downloaded_path)
+
+    with patch("oneiro.discord.commands.DevicePolicy.auto_detect") as auto_detect:
+        auto_detect.return_value.dtype = "bfloat16"
+        await commands["fetch"](
+            ctx,
+            "https://civitai.com/models/1",
+            krea2_variant="raw",
+        )
+
+    assert ctx.bot.config.set.called is writes_config
+    if writes_config:
+        ctx.bot.civitai_client.download_model_version.assert_awaited_once()
+        if checkpoint_kind == "cached":
+            ctx.bot.civitai_client.get_safetensor_header.assert_not_awaited()
+        else:
+            ctx.bot.civitai_client.get_safetensor_header.assert_awaited_once()
+        checkpoint_config = ctx.bot.config.set.call_args.kwargs["value"]
+        assert checkpoint_config["krea2_component_repo"] == "krea/Krea-2-Raw"
+        assert checkpoint_config["steps"] == 28
+        assert checkpoint_config["guidance_scale"] == 4.5
+        embed = status.edit.call_args.kwargs["embed"]
+        assert next(field.value for field in embed.fields if field.name == "Precision") == "`bf16`"
+
+        ctx.bot.pipeline_manager = MagicMock(current_model="fetched-krea")
+        ctx.bot.content_filter = None
+        ctx.bot.config.get.side_effect = lambda *keys, default=None: (
+            checkpoint_config if keys == ("models", "fetched-krea") else {}
+        )
+        queue_result = MagicMock(status=QueueStatus.QUEUED, position=1)
+        ctx.bot.generation_queue.add = MagicMock(return_value=queue_result)
+        ctx.author.id = 1
+        lora_result = MagicMock(configs=[], warnings=[], auto_detected=False)
+
+        with (
+            patch(
+                "oneiro.discord.commands.resolve_loras",
+                new=AsyncMock(return_value=lora_result),
+            ),
+            patch(
+                "oneiro.discord.commands.create_dream_callbacks",
+                return_value=(MagicMock(), MagicMock(), MagicMock()),
+            ),
+        ):
+            await commands["dream"](ctx, "test prompt")
+
+        request = ctx.bot.generation_queue.add.call_args.kwargs["request"]
+        assert request["steps"] == 28
+        assert request["guidance_scale"] == 4.5
+    elif checkpoint_kind in {"quantized", "lora"}:
+        ctx.bot.civitai_client.download_model_version.assert_not_awaited()
+        ctx.bot.civitai_client.get_safetensor_header.assert_awaited_once()
+    else:
+        if checkpoint_kind == "cached_malformed":
+            ctx.bot.civitai_client.download_model_version.assert_not_awaited()
+            ctx.bot.civitai_client.get_safetensor_header.assert_not_awaited()
+        else:
+            ctx.bot.civitai_client.download_model_version.assert_awaited_once()
+            ctx.bot.civitai_client.get_safetensor_header.assert_awaited_once()
+        assert not downloaded_path.exists()
+        ctx.bot.civitai_client.cache.remove.assert_called_once_with("ABC123")
 
 
 class TestValidateLoraWeight:
