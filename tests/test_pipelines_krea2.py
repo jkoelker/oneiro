@@ -7,9 +7,26 @@ import pytest
 import torch
 from PIL import Image
 
+import oneiro.pipelines.krea2 as krea2
 from oneiro.device import DevicePolicy, OffloadMode
 from oneiro.pipelines.krea2 import Krea2PipelineWrapper
 from oneiro.pipelines.lora import LoraConfig, LoraSource
+
+
+class TestLoadKrea2Tokenizer:
+    """Tests for load_krea2_tokenizer()."""
+
+    @patch("transformers.AutoTokenizer")
+    def test_loads_published_fast_tokenizer(self, mock_auto_tokenizer):
+        """Krea repositories load their published fast-tokenizer asset."""
+        tokenizer = krea2.load_krea2_tokenizer("krea/Krea-2-Turbo")
+
+        mock_auto_tokenizer.from_pretrained.assert_called_once_with(
+            "krea/Krea-2-Turbo",
+            subfolder="tokenizer",
+            use_fast=True,
+        )
+        assert tokenizer is mock_auto_tokenizer.from_pretrained.return_value
 
 
 class TestKrea2PipelineWrapperLoad:
@@ -18,13 +35,21 @@ class TestKrea2PipelineWrapperLoad:
     @patch("oneiro.pipelines.base.torch.set_num_interop_threads")
     @patch("oneiro.pipelines.base.torch.set_num_threads")
     @patch("diffusers.Krea2Pipeline", create=True)
-    def test_load_uses_turbo_repo_by_default(self, mock_krea2_pipeline, mock_threads, mock_interop):
-        """Load selects the official Turbo checkpoint when no repo is configured."""
-        pipeline = Krea2PipelineWrapper()
-        pipeline.load({"cpu_offload": False})
+    def test_load_uses_turbo_repo_and_fast_tokenizer_by_default(
+        self, mock_krea2_pipeline, mock_threads, mock_interop
+    ):
+        """Load selects the official Turbo checkpoint and its fast tokenizer by default."""
+        with patch(
+            "oneiro.pipelines.krea2.load_krea2_tokenizer",
+            create=True,
+        ) as mock_load_tokenizer:
+            pipeline = Krea2PipelineWrapper()
+            pipeline.load({"cpu_offload": False})
 
+        mock_load_tokenizer.assert_called_once_with("krea/Krea-2-Turbo")
         mock_krea2_pipeline.from_pretrained.assert_called_once_with(
             "krea/Krea-2-Turbo",
+            tokenizer=mock_load_tokenizer.return_value,
             torch_dtype=pipeline.policy.dtype,
         )
 

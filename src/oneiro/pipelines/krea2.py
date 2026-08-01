@@ -10,6 +10,13 @@ from oneiro.pipelines.base import BasePipeline, GenerationResult
 from oneiro.pipelines.lora import LoraLoaderMixin
 
 
+def load_krea2_tokenizer(repo: str) -> Any:
+    """Load Krea's tokenizer from its published fast-tokenizer asset."""
+    from transformers import AutoTokenizer
+
+    return AutoTokenizer.from_pretrained(repo, subfolder="tokenizer", use_fast=True)
+
+
 class Krea2PipelineWrapper(LoraLoaderMixin, BasePipeline):
     """Wrapper for Krea 2 Raw and Turbo models."""
 
@@ -35,7 +42,12 @@ class Krea2PipelineWrapper(LoraLoaderMixin, BasePipeline):
             group_offload_use_stream=group_offload_use_stream,
             group_offload_num_blocks_per_group=group_offload_num_blocks_per_group,
         )
-        self.pipe = Krea2Pipeline.from_pretrained(repo, torch_dtype=self.policy.dtype)
+        tokenizer = load_krea2_tokenizer(repo)
+        self.pipe = Krea2Pipeline.from_pretrained(
+            repo,
+            tokenizer=tokenizer,
+            torch_dtype=self.policy.dtype,
+        )
 
         self.policy.apply_to_pipeline(self.pipe)
         print(f"Krea 2 loaded from {repo}")

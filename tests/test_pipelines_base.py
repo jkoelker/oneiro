@@ -135,9 +135,10 @@ class TestPipelineManagerLoad:
 
     @patch("oneiro.pipelines.base.torch.set_num_interop_threads")
     @patch("oneiro.pipelines.base.torch.set_num_threads")
+    @patch("oneiro.pipelines.krea2.load_krea2_tokenizer")
     @patch("diffusers.Krea2Pipeline", create=True)
     async def test_resolves_named_local_lora_before_krea_load(
-        self, mock_krea2_pipeline, mock_threads, mock_interop, tmp_path
+        self, mock_krea2_pipeline, mock_tokenizer, mock_threads, mock_interop, tmp_path
     ):
         """Krea loading resolves local named LoRAs before synchronous model setup."""
         lora_path = tmp_path / "portrait.safetensors"
