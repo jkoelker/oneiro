@@ -1,6 +1,9 @@
 """Event handlers and callback factories for Discord bot."""
 
+import io
+import re
 import time
+import traceback
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -12,6 +15,26 @@ from oneiro.pipelines import GenerationResult, LoraConfig
 if TYPE_CHECKING:
     from oneiro.app import OneiroBot
     from oneiro.pipelines import PipelineManager
+
+
+_TOKEN_PATTERN = re.compile(r"([?&]token=)[^&\s'\"`]+", re.IGNORECASE)
+
+
+def _sanitize_error_text(text: str) -> str:
+    """Redact CivitAI API tokens from exception text."""
+    return _TOKEN_PATTERN.sub(r"\1<redacted>", text)
+
+
+def format_exception_response(prefix: str, error: BaseException) -> dict[str, Any]:
+    """Build Discord send arguments for a sanitized traceback response."""
+    trace = _sanitize_error_text("".join(traceback.format_exception(error)))
+    message = f"{prefix}\n```py\n{trace}\n```"
+    response: dict[str, Any] = {"content": message}
+    if len(message) > 2000:
+        preview = 2000 - len(prefix) - len("\n```py\n...\n```")
+        response["content"] = f"{prefix}\n```py\n{trace[:preview]}...\n```"
+        response["file"] = discord.File(io.BytesIO(trace.encode()), filename="traceback.txt")
+    return response
 
 
 @dataclass
@@ -73,13 +96,25 @@ def create_dream_callbacks(
 
     async def on_complete(result: GenerationResult | Exception) -> None:
         if isinstance(result, Exception):
+            prefix = "❌ Generation failed"
+            separator = ": "
+            ellipsis = "..."
+            max_reason_length = 2000 - len(prefix) - len(separator) - len(ellipsis)
+            reason = _sanitize_error_text(str(result))
+            if len(reason) > max_reason_length:
+                reason = f"{reason[:max_reason_length]}{ellipsis}"
+            public_message = f"{prefix}{separator}{reason}"
             if context.status_message:
                 try:
-                    await context.status_message.edit(content=f"❌ Generation failed: {result}")
+                    await context.status_message.edit(content=public_message)
                 except discord.errors.NotFound:
-                    await context.ctx.followup.send(f"❌ Generation failed: {result}")
+                    await context.ctx.followup.send(public_message)
             else:
-                await context.ctx.followup.send(f"❌ Generation failed: {result}")
+                await context.ctx.followup.send(public_message)
+
+            await context.ctx.followup.send(
+                **format_exception_response(prefix, result), ephemeral=True
+            )
             return
 
         elapsed = time.time() - context.start_time
