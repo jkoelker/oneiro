@@ -1,6 +1,7 @@
 """Tests for CivitaiClient."""
 
 from pathlib import Path
+from unittest.mock import patch
 
 import httpx
 import pytest
@@ -12,6 +13,7 @@ from oneiro.civitai import (
     CivitaiCache,
     CivitaiClient,
     CivitaiError,
+    CivitaiHeaderError,
     CivitaiNotFoundError,
     CivitaiRateLimitError,
     Model,
@@ -201,7 +203,7 @@ class TestModelVersion:
         assert version.primary_file is not None
         assert version.primary_file.name == "first.bin"
 
-    def test_select_checkpoint_file_auto_prefers_diffusers_compatible_precision(self):
+    def test_checkpoint_files_auto_prefers_diffusers_compatible_precision(self):
         """Automatic checkpoint selection skips unsupported quantized files."""
         version = ModelVersion.from_dict(
             {
@@ -225,11 +227,11 @@ class TestModelVersion:
             }
         )
 
-        selected = version.select_checkpoint_file()
+        selected = version.checkpoint_files()[0]
 
         assert selected.id == 2
 
-    def test_select_checkpoint_file_honors_explicit_precision(self):
+    def test_checkpoint_files_honors_explicit_precision(self):
         """Explicit checkpoint precision overrides the automatic ranking."""
         version = ModelVersion.from_dict(
             {
@@ -253,11 +255,11 @@ class TestModelVersion:
             }
         )
 
-        selected = version.select_checkpoint_file("fp16")
+        selected = version.checkpoint_files("fp16")[0]
 
         assert selected.id == 2
 
-    def test_select_checkpoint_file_auto_prefers_policy_precision(self):
+    def test_checkpoint_files_auto_prefers_policy_precision(self):
         """Automatic checkpoint selection follows the resolved device policy dtype."""
         version = ModelVersion.from_dict(
             {
@@ -280,18 +282,82 @@ class TestModelVersion:
             }
         )
 
-        selected = version.select_checkpoint_file(preferred_precision="fp16")
+        selected = version.checkpoint_files("fp16")[0]
 
         assert selected.id == 2
 
-    def test_select_checkpoint_file_reports_unavailable_precision_as_civitai_error(self):
-        """Unavailable checkpoint precision is not reported as a URL parsing failure."""
+    def test_checkpoint_files_break_precision_ties_by_size(self):
+        """Larger files rank first when CivitAI precision metadata ties."""
+        version = ModelVersion.from_dict(
+            {
+                "id": 1,
+                "name": "Krea",
+                "files": [
+                    {
+                        "id": 1,
+                        "name": "small.safetensors",
+                        "sizeKB": 100,
+                        "downloadUrl": "http://x/small",
+                        "metadata": {"format": "SafeTensor", "fp": "bf16"},
+                    },
+                    {
+                        "id": 2,
+                        "name": "large.safetensors",
+                        "sizeKB": 200,
+                        "downloadUrl": "http://x/large",
+                        "metadata": {"format": "SafeTensor", "fp": "bf16"},
+                    },
+                ],
+            }
+        )
+
+        assert [file.id for file in version.checkpoint_files()] == [2, 1]
+
+    @pytest.mark.parametrize(
+        "metadata",
+        [
+            {"format": "SafeTensor"},
+            {"format": "SafeTensor", "fp": "fp8"},
+        ],
+    )
+    def test_checkpoint_files_keeps_weight_candidates_with_untrusted_precision_metadata(
+        self, metadata
+    ):
+        """Missing or incorrect precision metadata cannot exclude a weight checkpoint."""
+        version = ModelVersion.from_dict(
+            {
+                "id": 1,
+                "name": "Krea",
+                "files": [
+                    {
+                        "id": 1,
+                        "name": "untrusted-metadata.safetensors",
+                        "sizeKB": 100,
+                        "type": "Model",
+                        "downloadUrl": "http://x/untrusted",
+                        "metadata": metadata,
+                    },
+                    {
+                        "id": 2,
+                        "name": "bf16.safetensors",
+                        "sizeKB": 200,
+                        "type": "Model",
+                        "downloadUrl": "http://x/bf16",
+                        "metadata": {"format": "SafeTensor", "fp": "bf16"},
+                    },
+                ],
+            }
+        )
+
+        assert [file.id for file in version.checkpoint_files("bf16")] == [2, 1]
+
+    def test_checkpoint_files_treats_explicit_precision_as_a_preference(self):
+        """Unavailable metadata precision does not prevent later header validation."""
         version = ModelVersion.from_dict(SAMPLE_VERSION_RESPONSE)
 
-        with pytest.raises(CivitaiError, match="No fp32 SafeTensor checkpoint found"):
-            version.select_checkpoint_file("fp32")
+        assert version.checkpoint_files("fp32")[0].id == 11111
 
-    def test_select_checkpoint_file_never_returns_vae(self):
+    def test_checkpoint_files_never_returns_vae(self):
         """Floating-point VAE siblings are not mistaken for transformer checkpoints."""
         version = ModelVersion.from_dict(
             {
@@ -317,8 +383,15 @@ class TestModelVersion:
             }
         )
 
-        with pytest.raises(CivitaiError, match="No Diffusers-compatible"):
-            version.select_checkpoint_file()
+        assert version.checkpoint_files()[0].id == 1
+
+    def test_checkpoint_files_is_the_only_checkpoint_selection_api(self):
+        """Checkpoint selection exposes only ordered candidates and a precision preference."""
+        version = ModelVersion.from_dict(SAMPLE_VERSION_RESPONSE)
+
+        assert not hasattr(version, "select_checkpoint_file")
+        with pytest.raises(TypeError, match="unexpected keyword argument 'precision'"):
+            version.checkpoint_files(precision="fp16")
 
 
 class TestModel:
@@ -879,6 +952,32 @@ class TestCivitaiClientDownload:
             with pytest.raises(CivitaiError, match="Invalid SafeTensor tensor descriptor"):
                 await client.get_safetensor_header("https://civitai.com/api/download/models/1")
 
+    @pytest.mark.parametrize("error", [ValueError("integer too large"), RecursionError()])
+    @respx.mock
+    async def test_get_safetensor_header_normalizes_json_parser_errors(self, tmp_path, error):
+        """Pathological JSON remains a candidate-specific header failure."""
+        contents = (2).to_bytes(8, "little") + b"{}"
+        route = respx.get("https://civitai.com/api/download/models/1")
+        route.side_effect = [
+            httpx.Response(
+                206,
+                content=contents[:8],
+                headers={"Content-Range": "bytes 0-7/10"},
+            ),
+            httpx.Response(
+                206,
+                content=contents,
+                headers={"Content-Range": "bytes 0-9/10"},
+            ),
+        ]
+
+        async with CivitaiClient(cache_dir=tmp_path) as client:
+            with (
+                patch("oneiro.civitai.json.loads", side_effect=error),
+                pytest.raises(CivitaiHeaderError, match="Invalid SafeTensor header"),
+            ):
+                await client.get_safetensor_header("https://civitai.com/api/download/models/1")
+
     @respx.mock
     async def test_download_uses_cache(self, tmp_path):
         """download_file returns cached file if hash matches."""
@@ -955,7 +1054,7 @@ class TestCivitaiClientDownload:
                 ],
             }
         )
-        selected = version.select_checkpoint_file("fp16")
+        selected = version.checkpoint_files("fp16")[0]
 
         async with CivitaiClient(cache_dir=tmp_path, verify_hashes=False) as client:
             result = await client.download_model_version(version, model_file=selected)

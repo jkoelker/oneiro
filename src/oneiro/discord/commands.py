@@ -1,5 +1,6 @@
 """Slash command definitions for Oneiro Discord bot."""
 
+import inspect
 import re
 from contextlib import suppress
 from pathlib import Path
@@ -7,10 +8,21 @@ from typing import TYPE_CHECKING, Any
 
 import discord
 from discord import option
+from safetensors import SafetensorError
 
-from oneiro.civitai import CivitaiClient, CivitaiError, ModelFile, parse_civitai_url
+from oneiro.civitai import (
+    CivitaiClient,
+    CivitaiError,
+    CivitaiHeaderError,
+    ModelFile,
+    parse_civitai_url,
+)
 from oneiro.device import DevicePolicy
-from oneiro.discord.handlers import DreamContext, create_dream_callbacks
+from oneiro.discord.handlers import (
+    DreamContext,
+    create_dream_callbacks,
+    format_exception_response,
+)
 from oneiro.pipelines import SCHEDULER_CHOICES
 from oneiro.pipelines.civitai_checkpoint import (
     DEFAULT_KREA2_COMPONENT_REPO,
@@ -102,6 +114,27 @@ def _discard_invalid_civitai_download(
             client.cache.remove(model_file.sha256)
     with suppress(OSError):
         path.unlink(missing_ok=True)
+
+
+def get_generation_defaults(pipeline: Any) -> tuple[int, float]:
+    """Return configured or declared generation defaults for a loaded pipeline."""
+    if pipeline is None:
+        return 9, 0.0
+    pipeline_config = getattr(pipeline, "pipeline_config", None)
+    steps = getattr(pipeline_config, "default_steps", None)
+    guidance = getattr(pipeline_config, "default_guidance_scale", None)
+    try:
+        parameters = inspect.signature(pipeline.generate).parameters
+    except (TypeError, ValueError):
+        parameters = {}
+    if not isinstance(steps, int):
+        steps = getattr(parameters.get("steps"), "default", 9)
+    if not isinstance(guidance, int | float):
+        guidance = getattr(parameters.get("guidance_scale"), "default", 0.0)
+    return (
+        steps if isinstance(steps, int) else 9,
+        float(guidance) if isinstance(guidance, int | float) else 0.0,
+    )
 
 
 def validate_image_attachment(attachment: discord.Attachment, label: str) -> str | None:
@@ -324,7 +357,9 @@ def register_commands(bot: "OneiroBot") -> None:
             try:
                 init_image_bytes = await image.read()
             except Exception as e:
-                await ctx.followup.send(f"❌ Failed to read image: {e}", ephemeral=True)
+                await ctx.followup.send(
+                    **format_exception_response("❌ Failed to read image", e), ephemeral=True
+                )
                 return
 
         mask_image_bytes: bytes | None = None
@@ -338,12 +373,18 @@ def register_commands(bot: "OneiroBot") -> None:
             try:
                 mask_image_bytes = await mask.read()
             except Exception as e:
-                await ctx.followup.send(f"❌ Failed to read mask image: {e}", ephemeral=True)
+                await ctx.followup.send(
+                    **format_exception_response("❌ Failed to read mask image", e),
+                    ephemeral=True,
+                )
                 return
 
         # Get model config defaults
-        model_steps = model_config.get("steps", 9)
-        model_guidance = model_config.get("guidance_scale", 0.0)
+        pipeline_steps, pipeline_guidance = get_generation_defaults(
+            ctx.bot.pipeline_manager.pipeline
+        )
+        model_steps = model_config.get("steps", pipeline_steps)
+        model_guidance = model_config.get("guidance_scale", pipeline_guidance)
 
         # Handle Qwen's true_cfg_scale
         if model_config.get("true_cfg_scale"):
@@ -576,7 +617,11 @@ def register_commands(bot: "OneiroBot") -> None:
 
         try:
             loading_msg = await ctx.followup.send(f"⏳ Loading model `{model}`...")
-            await ctx.bot.pipeline_manager.load_model(model)
+            try:
+                await ctx.bot.pipeline_manager.load_model(model)
+            except (CivitaiError, ValueError) as e:
+                await ctx.followup.send(f"❌ Failed to load model: {e}", ephemeral=True)
+                return
 
             if scheduler and ctx.bot.pipeline_manager.pipeline is not None:
                 if isinstance(ctx.bot.pipeline_manager.pipeline, CivitaiCheckpointPipeline):
@@ -604,7 +649,9 @@ def register_commands(bot: "OneiroBot") -> None:
                 msg += f" with {', '.join(overrides)}"
             await loading_msg.edit(content=msg)
         except Exception as e:
-            await ctx.followup.send(f"❌ Failed to load model: {e}", ephemeral=True)
+            await ctx.followup.send(
+                **format_exception_response("❌ Failed to load model", e), ephemeral=True
+            )
 
     @bot.slash_command(name="config", description="Show current configuration")
     async def config_command(ctx: discord.ApplicationContext) -> None:
@@ -759,54 +806,92 @@ def register_commands(bot: "OneiroBot") -> None:
             selected_file = None
             selected_precision = None
             component_repo = None
-            cached_checkpoint = None
+            downloaded_path = None
             if model_type == "CHECKPOINT" and is_krea2_base_model(version.base_model):
                 policy_precision = {
                     "bfloat16": "bf16",
                     "float16": "fp16",
                     "float32": "fp32",
                 }[str(DevicePolicy.auto_detect().dtype).removeprefix("torch.")]
-                selected_file = version.select_checkpoint_file(
-                    precision,
-                    preferred_precision=policy_precision,
+                candidates = version.checkpoint_files(
+                    preferred_precision=(precision if precision != "auto" else policy_precision),
                 )
                 component_repo = krea2_component_repo(
                     model.name,
                     version.name,
                     krea2_variant,
                 )
-                if selected_file.sha256:
-                    cached_checkpoint = ctx.bot.civitai_client.cache.get(selected_file.sha256)
-                try:
-                    if cached_checkpoint:
-                        selected_precision = get_krea2_checkpoint_precision(cached_checkpoint)
-                    else:
-                        header = await ctx.bot.civitai_client.get_safetensor_header(
-                            selected_file.download_url
+                last_error = None
+                for candidate in candidates:
+                    cached = (
+                        ctx.bot.civitai_client.cache.get(candidate.sha256)
+                        if candidate.sha256
+                        else None
+                    )
+                    if cached:
+                        try:
+                            selected_precision = get_krea2_checkpoint_precision(cached)
+                        except (SafetensorError, ValueError):
+                            _discard_invalid_civitai_download(
+                                ctx.bot.civitai_client,
+                                candidate,
+                                cached,
+                            )
+                            cached = None
+                    if not cached:
+                        try:
+                            header = await ctx.bot.civitai_client.get_safetensor_header(
+                                candidate.download_url
+                            )
+                        except CivitaiHeaderError as error:
+                            last_error = error
+                            continue
+                        except CivitaiError:
+                            raise
+                        try:
+                            selected_precision = get_krea2_checkpoint_precision_from_header(header)
+                        except ValueError as error:
+                            last_error = error
+                            continue
+                    if precision != "auto" and selected_precision != precision:
+                        last_error = CivitaiError(
+                            f"Checkpoint contains {selected_precision}, not requested {precision}"
                         )
-                        selected_precision = get_krea2_checkpoint_precision_from_header(header)
-                except Exception as error:
-                    if cached_checkpoint:
+                        continue
+                    if cached:
+                        selected_file = candidate
+                        downloaded_path = cached
+                        break
+
+                    candidate_path = await ctx.bot.civitai_client.download_model_version(
+                        version,
+                        model_file=candidate,
+                    )
+                    try:
+                        candidate_precision = get_krea2_checkpoint_precision(candidate_path)
+                    except (SafetensorError, ValueError) as error:
                         _discard_invalid_civitai_download(
                             ctx.bot.civitai_client,
-                            selected_file,
-                            cached_checkpoint,
+                            candidate,
+                            candidate_path,
                         )
-                    raise CivitaiError(str(error)) from error
-            downloaded_path = await ctx.bot.civitai_client.download_model_version(
-                version,
-                model_file=selected_file,
-            )
-            if selected_file:
-                try:
-                    selected_precision = get_krea2_checkpoint_precision(downloaded_path)
-                except Exception as error:
-                    _discard_invalid_civitai_download(
-                        ctx.bot.civitai_client,
-                        selected_file,
-                        downloaded_path,
+                        last_error = error
+                        continue
+                    if precision != "auto" and candidate_precision != precision:
+                        last_error = CivitaiError(
+                            f"Checkpoint contains {candidate_precision}, not requested {precision}"
+                        )
+                        continue
+                    selected_file = candidate
+                    selected_precision = candidate_precision
+                    downloaded_path = candidate_path
+                    break
+                if selected_file is None:
+                    raise CivitaiError(
+                        str(last_error) if last_error else "No valid Krea 2 checkpoint found"
                     )
-                    raise CivitaiError(str(error)) from error
+            else:
+                downloaded_path = await ctx.bot.civitai_client.download_model_version(version)
 
             # Get current pipeline type for compatibility info
             pipeline_type = None
@@ -957,6 +1042,16 @@ def register_commands(bot: "OneiroBot") -> None:
                     value=f"`{selected_precision}`",
                     inline=True,
                 )
+                if component_repo:
+                    recipe_steps, recipe_guidance = get_krea2_generation_defaults(component_repo)
+                    embed.add_field(
+                        name="Krea 2 Recipe",
+                        value=(
+                            f"`{component_repo}`\n"
+                            f"{recipe_steps} steps | guidance {recipe_guidance:g}"
+                        ),
+                        inline=False,
+                    )
             elif precision != "auto":
                 embed.add_field(
                     name="Precision",
@@ -982,4 +1077,6 @@ def register_commands(bot: "OneiroBot") -> None:
         except CivitaiError as e:
             await ctx.followup.send(f"❌ Civitai error: {e}", ephemeral=True)
         except Exception as e:
-            await ctx.followup.send(f"❌ Failed to fetch: {e}", ephemeral=True)
+            await ctx.followup.send(
+                **format_exception_response("❌ Failed to fetch", e), ephemeral=True
+            )

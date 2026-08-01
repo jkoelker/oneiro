@@ -42,6 +42,12 @@ class CivitaiNotFoundError(CivitaiError):
     pass
 
 
+class CivitaiHeaderError(CivitaiError):
+    """Downloaded SafeTensor header is invalid or incomplete."""
+
+    pass
+
+
 class ModelType(StrEnum):
     """Civitai model types."""
 
@@ -165,12 +171,8 @@ class ModelVersion:
                 return f
         return self.files[0] if self.files else None
 
-    def select_checkpoint_file(
-        self,
-        precision: str = "auto",
-        preferred_precision: str = "bf16",
-    ) -> ModelFile:
-        """Select the best floating-point SafeTensor checkpoint for Diffusers."""
+    def checkpoint_files(self, preferred_precision: str = "bf16") -> list[ModelFile]:
+        """Return SafeTensor weight checkpoints ordered by precision and size."""
         supported_precisions = ("bf16", "fp16", "fp32")
         weight_file_types = {"model", "unet", "diffusion model"}
         candidates = [
@@ -178,20 +180,22 @@ class ModelVersion:
             for file in self.files
             if file.type.lower() in weight_file_types
             and (file.format or "").lower() == "safetensor"
-            and (file.fp or "").lower() in supported_precisions
         ]
         if not candidates:
-            raise CivitaiError("No Diffusers-compatible floating-point SafeTensor checkpoint found")
-
-        if precision != "auto":
-            candidates = [file for file in candidates if (file.fp or "").lower() == precision]
-            if not candidates:
-                raise CivitaiError(f"No {precision} SafeTensor checkpoint found")
+            raise CivitaiError("No Diffusers-compatible SafeTensor checkpoint found")
 
         precision_order = (preferred_precision,) + tuple(
             item for item in supported_precisions if item != preferred_precision
         )
-        return min(candidates, key=lambda file: precision_order.index((file.fp or "").lower()))
+        precision_rank = {item: rank for rank, item in enumerate(precision_order)}
+        return sorted(
+            candidates,
+            key=lambda file: (
+                precision_rank.get((file.fp or "").lower(), len(precision_order)),
+                -file.size_kb,
+                file.id,
+            ),
+        )
 
 
 @dataclass
@@ -744,7 +748,7 @@ class CivitaiClient:
             raise CivitaiError(f"SafeTensor header request failed: {error}") from error
 
         if len(data) != length:
-            raise CivitaiError("SafeTensor file ended before its header was complete")
+            raise CivitaiHeaderError("SafeTensor file ended before its header was complete")
         return bytes(data)
 
     async def get_safetensor_header(self, url: str) -> dict[str, Any]:
@@ -752,23 +756,23 @@ class CivitaiClient:
         prefix = await self._read_download_prefix(url, 8)
         header_size = int.from_bytes(prefix, "little")
         if not 0 < header_size <= self.MAX_SAFETENSOR_HEADER_BYTES:
-            raise CivitaiError("Invalid SafeTensor header size")
+            raise CivitaiHeaderError("Invalid SafeTensor header size")
 
         payload = await self._read_download_prefix(url, 8 + header_size)
         try:
             header = json.loads(payload[8:].decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as error:
-            raise CivitaiError("Invalid SafeTensor header") from error
+        except (UnicodeDecodeError, ValueError, RecursionError) as error:
+            raise CivitaiHeaderError("Invalid SafeTensor header") from error
         if not isinstance(header, dict):
-            raise CivitaiError("Invalid SafeTensor header")
+            raise CivitaiHeaderError("Invalid SafeTensor header")
         metadata = header.get("__metadata__", {})
         if not isinstance(metadata, dict):
-            raise CivitaiError("Invalid SafeTensor metadata")
+            raise CivitaiHeaderError("Invalid SafeTensor metadata")
         for key, descriptor in header.items():
             if key == "__metadata__":
                 continue
             if not isinstance(descriptor, dict):
-                raise CivitaiError("Invalid SafeTensor tensor descriptor")
+                raise CivitaiHeaderError("Invalid SafeTensor tensor descriptor")
             shape = descriptor.get("shape")
             offsets = descriptor.get("data_offsets")
             if (
@@ -780,7 +784,7 @@ class CivitaiClient:
                 or any(not isinstance(offset, int) or offset < 0 for offset in offsets)
                 or offsets[0] > offsets[1]
             ):
-                raise CivitaiError("Invalid SafeTensor tensor descriptor")
+                raise CivitaiHeaderError("Invalid SafeTensor tensor descriptor")
         return header
 
     async def download_model_version(
