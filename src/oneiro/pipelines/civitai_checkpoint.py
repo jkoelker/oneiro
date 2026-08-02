@@ -901,6 +901,8 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
             if self._pipeline_config.pipeline_class == "Krea2Pipeline":
                 from diffusers import Krea2Pipeline
 
+                from oneiro.pipelines.krea2 import load_krea2_tokenizer
+
                 component_repo = self._krea2_component_repo(model_config)
                 transformer_subfolder = model_config.get("transformer_subfolder", "transformer")
                 transformer = self._load_krea2_transformer_from_single_file(
@@ -908,9 +910,11 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
                     component_repo,
                     transformer_subfolder,
                 )
+                tokenizer = load_krea2_tokenizer(component_repo)
                 return Krea2Pipeline.from_pretrained(
                     component_repo,
                     transformer=transformer,
+                    tokenizer=tokenizer,
                     torch_dtype=self.policy.dtype,
                 )
 

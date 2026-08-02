@@ -969,7 +969,12 @@ class TestCivitaiCheckpointPipelineLoad:
         checkpoint.write_bytes(b"dummy")
         mock_pipe = MagicMock()
         mock_transformer = MagicMock()
+        mock_tokenizer = MagicMock()
         mock_policy = DevicePolicy(device="cpu", dtype=torch.bfloat16, offload=OffloadMode.NEVER)
+
+        def load_tokenizer(repo):
+            mock_load_transformer.assert_called_once()
+            return mock_tokenizer
 
         with (
             patch.object(CivitaiCheckpointPipeline, "configure_scheduler"),
@@ -980,6 +985,11 @@ class TestCivitaiCheckpointPipelineLoad:
                 create=True,
                 return_value=mock_transformer,
             ) as mock_load_transformer,
+            patch(
+                "oneiro.pipelines.krea2.load_krea2_tokenizer",
+                create=True,
+                side_effect=load_tokenizer,
+            ) as mock_load_tokenizer,
             patch(
                 "oneiro.pipelines.civitai_checkpoint.get_diffusers_pipeline_class"
             ) as mock_get_class,
@@ -1001,9 +1011,11 @@ class TestCivitaiCheckpointPipelineLoad:
             "krea/Krea-2-Turbo",
             "transformer",
         )
+        mock_load_tokenizer.assert_called_once_with("krea/Krea-2-Turbo")
         mock_krea2_pipeline.from_pretrained.assert_called_once_with(
             "krea/Krea-2-Turbo",
             transformer=mock_transformer,
+            tokenizer=mock_tokenizer,
             torch_dtype=torch.bfloat16,
         )
 
@@ -1025,6 +1037,7 @@ class TestCivitaiCheckpointPipelineLoad:
         checkpoint = tmp_path / "krea2-raw.safetensors"
         checkpoint.write_bytes(b"dummy")
         mock_transformer = MagicMock()
+        mock_tokenizer = MagicMock()
         mock_policy = DevicePolicy(device="cpu", dtype=torch.bfloat16, offload=OffloadMode.NEVER)
 
         with (
@@ -1035,6 +1048,10 @@ class TestCivitaiCheckpointPipelineLoad:
                 "_load_krea2_transformer_from_single_file",
                 return_value=mock_transformer,
             ),
+            patch(
+                "oneiro.pipelines.krea2.load_krea2_tokenizer",
+                return_value=mock_tokenizer,
+            ) as mock_load_tokenizer,
             patch("diffusers.Krea2Pipeline") as mock_krea2_pipeline,
         ):
             mock_krea2_pipeline.from_pretrained.return_value = MagicMock()
@@ -1050,9 +1067,11 @@ class TestCivitaiCheckpointPipelineLoad:
         assert pipeline.pipeline_config is not None
         assert pipeline.pipeline_config.default_steps == expected_steps
         assert pipeline.pipeline_config.default_guidance_scale == expected_guidance
+        mock_load_tokenizer.assert_called_once_with(component_repo)
         mock_krea2_pipeline.from_pretrained.assert_called_once_with(
             component_repo,
             transformer=mock_transformer,
+            tokenizer=mock_tokenizer,
             torch_dtype=torch.bfloat16,
         )
 
