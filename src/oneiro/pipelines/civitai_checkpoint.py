@@ -5,6 +5,7 @@ diffusers' from_single_file() method. Automatically detects the appropriate
 pipeline class based on CivitAI's baseModel metadata.
 """
 
+import json
 import math
 import re
 from dataclasses import dataclass, replace
@@ -469,6 +470,7 @@ DEFAULT_FLUX2_KLEIN_4B_BASE_COMPONENT_REPO = "black-forest-labs/FLUX.2-klein-bas
 COMFY_DIFFUSION_MODEL_PREFIX = "model.diffusion_model."
 KREA2_DTYPE_PRECISIONS = {
     "BF16": "bf16",
+    "F8_E4M3": "fp8",
     "F16": "fp16",
     "F32": "fp32",
     "F64": "fp64",
@@ -490,6 +492,52 @@ DEFAULT_PIPELINE_CONFIG = PipelineConfig(
 )
 
 
+class _Krea2FP8Linear(torch.nn.Linear):
+    """Run Comfy FP8 weights with dynamically quantized activations."""
+
+    _oneiro_full_precision_mm = False
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        """Apply the FP8 weight using its checkpoint scale."""
+        from comfy_kitchen.tensor import QuantizedTensor, TensorCoreFP8Layout
+
+        if self._oneiro_full_precision_mm:
+            return torch.nn.functional.linear(input, self.weight.dequantize(), self.bias)
+
+        quantized, params = TensorCoreFP8Layout.quantize(input)
+        quantized_input = QuantizedTensor(quantized, "TensorCoreFP8Layout", params)
+        return torch.nn.functional.linear(quantized_input, self.weight, self.bias)
+
+
+def _get_krea2_fp8_layers(metadata: dict[str, Any]) -> dict[str, bool]:
+    """Return Comfy FP8 layer names and their full-precision matmul flags."""
+    raw_metadata = metadata.get("_quantization_metadata")
+    if raw_metadata is None:
+        return {}
+    try:
+        quantization = json.loads(raw_metadata)
+    except (TypeError, ValueError) as error:
+        raise ValueError("Invalid Krea 2 quantization metadata") from error
+    layers = quantization.get("layers") if isinstance(quantization, dict) else None
+    if not isinstance(layers, dict) or not layers:
+        raise ValueError("Invalid Krea 2 quantization metadata")
+
+    result: dict[str, bool] = {}
+    for name, config in layers.items():
+        if (
+            not isinstance(name, str)
+            or not isinstance(config, dict)
+            or config.get("format") != "float8_e4m3fn"
+        ):
+            raise ValueError(
+                "Quantized Krea 2 single-file checkpoints are not supported by Diffusers"
+            )
+        result[name.removeprefix(COMFY_DIFFUSION_MODEL_PREFIX)] = bool(
+            config.get("full_precision_matrix_mult", False)
+        )
+    return result
+
+
 def get_krea2_checkpoint_precision_from_header(header: dict[str, Any]) -> str:
     """Validate a Krea SafeTensor header and return its dominant precision."""
     metadata = header.get("__metadata__", {}) or {}
@@ -500,14 +548,35 @@ def get_krea2_checkpoint_precision_from_header(header: dict[str, Any]) -> str:
         raise ValueError("Invalid SafeTensor header")
     source_keys = list(tensors)
     dtypes = {str(value.get("dtype", "")) for value in tensors.values()}
+    fp8_layers = _get_krea2_fp8_layers(metadata)
+    has_fp8 = "F8_E4M3" in dtypes
     if (
         not source_keys
-        or "_quantization_metadata" in metadata
-        or any(key.endswith(".weight_scale") for key in source_keys)
         or not dtypes.issubset(KREA2_DTYPE_PRECISIONS)
+        or (fp8_layers and not has_fp8)
+        or (any(key.endswith(".weight_scale") for key in source_keys) and not has_fp8)
     ):
         raise ValueError("Quantized Krea 2 single-file checkpoints are not supported by Diffusers")
-    normalized_keys = {key.removeprefix(COMFY_DIFFUSION_MODEL_PREFIX) for key in source_keys}
+    normalized_tensors = {
+        key.removeprefix(COMFY_DIFFUSION_MODEL_PREFIX): value for key, value in tensors.items()
+    }
+    normalized_keys = set(normalized_tensors)
+    fp8_keys = {key for key, value in normalized_tensors.items() if value.get("dtype") == "F8_E4M3"}
+    fp8_weights = {key for key in fp8_keys if key.endswith(".weight")}
+    scale_keys = {key for key in normalized_keys if key.endswith(".weight_scale")}
+    if fp8_keys != fp8_weights:
+        raise ValueError("Unexpected non-weight FP8 Krea 2 tensor")
+    if fp8_layers and fp8_weights != {f"{name}.weight" for name in fp8_layers}:
+        raise ValueError("Krea 2 FP8 metadata does not match checkpoint weights")
+    if scale_keys and {key.removesuffix("_scale") for key in scale_keys} != fp8_weights:
+        raise ValueError("Krea 2 FP8 checkpoint has missing or orphaned scales")
+    if fp8_layers and not scale_keys:
+        raise ValueError("Krea 2 FP8 checkpoint is missing weight scales")
+    if any(
+        normalized_tensors[key].get("dtype") != "F32" or normalized_tensors[key].get("shape") != []
+        for key in scale_keys
+    ):
+        raise ValueError("Krea 2 FP8 weight scales must be scalar FP32 tensors")
     if not KREA2_REQUIRED_TENSOR_KEYS.issubset(normalized_keys):
         raise ValueError("SafeTensor file does not contain Krea 2 transformer weights")
     element_counts = {
@@ -1010,9 +1079,10 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
         component_repo: str,
         transformer_subfolder: str,
     ) -> Any:
-        """Stream a floating-point Comfy Krea checkpoint into a Diffusers transformer."""
+        """Stream a Comfy Krea checkpoint into a Diffusers transformer."""
         from accelerate import init_empty_weights
         from accelerate.utils import set_module_tensor_to_device
+        from comfy_kitchen.tensor import QuantizedTensor, TensorCoreFP8Layout
         from diffusers import Krea2Transformer2DModel
         from safetensors import safe_open
 
@@ -1034,12 +1104,16 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
         }
         loaded_keys: set[str] = set()
         keep_in_fp32_modules = set(transformer._keep_in_fp32_modules)
+        fp8_loaded = False
 
         with safe_open(checkpoint_path, framework="pt", device="cpu") as checkpoint:
             source_keys = list(checkpoint.keys())
             _get_krea2_checkpoint_precision(checkpoint)
+            fp8_layers = _get_krea2_fp8_layers(checkpoint.metadata() or {})
 
             for source_key in source_keys:
+                if source_key.endswith(".weight_scale"):
+                    continue
                 tensor = checkpoint.get_tensor(source_key)
                 key, tensor = self._convert_krea2_checkpoint_tensor(source_key, tensor)
                 expected_shape = expected_shapes.get(key)
@@ -1050,6 +1124,38 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
                         f"Invalid shape for Krea 2 tensor {source_key}: "
                         f"expected {expected_shape}, got {tuple(tensor.shape)}"
                     )
+
+                if tensor.dtype == torch.float8_e4m3fn:
+                    if not source_key.endswith(".weight"):
+                        raise ValueError(f"Unexpected FP8 Krea 2 tensor: {source_key}")
+                    scale_key = f"{source_key.removesuffix('.weight')}.weight_scale"
+                    scale = (
+                        checkpoint.get_tensor(scale_key)
+                        if scale_key in source_keys
+                        else torch.ones((), dtype=torch.float32)
+                    )
+                    if scale.numel() != 1 or not torch.isfinite(scale).item() or scale.item() <= 0:
+                        raise ValueError(f"Invalid Krea 2 FP8 weight scale: {scale_key}")
+                    tensor = QuantizedTensor(
+                        tensor,
+                        "TensorCoreFP8Layout",
+                        TensorCoreFP8Layout.Params(
+                            scale=scale.float(),
+                            orig_dtype=self.policy.dtype,
+                            orig_shape=expected_shape,
+                        ),
+                    )
+                    module = transformer.get_submodule(key.removesuffix(".weight"))
+                    if not isinstance(module, torch.nn.Linear):
+                        raise ValueError(
+                            f"FP8 Krea 2 tensor does not target a linear layer: {source_key}"
+                        )
+                    module.__class__ = _Krea2FP8Linear
+                    layer_name = source_key.removeprefix(COMFY_DIFFUSION_MODEL_PREFIX).removesuffix(
+                        ".weight"
+                    )
+                    module._oneiro_full_precision_mm = fp8_layers.get(layer_name, False)
+                    fp8_loaded = True
 
                 set_module_tensor_to_device(
                     transformer,
@@ -1068,6 +1174,9 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
         if missing_keys:
             missing = ", ".join(sorted(missing_keys)[:3])
             raise ValueError(f"Krea 2 checkpoint is missing tensors: {missing}")
+
+        if fp8_loaded and self.policy.group_offload_use_stream:
+            self.policy = replace(self.policy, group_offload_use_stream=False)
 
         return transformer
 
