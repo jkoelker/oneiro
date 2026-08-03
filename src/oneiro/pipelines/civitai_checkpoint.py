@@ -524,14 +524,10 @@ def _get_krea2_fp8_layers(metadata: dict[str, Any]) -> dict[str, bool]:
 
     result: dict[str, bool] = {}
     for name, config in layers.items():
-        if (
-            not isinstance(name, str)
-            or not isinstance(config, dict)
-            or config.get("format") != "float8_e4m3fn"
-        ):
-            raise ValueError(
-                "Quantized Krea 2 single-file checkpoints are not supported by Diffusers"
-            )
+        if not isinstance(name, str) or not isinstance(config, dict):
+            raise ValueError("Invalid Krea 2 quantization metadata")
+        if config.get("format") != "float8_e4m3fn":
+            raise ValueError(f"Unsupported Krea 2 quantization format: {config.get('format')}")
         result[name.removeprefix(COMFY_DIFFUSION_MODEL_PREFIX)] = bool(
             config.get("full_precision_matrix_mult", False)
         )
@@ -550,13 +546,17 @@ def get_krea2_checkpoint_precision_from_header(header: dict[str, Any]) -> str:
     dtypes = {str(value.get("dtype", "")) for value in tensors.values()}
     fp8_layers = _get_krea2_fp8_layers(metadata)
     has_fp8 = "F8_E4M3" in dtypes
-    if (
-        not source_keys
-        or not dtypes.issubset(KREA2_DTYPE_PRECISIONS)
-        or (fp8_layers and not has_fp8)
-        or (any(key.endswith(".weight_scale") for key in source_keys) and not has_fp8)
-    ):
-        raise ValueError("Quantized Krea 2 single-file checkpoints are not supported by Diffusers")
+    if not source_keys:
+        raise ValueError("Krea 2 checkpoint has no tensors")
+    unsupported_dtypes = dtypes - KREA2_DTYPE_PRECISIONS.keys()
+    if unsupported_dtypes:
+        raise ValueError(
+            f"Unsupported Krea 2 checkpoint dtypes: {', '.join(sorted(unsupported_dtypes))}"
+        )
+    if fp8_layers and not has_fp8:
+        raise ValueError("Krea 2 FP8 metadata has no FP8 weights")
+    if any(key.endswith(".weight_scale") for key in source_keys) and not has_fp8:
+        raise ValueError("Krea 2 FP8 scales have no FP8 weights")
     normalized_tensors = {
         key.removeprefix(COMFY_DIFFUSION_MODEL_PREFIX): value for key, value in tensors.items()
     }

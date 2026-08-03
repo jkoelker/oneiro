@@ -821,8 +821,11 @@ def register_commands(bot: "OneiroBot") -> None:
                     version.name,
                     krea2_variant,
                 )
-                last_error = None
+                candidate_errors: list[str] = []
                 for candidate in candidates:
+                    candidate_label = (
+                        f"{candidate.name} ({candidate.fp or 'unknown'}, file {candidate.id})"
+                    )
                     cached = (
                         ctx.bot.civitai_client.cache.get(candidate.sha256)
                         if candidate.sha256
@@ -844,18 +847,19 @@ def register_commands(bot: "OneiroBot") -> None:
                                 candidate.download_url
                             )
                         except CivitaiHeaderError as error:
-                            last_error = error
+                            candidate_errors.append(f"{candidate_label}: {error}")
                             continue
                         except CivitaiError:
                             raise
                         try:
                             selected_precision = get_krea2_checkpoint_precision_from_header(header)
                         except ValueError as error:
-                            last_error = error
+                            candidate_errors.append(f"{candidate_label}: {error}")
                             continue
                     if precision != "auto" and selected_precision != precision:
-                        last_error = CivitaiError(
-                            f"Checkpoint contains {selected_precision}, not requested {precision}"
+                        candidate_errors.append(
+                            f"{candidate_label}: contains {selected_precision}, "
+                            f"not requested {precision}"
                         )
                         continue
                     if cached:
@@ -875,11 +879,12 @@ def register_commands(bot: "OneiroBot") -> None:
                             candidate,
                             candidate_path,
                         )
-                        last_error = error
+                        candidate_errors.append(f"{candidate_label}: {error}")
                         continue
                     if precision != "auto" and candidate_precision != precision:
-                        last_error = CivitaiError(
-                            f"Checkpoint contains {candidate_precision}, not requested {precision}"
+                        candidate_errors.append(
+                            f"{candidate_label}: contains {candidate_precision}, "
+                            f"not requested {precision}"
                         )
                         continue
                     selected_file = candidate
@@ -888,7 +893,9 @@ def register_commands(bot: "OneiroBot") -> None:
                     break
                 if selected_file is None:
                     raise CivitaiError(
-                        str(last_error) if last_error else "No valid Krea 2 checkpoint found"
+                        "; ".join(candidate_errors)
+                        if candidate_errors
+                        else "No valid Krea 2 checkpoint found"
                     )
             else:
                 downloaded_path = await ctx.bot.civitai_client.download_model_version(version)
