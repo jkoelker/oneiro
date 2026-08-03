@@ -1075,22 +1075,21 @@ class TestCivitaiCheckpointPipelineLoad:
             torch_dtype=torch.bfloat16,
         )
 
-    def test_get_krea2_checkpoint_precision_rejects_quantized_tensor_header(self, tmp_path):
-        """Tensor dtypes override incorrect floating-point CivitAI metadata."""
+    def test_get_krea2_checkpoint_precision_reports_fp8_tensor_header(self, tmp_path):
+        """Tensor dtypes identify native FP8 Krea checkpoints."""
         from safetensors.torch import save_file
 
-        checkpoint = tmp_path / "mislabeled-bf16.safetensors"
+        checkpoint = tmp_path / "krea2-fp8.safetensors"
         save_file(
             {
-                "first.weight": torch.ones(2, dtype=torch.int8),
-                "last.linear.weight": torch.ones(2, dtype=torch.int8),
-                "blocks.0.attn.wq.weight": torch.ones(2, dtype=torch.int8),
+                "first.weight": torch.ones(2, dtype=torch.float8_e4m3fn),
+                "last.linear.weight": torch.ones(2, dtype=torch.float8_e4m3fn),
+                "blocks.0.attn.wq.weight": torch.ones(2, dtype=torch.float8_e4m3fn),
             },
             checkpoint,
         )
 
-        with pytest.raises(ValueError, match="Quantized Krea 2"):
-            get_krea2_checkpoint_precision(checkpoint)
+        assert get_krea2_checkpoint_precision(checkpoint) == "fp8"
 
     def test_get_krea2_checkpoint_precision_reads_tensor_header(self, tmp_path):
         """Displayed checkpoint precision comes from the SafeTensor header."""
@@ -1127,22 +1126,54 @@ class TestCivitaiCheckpointPipelineLoad:
 
         assert get_krea2_checkpoint_precision(checkpoint) == "bf16"
 
-    def test_get_krea2_checkpoint_precision_rejects_quantization_metadata(self, tmp_path):
-        """Quantization metadata is rejected even when every tensor claims BF16."""
+    def test_get_krea2_checkpoint_precision_reports_scaled_fp8_metadata(self, tmp_path):
+        """Comfy FP8 scales remain eligible for native quantized loading."""
         from safetensors.torch import save_file
 
-        checkpoint = tmp_path / "quantized-bf16.safetensors"
+        checkpoint = tmp_path / "krea2-scaled-fp8.safetensors"
         save_file(
             {
-                "first.weight": torch.ones(2, dtype=torch.bfloat16),
-                "last.linear.weight": torch.ones(2, dtype=torch.bfloat16),
-                "blocks.0.attn.wq.weight": torch.ones(2, dtype=torch.bfloat16),
+                "first.weight": torch.ones(2, dtype=torch.float8_e4m3fn),
+                "first.weight_scale": torch.tensor(0.5),
+                "last.linear.weight": torch.ones(2, dtype=torch.float8_e4m3fn),
+                "last.linear.weight_scale": torch.tensor(0.5),
+                "blocks.0.attn.wq.weight": torch.ones(2, dtype=torch.float8_e4m3fn),
+                "blocks.0.attn.wq.weight_scale": torch.tensor(0.5),
             },
             checkpoint,
-            metadata={"_quantization_metadata": "{}"},
+            metadata={
+                "_quantization_metadata": (
+                    '{"layers":{"first":{"format":"float8_e4m3fn"},'
+                    '"last.linear":{"format":"float8_e4m3fn"},'
+                    '"blocks.0.attn.wq":{"format":"float8_e4m3fn"}}}'
+                )
+            },
         )
 
-        with pytest.raises(ValueError, match="Quantized Krea 2"):
+        assert get_krea2_checkpoint_precision(checkpoint) == "fp8"
+
+    def test_get_krea2_checkpoint_precision_rejects_missing_fp8_scale(self, tmp_path):
+        """Scaled FP8 metadata requires a scale for every quantized weight."""
+        from safetensors.torch import save_file
+
+        checkpoint = tmp_path / "krea2-missing-fp8-scale.safetensors"
+        save_file(
+            {
+                "first.weight": torch.ones(2, dtype=torch.float8_e4m3fn),
+                "last.linear.weight": torch.ones(2, dtype=torch.float8_e4m3fn),
+                "blocks.0.attn.wq.weight": torch.ones(2, dtype=torch.float8_e4m3fn),
+            },
+            checkpoint,
+            metadata={
+                "_quantization_metadata": (
+                    '{"layers":{"first":{"format":"float8_e4m3fn"},'
+                    '"last.linear":{"format":"float8_e4m3fn"},'
+                    '"blocks.0.attn.wq":{"format":"float8_e4m3fn"}}}'
+                )
+            },
+        )
+
+        with pytest.raises(ValueError, match="scale"):
             get_krea2_checkpoint_precision(checkpoint)
 
     def test_load_krea2_transformer_uses_policy_dtype_and_keeps_norms_fp32(self, tmp_path):
@@ -1204,27 +1235,44 @@ class TestCivitaiCheckpointPipelineLoad:
         assert torch.equal(result.img_in.bias, source_bias.to(torch.bfloat16))
         assert torch.equal(result.final_layer.norm.weight, source_norm)
 
-    def test_load_krea2_transformer_rejects_quantized_checkpoint(self, tmp_path):
-        """Comfy quantization is rejected instead of being silently dequantized."""
+    def test_load_krea2_transformer_runs_scaled_fp8_without_dequantizing(self, tmp_path):
+        """Comfy FP8 weights retain quantized storage and apply their scale."""
         from safetensors.torch import save_file
 
-        fp8_dtype = getattr(torch, "float8_e4m3fn", None)
-        if fp8_dtype is None:
-            pytest.skip("torch build does not expose float8_e4m3fn")
-
         checkpoint = tmp_path / "krea2-fp8.safetensors"
+        source_weight = torch.tensor(
+            [[1.0, 2.0], [3.0, 4.0]],
+            dtype=torch.float8_e4m3fn,
+        )
         save_file(
             {
-                "first.weight": torch.zeros((4, 2), dtype=fp8_dtype),
-                "first.bias": torch.zeros(4),
+                "first.weight": source_weight,
+                "first.weight_scale": torch.tensor(0.5),
+                "last.linear.weight": source_weight.clone(),
+                "last.linear.weight_scale": torch.tensor(0.5),
+                "blocks.0.attn.wq.weight": source_weight.clone(),
+                "blocks.0.attn.wq.weight_scale": torch.tensor(0.5),
             },
             checkpoint,
-            metadata={"_quantization_metadata": "{}"},
+            metadata={
+                "_quantization_metadata": (
+                    '{"layers":{"first":{"format":"float8_e4m3fn"},'
+                    '"last.linear":{"format":"float8_e4m3fn",'
+                    '"full_precision_matrix_mult":true},'
+                    '"blocks.0.attn.wq":{"format":"float8_e4m3fn"}}}'
+                )
+            },
         )
         with torch.device("meta"):
             transformer = torch.nn.Module()
-            transformer.img_in = torch.nn.Linear(2, 4)
-        transformer._keep_in_fp32_modules = ["norm", "norm1", "norm2", "norm_q", "norm_k"]
+            transformer.img_in = torch.nn.Linear(2, 2, bias=False)
+            transformer.final_layer = torch.nn.Module()
+            transformer.final_layer.linear = torch.nn.Linear(2, 2, bias=False)
+            block = torch.nn.Module()
+            block.attn = torch.nn.Module()
+            block.attn.to_q = torch.nn.Linear(2, 2, bias=False)
+            transformer.transformer_blocks = torch.nn.ModuleList([block])
+        transformer._keep_in_fp32_modules = []
 
         pipeline = CivitaiCheckpointPipeline()
         pipeline.policy = DevicePolicy(
@@ -1233,17 +1281,31 @@ class TestCivitaiCheckpointPipelineLoad:
             offload=OffloadMode.NEVER,
         )
 
-        with (
-            patch("diffusers.Krea2Transformer2DModel") as mock_transformer_class,
-            pytest.raises(ValueError, match="Quantized Krea 2 single-file checkpoints"),
-        ):
+        with patch("diffusers.Krea2Transformer2DModel") as mock_transformer_class:
             mock_transformer_class.load_config.return_value = {"test": True}
             mock_transformer_class.from_config.return_value = transformer
-            pipeline._load_krea2_transformer_from_single_file(
+            result = pipeline._load_krea2_transformer_from_single_file(
                 checkpoint,
                 "krea/Krea-2-Turbo",
                 "transformer",
             )
+
+        assert result.img_in.weight._qdata.dtype == torch.float8_e4m3fn
+        from comfy_kitchen.tensor import TensorCoreFP8Layout
+
+        with patch.object(
+            TensorCoreFP8Layout,
+            "quantize",
+            wraps=TensorCoreFP8Layout.quantize,
+        ) as quantize:
+            input_tensor = torch.tensor([[[2.0, 1.0]]], dtype=torch.bfloat16)
+            output = result.img_in(input_tensor)
+            quantize.assert_called_once()
+            quantize.reset_mock()
+            result.final_layer.linear(input_tensor)
+            quantize.assert_not_called()
+        assert torch.equal(output, torch.tensor([[[2.0, 5.0]]], dtype=torch.bfloat16))
+        assert pipeline.policy.group_offload_use_stream is False
 
     def test_load_krea2_transformer_rejects_incomplete_checkpoint(self, tmp_path):
         """A truncated Krea checkpoint cannot leave meta parameters in the pipeline."""

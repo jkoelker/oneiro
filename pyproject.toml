@@ -34,6 +34,7 @@ dependencies = [
     "Pillow>=10.0.0",
     "watchfiles>=0.21.0",
     "bitsandbytes>=0.42.0",
+    "comfy-kitchen>=0.2.26,<0.3.0",
     "peft>=0.7.0",
     "gguf>=0.6.0",
     "kernels>=0.3.0",
