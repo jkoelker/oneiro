@@ -711,6 +711,10 @@ async def test_fetch_krea2_validates_header_before_writing_config(
     elif checkpoint_kind in {"quantized", "lora", "transport"}:
         ctx.bot.civitai_client.download_model_version.assert_not_awaited()
         ctx.bot.civitai_client.get_safetensor_header.assert_awaited_once()
+        if checkpoint_kind == "quantized":
+            failure = ctx.followup.send.await_args_list[-1].args[0]
+            assert "krea.safetensors (bf16, file 3)" in failure
+            assert "I8" in failure
     else:
         ctx.bot.civitai_client.download_model_version.assert_awaited_once()
         ctx.bot.civitai_client.get_safetensor_header.assert_awaited_once()
