@@ -16,6 +16,7 @@ from oneiro.pipelines.civitai_checkpoint import (
     PipelineConfig,
     get_diffusers_pipeline_class,
     get_krea2_checkpoint_precision,
+    get_krea2_checkpoint_precision_from_header,
     get_pipeline_config_for_base_model,
 )
 from oneiro.pipelines.lora import LoraConfig, LoraSource
@@ -1090,6 +1091,21 @@ class TestCivitaiCheckpointPipelineLoad:
         )
 
         assert get_krea2_checkpoint_precision(checkpoint) == "fp8"
+
+    def test_get_krea2_checkpoint_precision_reports_unsupported_tensor_names(self):
+        """Unsupported quantized tensors identify their key, dtype, and shape."""
+        header = {
+            "first.weight": {"dtype": "F8_E4M3", "shape": [2, 2]},
+            "last.linear.weight": {"dtype": "F8_E4M3", "shape": [2, 2]},
+            "blocks.0.attn.wq.weight": {"dtype": "F8_E4M3", "shape": [2, 2]},
+            "blocks.0.attn.wq.weight_scale": {"dtype": "U8", "shape": [2, 1]},
+        }
+
+        with pytest.raises(
+            ValueError,
+            match=r"blocks\.0\.attn\.wq\.weight_scale \(U8 \[2, 1\]\)",
+        ):
+            get_krea2_checkpoint_precision_from_header(header)
 
     def test_get_krea2_checkpoint_precision_reads_tensor_header(self, tmp_path):
         """Displayed checkpoint precision comes from the SafeTensor header."""

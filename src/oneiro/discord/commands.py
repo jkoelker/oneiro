@@ -1082,7 +1082,9 @@ def register_commands(bot: "OneiroBot") -> None:
         except ValueError as e:
             await ctx.followup.send(f"❌ Invalid URL: {e}", ephemeral=True)
         except CivitaiError as e:
-            await ctx.followup.send(f"❌ Civitai error: {e}", ephemeral=True)
+            await ctx.followup.send(
+                **format_exception_response("❌ Civitai error", e), ephemeral=True
+            )
         except Exception as e:
             await ctx.followup.send(
                 **format_exception_response("❌ Failed to fetch", e), ephemeral=True
