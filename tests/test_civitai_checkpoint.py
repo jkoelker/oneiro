@@ -1107,6 +1107,68 @@ class TestCivitaiCheckpointPipelineLoad:
         ):
             get_krea2_checkpoint_precision_from_header(header)
 
+    def test_get_krea2_checkpoint_precision_accepts_comfy_quant_fp8_descriptors(self):
+        """Per-layer Comfy descriptors are valid auxiliaries for FP8 weights."""
+        header = {
+            "first.weight": {"dtype": "F8_E4M3", "shape": [2, 2]},
+            "first.comfy_quant": {"dtype": "U8", "shape": [27]},
+            "last.linear.weight": {"dtype": "F8_E4M3", "shape": [2, 2]},
+            "last.linear.comfy_quant": {"dtype": "U8", "shape": [27]},
+            "blocks.0.attn.wq.weight": {"dtype": "F8_E4M3", "shape": [2, 2]},
+            "blocks.0.attn.wq.comfy_quant": {"dtype": "U8", "shape": [27]},
+        }
+
+        assert get_krea2_checkpoint_precision_from_header(header) == "fp8"
+
+    def test_get_krea2_checkpoint_precision_rejects_non_u8_comfy_descriptor(self):
+        """Comfy quantization descriptors must use their serialized U8 representation."""
+        header = {
+            "first.weight": {"dtype": "F8_E4M3", "shape": [2, 2]},
+            "first.comfy_quant": {"dtype": "F32", "shape": [27]},
+            "last.linear.weight": {"dtype": "F8_E4M3", "shape": [2, 2]},
+            "last.linear.comfy_quant": {"dtype": "F32", "shape": [27]},
+            "blocks.0.attn.wq.weight": {"dtype": "F8_E4M3", "shape": [2, 2]},
+            "blocks.0.attn.wq.comfy_quant": {"dtype": "F32", "shape": [27]},
+        }
+
+        with pytest.raises(ValueError, match="descriptors must be U8"):
+            get_krea2_checkpoint_precision_from_header(header)
+
+    @pytest.mark.parametrize(
+        ("payload", "error"),
+        [
+            (b"not json", "Invalid Krea 2 quantization descriptor"),
+            (b'{"format": "mxfp8"}', "Unsupported Krea 2 quantization format: mxfp8"),
+            (
+                b'{"format": "float8_e4m3fn", "full_precision_matrix_mult": "false"}',
+                "full_precision_matrix_mult must be a boolean",
+            ),
+        ],
+    )
+    def test_get_krea2_checkpoint_precision_validates_comfy_descriptor_payload(
+        self, tmp_path, payload, error
+    ):
+        """Downloaded FP8 candidates validate descriptor JSON before selection."""
+        from safetensors.torch import save_file
+
+        checkpoint = tmp_path / "krea2-comfy-quant.safetensors"
+        weight = torch.ones((2, 2), dtype=torch.float8_e4m3fn)
+        descriptor = torch.tensor(list(payload), dtype=torch.uint8)
+        save_file(
+            {
+                "first.weight": weight,
+                "first.comfy_quant": descriptor,
+                "last.linear.weight": weight.clone(),
+                "last.linear.comfy_quant": descriptor.clone(),
+                "blocks.0.attn.wq.weight": weight.clone(),
+                "blocks.0.attn.wq.comfy_quant": descriptor.clone(),
+            },
+            checkpoint,
+        )
+
+        with pytest.raises(ValueError, match=error):
+            get_krea2_checkpoint_precision(checkpoint)
+
     def test_get_krea2_checkpoint_precision_reads_tensor_header(self, tmp_path):
         """Displayed checkpoint precision comes from the SafeTensor header."""
         from safetensors.torch import save_file
@@ -1322,6 +1384,57 @@ class TestCivitaiCheckpointPipelineLoad:
             quantize.assert_not_called()
         assert torch.equal(output, torch.tensor([[[2.0, 5.0]]], dtype=torch.bfloat16))
         assert pipeline.policy.group_offload_use_stream is False
+
+    def test_load_krea2_transformer_runs_comfy_quant_fp8(self, tmp_path):
+        """Converted FP8 descriptors preserve native FP8 execution."""
+        from safetensors.torch import save_file
+
+        checkpoint = tmp_path / "krea2-comfy-quant-fp8.safetensors"
+        source_weight = torch.tensor(
+            [[1.0, 2.0], [3.0, 4.0]],
+            dtype=torch.float8_e4m3fn,
+        )
+        descriptor = torch.tensor(
+            list(b'{"format": "float8_e4m3fn"}'),
+            dtype=torch.uint8,
+        )
+        save_file(
+            {
+                "first.weight": source_weight,
+                "first.comfy_quant": descriptor,
+            },
+            checkpoint,
+        )
+        with torch.device("meta"):
+            transformer = torch.nn.Module()
+            transformer.img_in = torch.nn.Linear(2, 2, bias=False)
+        transformer._keep_in_fp32_modules = []
+
+        pipeline = CivitaiCheckpointPipeline()
+        pipeline.policy = DevicePolicy(
+            device="cpu",
+            dtype=torch.bfloat16,
+            offload=OffloadMode.NEVER,
+        )
+
+        with (
+            patch("diffusers.Krea2Transformer2DModel") as mock_transformer_class,
+            patch(
+                "oneiro.pipelines.civitai_checkpoint._get_krea2_checkpoint_precision",
+                return_value="fp8",
+            ),
+        ):
+            mock_transformer_class.load_config.return_value = {"test": True}
+            mock_transformer_class.from_config.return_value = transformer
+            result = pipeline._load_krea2_transformer_from_single_file(
+                checkpoint,
+                "krea/Krea-2-Turbo",
+                "transformer",
+            )
+
+        assert result.img_in.weight._qdata.dtype == torch.float8_e4m3fn
+        output = result.img_in(torch.tensor([[[2.0, 1.0]]], dtype=torch.bfloat16))
+        assert torch.equal(output, torch.tensor([[[4.0, 10.0]]], dtype=torch.bfloat16))
 
     def test_load_krea2_transformer_rejects_incomplete_checkpoint(self, tmp_path):
         """A truncated Krea checkpoint cannot leave meta parameters in the pipeline."""

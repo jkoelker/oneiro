@@ -619,7 +619,12 @@ def register_commands(bot: "OneiroBot") -> None:
             loading_msg = await ctx.followup.send(f"⏳ Loading model `{model}`...")
             try:
                 await ctx.bot.pipeline_manager.load_model(model)
-            except (CivitaiError, ValueError) as e:
+            except CivitaiError as e:
+                await ctx.followup.send(
+                    **format_exception_response("❌ Failed to load model", e), ephemeral=True
+                )
+                return
+            except ValueError as e:
                 await ctx.followup.send(f"❌ Failed to load model: {e}", ephemeral=True)
                 return
 
