@@ -1313,8 +1313,8 @@ class TestCivitaiCheckpointPipelineLoad:
         assert torch.equal(result.img_in.bias, source_bias.to(torch.bfloat16))
         assert torch.equal(result.final_layer.norm.weight, source_norm)
 
-    def test_load_krea2_transformer_runs_scaled_fp8_without_dequantizing(self, tmp_path):
-        """Comfy FP8 weights retain quantized storage and apply their scale."""
+    def test_load_krea2_transformer_runs_scaled_fp8_with_offloadable_storage(self, tmp_path):
+        """FP8 storage and scales remain visible to module device transfers."""
         from safetensors.torch import save_file
 
         checkpoint = tmp_path / "krea2-fp8.safetensors"
@@ -1368,7 +1368,12 @@ class TestCivitaiCheckpointPipelineLoad:
                 "transformer",
             )
 
-        assert result.img_in.weight._qdata.dtype == torch.float8_e4m3fn
+        assert result.img_in.weight.dtype == torch.float8_e4m3fn
+        assert (
+            result.img_in._oneiro_weight_scale
+            is dict(result.img_in.named_buffers())["_oneiro_weight_scale"]
+        )
+        assert result.img_in._oneiro_weight_scale.item() == 0.5
         from comfy_kitchen.tensor import TensorCoreFP8Layout
 
         with patch.object(
@@ -1432,7 +1437,7 @@ class TestCivitaiCheckpointPipelineLoad:
                 "transformer",
             )
 
-        assert result.img_in.weight._qdata.dtype == torch.float8_e4m3fn
+        assert result.img_in.weight.dtype == torch.float8_e4m3fn
         output = result.img_in(torch.tensor([[[2.0, 1.0]]], dtype=torch.bfloat16))
         assert torch.equal(output, torch.tensor([[[4.0, 10.0]]], dtype=torch.bfloat16))
 

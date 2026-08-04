@@ -496,17 +496,28 @@ class _Krea2FP8Linear(torch.nn.Linear):
     """Run Comfy FP8 weights with dynamically quantized activations."""
 
     _oneiro_full_precision_mm = False
+    _oneiro_weight_dtype: torch.dtype
+    _oneiro_weight_scale: torch.Tensor
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         """Apply the FP8 weight using its checkpoint scale."""
         from comfy_kitchen.tensor import QuantizedTensor, TensorCoreFP8Layout
 
+        weight = QuantizedTensor(
+            self.weight,
+            "TensorCoreFP8Layout",
+            TensorCoreFP8Layout.Params(
+                scale=self._oneiro_weight_scale,
+                orig_dtype=self._oneiro_weight_dtype,
+                orig_shape=tuple(self.weight.shape),
+            ),
+        )
         if self._oneiro_full_precision_mm:
-            return torch.nn.functional.linear(input, self.weight.dequantize(), self.bias)
+            return torch.nn.functional.linear(input, weight.dequantize(), self.bias)
 
         quantized, params = TensorCoreFP8Layout.quantize(input)
         quantized_input = QuantizedTensor(quantized, "TensorCoreFP8Layout", params)
-        return torch.nn.functional.linear(quantized_input, self.weight, self.bias)
+        return torch.nn.functional.linear(quantized_input, weight, self.bias)
 
 
 def _get_krea2_fp8_layers(metadata: dict[str, Any]) -> dict[str, bool]:
@@ -1135,7 +1146,6 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
         """Stream a Comfy Krea checkpoint into a Diffusers transformer."""
         from accelerate import init_empty_weights
         from accelerate.utils import set_module_tensor_to_device
-        from comfy_kitchen.tensor import QuantizedTensor, TensorCoreFP8Layout
         from diffusers import Krea2Transformer2DModel
         from safetensors import safe_open
 
@@ -1194,21 +1204,14 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
                     )
                     if scale.numel() != 1 or not torch.isfinite(scale).item() or scale.item() <= 0:
                         raise ValueError(f"Invalid Krea 2 FP8 weight scale: {scale_key}")
-                    tensor = QuantizedTensor(
-                        tensor,
-                        "TensorCoreFP8Layout",
-                        TensorCoreFP8Layout.Params(
-                            scale=scale.float(),
-                            orig_dtype=self.policy.dtype,
-                            orig_shape=expected_shape,
-                        ),
-                    )
                     module = transformer.get_submodule(key.removesuffix(".weight"))
                     if not isinstance(module, torch.nn.Linear):
                         raise ValueError(
                             f"FP8 Krea 2 tensor does not target a linear layer: {source_key}"
                         )
                     module.__class__ = _Krea2FP8Linear
+                    module.register_buffer("_oneiro_weight_scale", scale.float(), persistent=False)
+                    module._oneiro_weight_dtype = self.policy.dtype
                     layer_name = source_key.removeprefix(COMFY_DIFFUSION_MODEL_PREFIX).removesuffix(
                         ".weight"
                     )
@@ -1221,9 +1224,13 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
                     "cpu",
                     value=tensor,
                     dtype=(
-                        torch.float32
-                        if keep_in_fp32_modules.intersection(key.split("."))
-                        else self.policy.dtype
+                        tensor.dtype
+                        if tensor.dtype == torch.float8_e4m3fn
+                        else (
+                            torch.float32
+                            if keep_in_fp32_modules.intersection(key.split("."))
+                            else self.policy.dtype
+                        )
                     ),
                 )
                 loaded_keys.add(key)
