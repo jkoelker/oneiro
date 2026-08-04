@@ -275,6 +275,44 @@ async def test_fetch_error_includes_traceback():
     assert call.kwargs.keys() == {"content", "ephemeral"}
 
 
+async def test_fetch_long_civitai_error_attaches_full_details():
+    """Expected Civitai failures preserve diagnostics beyond Discord's limit."""
+    commands = _register_test_commands()
+    error = CivitaiError("x" * 2500)
+    ctx = MagicMock()
+    ctx.defer = AsyncMock()
+    ctx.followup.send = AsyncMock(return_value=MagicMock())
+    ctx.bot.config.state_path = "state.toml"
+    ctx.bot.civitai_client.get_model = AsyncMock(side_effect=error)
+
+    await commands["fetch"](ctx, "https://civitai.com/models/1")
+
+    call = ctx.followup.send.await_args_list[-1]
+    assert call.kwargs["content"].startswith("❌ Civitai error")
+    assert len(call.kwargs["content"]) <= 2000
+    assert call.kwargs["file"].filename == "traceback.txt"
+    assert str(error) in call.kwargs["file"].fp.getvalue().decode()
+
+
+async def test_fetch_civitai_error_includes_traceback():
+    """Expected Civitai failures include their traceback for diagnosis."""
+    commands = _register_test_commands()
+    error = CivitaiError("checkpoint rejected")
+    ctx = MagicMock()
+    ctx.defer = AsyncMock()
+    ctx.followup.send = AsyncMock(return_value=MagicMock())
+    ctx.bot.config.state_path = "state.toml"
+    ctx.bot.civitai_client.get_model = AsyncMock(side_effect=error)
+
+    await commands["fetch"](ctx, "https://civitai.com/models/1")
+
+    call = ctx.followup.send.await_args_list[-1]
+    assert call.kwargs["content"].startswith("❌ Civitai error")
+    assert "Traceback (most recent call last)" in call.kwargs["content"]
+    assert "CivitaiError: checkpoint rejected" in call.kwargs["content"]
+    assert call.kwargs.keys() == {"content", "ephemeral"}
+
+
 async def test_image_read_error_includes_traceback():
     """Unexpected image read failures include their traceback in the response."""
     commands = _register_test_commands()
@@ -712,7 +750,7 @@ async def test_fetch_krea2_validates_header_before_writing_config(
         ctx.bot.civitai_client.download_model_version.assert_not_awaited()
         ctx.bot.civitai_client.get_safetensor_header.assert_awaited_once()
         if checkpoint_kind == "quantized":
-            failure = ctx.followup.send.await_args_list[-1].args[0]
+            failure = ctx.followup.send.await_args_list[-1].kwargs["content"]
             assert "krea.safetensors (bf16, file 3)" in failure
             assert "I8" in failure
     else:

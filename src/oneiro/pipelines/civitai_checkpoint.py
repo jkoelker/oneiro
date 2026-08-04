@@ -548,11 +548,13 @@ def get_krea2_checkpoint_precision_from_header(header: dict[str, Any]) -> str:
     has_fp8 = "F8_E4M3" in dtypes
     if not source_keys:
         raise ValueError("Krea 2 checkpoint has no tensors")
-    unsupported_dtypes = dtypes - KREA2_DTYPE_PRECISIONS.keys()
-    if unsupported_dtypes:
-        raise ValueError(
-            f"Unsupported Krea 2 checkpoint dtypes: {', '.join(sorted(unsupported_dtypes))}"
-        )
+    unsupported_tensors = [
+        f"{key} ({value.get('dtype')} {value.get('shape')})"
+        for key, value in sorted(tensors.items())
+        if value.get("dtype") not in KREA2_DTYPE_PRECISIONS
+    ]
+    if unsupported_tensors:
+        raise ValueError(f"Unsupported Krea 2 checkpoint tensors: {', '.join(unsupported_tensors)}")
     if fp8_layers and not has_fp8:
         raise ValueError("Krea 2 FP8 metadata has no FP8 weights")
     if any(key.endswith(".weight_scale") for key in source_keys) and not has_fp8:
