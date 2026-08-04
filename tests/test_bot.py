@@ -213,10 +213,7 @@ async def test_model_error_includes_traceback_and_attaches_full_trace_when_trunc
     assert str(error) in call.kwargs["file"].fp.getvalue().decode()
 
 
-@pytest.mark.parametrize(
-    "error",
-    [CivitaiError("checkpoint download failed"), ValueError("invalid model configuration")],
-)
+@pytest.mark.parametrize("error", [ValueError("invalid model configuration")])
 async def test_model_expected_error_is_concise_and_ephemeral(error):
     """Expected model failures omit traceback details and attachments."""
     commands = _register_test_commands()
@@ -232,6 +229,26 @@ async def test_model_expected_error_is_concise_and_ephemeral(error):
     call = ctx.followup.send.await_args_list[-1]
     assert call.args == (f"❌ Failed to load model: {error}",)
     assert call.kwargs == {"ephemeral": True}
+
+
+async def test_model_civitai_error_includes_traceback():
+    """Civitai model-load failures include their traceback for diagnosis."""
+    commands = _register_test_commands()
+    error = CivitaiError("checkpoint download failed")
+    ctx = MagicMock()
+    ctx.defer = AsyncMock()
+    ctx.followup.send = AsyncMock(return_value=MagicMock())
+    ctx.bot.config.get.return_value = {"type": "test"}
+    ctx.bot.pipeline_manager.current_model = "working"
+    ctx.bot.pipeline_manager.load_model = AsyncMock(side_effect=error)
+
+    await commands["model"](ctx, "broken")
+
+    call = ctx.followup.send.await_args_list[-1]
+    assert call.kwargs["content"].startswith("❌ Failed to load model")
+    assert "Traceback (most recent call last)" in call.kwargs["content"]
+    assert "CivitaiError: checkpoint download failed" in call.kwargs["content"]
+    assert call.kwargs.keys() == {"content", "ephemeral"}
 
 
 async def test_model_post_load_value_error_includes_traceback():

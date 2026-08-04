@@ -528,9 +528,35 @@ def _get_krea2_fp8_layers(metadata: dict[str, Any]) -> dict[str, bool]:
             raise ValueError("Invalid Krea 2 quantization metadata")
         if config.get("format") != "float8_e4m3fn":
             raise ValueError(f"Unsupported Krea 2 quantization format: {config.get('format')}")
-        result[name.removeprefix(COMFY_DIFFUSION_MODEL_PREFIX)] = bool(
-            config.get("full_precision_matrix_mult", False)
-        )
+        full_precision = config.get("full_precision_matrix_mult", False)
+        if not isinstance(full_precision, bool):
+            raise ValueError("Krea 2 full_precision_matrix_mult must be a boolean")
+        result[name.removeprefix(COMFY_DIFFUSION_MODEL_PREFIX)] = full_precision
+    return result
+
+
+def _get_krea2_comfy_quant_layers(checkpoint: Any) -> dict[str, bool]:
+    """Read per-layer Comfy quantization descriptors from a checkpoint."""
+    result: dict[str, bool] = {}
+    for key in checkpoint.keys():
+        if not key.endswith(".comfy_quant"):
+            continue
+        descriptor = checkpoint.get_tensor(key)
+        if descriptor.dtype != torch.uint8 or descriptor.ndim != 1 or descriptor.numel() > 4096:
+            raise ValueError(f"Invalid Krea 2 quantization descriptor: {key}")
+        try:
+            config = json.loads(bytes(descriptor.tolist()).decode())
+        except (UnicodeDecodeError, ValueError) as error:
+            raise ValueError(f"Invalid Krea 2 quantization descriptor: {key}") from error
+        if not isinstance(config, dict):
+            raise ValueError(f"Invalid Krea 2 quantization descriptor: {key}")
+        if config.get("format") != "float8_e4m3fn":
+            raise ValueError(f"Unsupported Krea 2 quantization format: {config.get('format')}")
+        layer = key.removeprefix(COMFY_DIFFUSION_MODEL_PREFIX).removesuffix(".comfy_quant")
+        full_precision = config.get("full_precision_matrix_mult", False)
+        if not isinstance(full_precision, bool):
+            raise ValueError("Krea 2 full_precision_matrix_mult must be a boolean")
+        result[layer] = full_precision
     return result
 
 
@@ -552,6 +578,7 @@ def get_krea2_checkpoint_precision_from_header(header: dict[str, Any]) -> str:
         f"{key} ({value.get('dtype')} {value.get('shape')})"
         for key, value in sorted(tensors.items())
         if value.get("dtype") not in KREA2_DTYPE_PRECISIONS
+        and not (value.get("dtype") == "U8" and key.endswith(".comfy_quant"))
     ]
     if unsupported_tensors:
         raise ValueError(f"Unsupported Krea 2 checkpoint tensors: {', '.join(unsupported_tensors)}")
@@ -566,10 +593,26 @@ def get_krea2_checkpoint_precision_from_header(header: dict[str, Any]) -> str:
     fp8_keys = {key for key, value in normalized_tensors.items() if value.get("dtype") == "F8_E4M3"}
     fp8_weights = {key for key in fp8_keys if key.endswith(".weight")}
     scale_keys = {key for key in normalized_keys if key.endswith(".weight_scale")}
+    comfy_quant_keys = {key for key in normalized_keys if key.endswith(".comfy_quant")}
     if fp8_keys != fp8_weights:
         raise ValueError("Unexpected non-weight FP8 Krea 2 tensor")
     if fp8_layers and fp8_weights != {f"{name}.weight" for name in fp8_layers}:
         raise ValueError("Krea 2 FP8 metadata does not match checkpoint weights")
+    if (
+        comfy_quant_keys
+        and {f"{key.removesuffix('.comfy_quant')}.weight" for key in comfy_quant_keys}
+        != fp8_weights
+    ):
+        raise ValueError("Krea 2 Comfy quantization descriptors do not match FP8 weights")
+    if any(normalized_tensors[key].get("dtype") != "U8" for key in comfy_quant_keys):
+        raise ValueError("Krea 2 Comfy quantization descriptors must be U8 tensors")
+    if any(
+        normalized_tensors[key].get("shape") in (None, [])
+        or len(normalized_tensors[key]["shape"]) != 1
+        or normalized_tensors[key]["shape"][0] > 4096
+        for key in comfy_quant_keys
+    ):
+        raise ValueError("Invalid Krea 2 Comfy quantization descriptor shape")
     if scale_keys and {key.removesuffix("_scale") for key in scale_keys} != fp8_weights:
         raise ValueError("Krea 2 FP8 checkpoint has missing or orphaned scales")
     if fp8_layers and not scale_keys:
@@ -613,7 +656,15 @@ def get_krea2_checkpoint_precision(checkpoint_path: Path) -> str:
     from safetensors import safe_open
 
     with safe_open(checkpoint_path, framework="pt", device="cpu") as checkpoint:
-        return _get_krea2_checkpoint_precision(checkpoint)
+        precision = _get_krea2_checkpoint_precision(checkpoint)
+        metadata_layers = _get_krea2_fp8_layers(checkpoint.metadata() or {})
+        descriptor_layers = _get_krea2_comfy_quant_layers(checkpoint)
+        if any(
+            layer in metadata_layers and metadata_layers[layer] != full_precision
+            for layer, full_precision in descriptor_layers.items()
+        ):
+            raise ValueError("Conflicting Krea 2 quantization metadata")
+        return precision
 
 
 def get_krea2_generation_defaults(component_repo: str) -> tuple[int, float]:
@@ -1112,9 +1163,14 @@ class CivitaiCheckpointPipeline(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipel
             source_keys = list(checkpoint.keys())
             _get_krea2_checkpoint_precision(checkpoint)
             fp8_layers = _get_krea2_fp8_layers(checkpoint.metadata() or {})
+            comfy_quant_layers = _get_krea2_comfy_quant_layers(checkpoint)
+            for layer, full_precision in comfy_quant_layers.items():
+                if layer in fp8_layers and fp8_layers[layer] != full_precision:
+                    raise ValueError(f"Conflicting Krea 2 quantization metadata: {layer}")
+                fp8_layers[layer] = full_precision
 
             for source_key in source_keys:
-                if source_key.endswith(".weight_scale"):
+                if source_key.endswith((".weight_scale", ".comfy_quant")):
                     continue
                 tensor = checkpoint.get_tensor(source_key)
                 key, tensor = self._convert_krea2_checkpoint_tensor(source_key, tensor)
