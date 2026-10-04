@@ -53,6 +53,11 @@ class BasePipeline(ABC):
             full_config: Full configuration dict (for accessing global sections like embeddings)
         """
 
+    def validate_config(  # noqa: B027
+        self, model_config: dict[str, Any], full_config: dict[str, Any] | None = None
+    ) -> None:
+        """Preflight deterministic loader controls without loading model assets."""
+
     def generate(
         self,
         prompt: str,

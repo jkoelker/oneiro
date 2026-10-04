@@ -17,7 +17,6 @@ from diffusers.modular_pipelines.modular_pipeline_utils import (
 )
 from PIL import Image
 
-from oneiro.device import DevicePolicy
 from oneiro.pipelines.base import GenerationResult
 from oneiro.pipelines.embedding import parse_embeddings_from_config
 from oneiro.pipelines.krea2_checkpoint import (
@@ -336,7 +335,7 @@ class CivitaiCheckpointPipeline(ModularPipelineWrapper):
                 if configured.family != actual.family:
                     raise ValueError("Configured base model conflicts with CivitAI metadata")
             resolved["base_model"] = self._resolved_version.base_model
-        self._configure_recipe(resolved)
+        self.validate_config(resolved)
         resolved.update(
             base_model=self._base_model,
             family=self.family,
@@ -344,6 +343,13 @@ class CivitaiCheckpointPipeline(ModularPipelineWrapper):
             variant=self.variant,
         )
         return resolved
+
+    def validate_config(
+        self, model_config: dict[str, Any], full_config: dict[str, Any] | None = None
+    ) -> None:
+        """Resolve native recipe and placement before checkpoint downloads or conversion."""
+        self._configure_recipe(model_config)
+        super().validate_config(model_config, full_config)
 
     def _configure_recipe(self, model_config: dict[str, Any]) -> None:
         """Select original native blocks from known metadata and explicit source variants."""
@@ -452,6 +458,15 @@ class CivitaiCheckpointPipeline(ModularPipelineWrapper):
                 default_steps=4 if variant == "schnell" else 28,
                 default_guidance_scale=0.0 if variant == "schnell" else 3.5,
             )
+        self._component_repo, self.variant, self.blocks = component_repo, variant, blocks
+        self._recipe_guidance_scale = config.default_guidance_scale
+        # No repo/assets: native initialization retains Turbo/disabled-guider policy.
+        native = blocks.init_pipeline()
+        self.validate_guidance(
+            model_config.get("guidance_scale", config.default_guidance_scale),
+            self.workflow_inputs("text2image"),
+            native.components.get("guider"),
+        )
         self._pipeline_config = replace(
             config,
             default_steps=model_config.get("steps", config.default_steps),
@@ -463,7 +478,6 @@ class CivitaiCheckpointPipeline(ModularPipelineWrapper):
         )
         self.default_steps = self._pipeline_config.default_steps
         self.default_guidance_scale = self._pipeline_config.default_guidance_scale
-        self._component_repo, self.variant, self.blocks = component_repo, variant, blocks
         self._validate_scheduler(model_config.get("scheduler"))
 
     def load(self, model_config: dict[str, Any], full_config: dict[str, Any] | None = None) -> None:
@@ -494,18 +508,9 @@ class CivitaiCheckpointPipeline(ModularPipelineWrapper):
         full_config: dict[str, Any] | None = None,
     ) -> None:
         """Discard conversion containers before shared placement and resource loading."""
-        self._configure_recipe(model_config)
+        self.validate_config(model_config, full_config)
         if not checkpoint_path.exists():
             raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
-        self.policy = DevicePolicy.auto_detect(
-            cpu_offload=model_config.get("cpu_offload", True),
-            offload_type=model_config.get("offload_type", "group"),
-            group_offload_type=model_config.get("group_offload_type", "leaf_level"),
-            group_offload_use_stream=model_config.get("group_offload_use_stream", True),
-            group_offload_num_blocks_per_group=model_config.get(
-                "group_offload_num_blocks_per_group"
-            ),
-        )
         try:
             components = self._load_checkpoint_components(checkpoint_path, model_config)
             if self.family in {"sdxl", "sd3", "flux1"}:

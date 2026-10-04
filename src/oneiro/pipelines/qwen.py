@@ -6,7 +6,6 @@ from typing import Any
 
 from diffusers import FlowMatchEulerDiscreteScheduler, QwenImageAutoBlocks
 
-from oneiro.device import DevicePolicy
 from oneiro.pipelines.modular import ModularPipelineWrapper
 
 
@@ -82,6 +81,24 @@ class QwenPipelineWrapper(ModularPipelineWrapper):
             subfolder="transformer",
         )
 
+    def validate_config(
+        self, model_config: dict[str, Any], full_config: dict[str, Any] | None = None
+    ) -> None:
+        """Resolve Qwen Image and placement without loading checkpoint or hosted assets."""
+        repo = model_config.get("repo", "Qwen/Qwen-Image")
+        known = {"Qwen/Qwen-Image", "Qwen/Qwen-Image-2512"}
+        variant = model_config.get("variant", "image" if repo in known else None)
+        if variant != "image":
+            raise ValueError("Qwen requires variant='image' for custom model sources")
+        if (
+            model_config.get("embeddings")
+            or model_config.get("inline_embeddings")
+            or (full_config or {}).get("embeddings", {}).get("auto_load")
+        ):
+            raise ValueError("Qwen does not support textual inversion embeddings")
+        self._component_repo, self.blocks = repo, QwenImageAutoBlocks()
+        super().validate_config(model_config, full_config)
+
     def load(self, model_config: dict[str, Any], full_config: dict[str, Any] | None = None) -> None:
         """Load native Qwen blocks and preserve the single-file transformer API.
 
@@ -95,31 +112,9 @@ class QwenPipelineWrapper(ModularPipelineWrapper):
             cpu_offload: Enable CPU offload (default: True)
             offload_type: Offload implementation: group, model, or sequential
         """
-        repo = model_config.get("repo", "Qwen/Qwen-Image")
-        known = {"Qwen/Qwen-Image", "Qwen/Qwen-Image-2512"}
-        variant = model_config.get("variant", "image" if repo in known else None)
-        if variant != "image":
-            raise ValueError("Qwen requires variant='image' for custom model sources")
-        if (
-            model_config.get("embeddings")
-            or model_config.get("inline_embeddings")
-            or (full_config or {}).get("embeddings", {}).get("auto_load")
-        ):
-            raise ValueError("Qwen does not support textual inversion embeddings")
+        self.validate_config(model_config, full_config)
+        repo = self._component_repo
         transformer_path = model_config.get("transformer")
-        cpu_offload = model_config.get("cpu_offload", True)
-        offload_type = model_config.get("offload_type", "group")
-        group_offload_type = model_config.get("group_offload_type", "leaf_level")
-        group_offload_use_stream = model_config.get("group_offload_use_stream", True)
-        group_offload_num_blocks_per_group = model_config.get("group_offload_num_blocks_per_group")
-
-        self.policy = DevicePolicy.auto_detect(
-            cpu_offload=cpu_offload,
-            offload_type=offload_type,
-            group_offload_type=group_offload_type,
-            group_offload_use_stream=group_offload_use_stream,
-            group_offload_num_blocks_per_group=group_offload_num_blocks_per_group,
-        )
 
         print(f"Loading Qwen-Image from {repo}")
 
@@ -150,4 +145,4 @@ class QwenPipelineWrapper(ModularPipelineWrapper):
         components: dict[str, Any] = {"scheduler": scheduler}
         if transformer is not None:
             components["transformer"] = transformer
-        self.initialize_pipeline(repo, QwenImageAutoBlocks(), components)
+        self.initialize_pipeline(repo, self.blocks, components)

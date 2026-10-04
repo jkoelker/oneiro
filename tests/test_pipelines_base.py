@@ -191,6 +191,81 @@ async def test_preflight_failure_keeps_old_model() -> None:
     assert result.model_name == "old" and manager.pipeline is old
 
 
+@pytest.mark.parametrize(
+    "pipeline_type,repo,variant",
+    [
+        ("flux1", "black-forest-labs/FLUX.1-dev", "schnell"),
+        ("flux2", "black-forest-labs/FLUX.2-dev", "schnell"),
+        ("flux2-klein", "black-forest-labs/FLUX.2-klein-9B", "base"),
+        ("krea2", "krea/Krea-2-Turbo", "raw"),
+        ("qwen", "Qwen/Qwen-Image", "edit"),
+        ("zimage", "Tongyi-MAI/Z-Image-Turbo", "base"),
+    ],
+)
+@pytest.mark.parametrize(
+    "error", ["custom-variant", "official-contradiction", "placement", "group-type", "group-count"]
+)
+async def test_hosted_recipe_preflight_preserves_current_model(
+    pipeline_type: str, repo: str, variant: str, error: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """All hosted loaders must share their metadata-only checks with manager preflight."""
+    from diffusers import ModularPipeline
+    from diffusers.modular_pipelines.modular_pipeline_utils import ComponentSpec
+
+    monkeypatch.setattr(BasePipeline, "_configure_cpu_threads", lambda *args: 1)
+
+    profile = {"type": pipeline_type, "repo": repo}
+    if error == "custom-variant":
+        profile["repo"] = "custom/model"
+    elif error == "official-contradiction":
+        profile["variant"] = variant
+    elif error == "placement":
+        profile["offload_type"] = "not-an-offload-mode"
+    elif error == "group-type":
+        profile["group_offload_type"] = "invalid"
+    else:
+        profile["group_offload_num_blocks_per_group"] = 0
+    config = Mock(data={})
+    config.get.return_value = profile
+    manager = PipelineManager(config)
+    old = Mock(family="sdxl")
+    old.generate.return_value = Mock()
+    manager.pipeline, manager.current_model = old, "old"
+    with (
+        patch.object(ModularPipeline, "_load_pipeline_config") as assets,
+        patch.object(ComponentSpec, "load") as component,
+        pytest.raises(ValueError),
+    ):
+        await manager.load_model("bad")
+    assets.assert_not_called()
+    component.assert_not_called()
+    old.unload.assert_not_called()
+    assert manager.pipeline is old and manager.current_model == "old"
+    assert (await manager.generate("still usable")).model_name == "old"
+
+
+async def test_checkpoint_placement_preflight_preserves_current_model() -> None:
+    """Checkpoint recipe resolution must also reject placement before assets or unload."""
+    from oneiro.pipelines.civitai_checkpoint import CivitaiCheckpointPipeline
+
+    config = Mock(data={})
+    config.get.return_value = {
+        "type": "civitai",
+        "checkpoint_path": "unused",
+        "base_model": "Pony",
+        "offload_type": "invalid",
+    }
+    manager = PipelineManager(config)
+    old = Mock(family="sdxl")
+    manager.pipeline, manager.current_model = old, "old"
+    with patch.object(CivitaiCheckpointPipeline, "load") as assets:
+        with pytest.raises(ValueError):
+            await manager.load_model("bad")
+    assets.assert_not_called()
+    old.unload.assert_not_called()
+    assert manager.pipeline is old and manager.current_model == "old"
+
+
 @pytest.mark.parametrize("fail", [False, True])
 async def test_cancelled_load_retains_model_ownership(fail: bool) -> None:
     """Cancellation drains native loading and cleanup before allowing another owner."""
@@ -376,15 +451,26 @@ class TestBasePipelineInit:
 
 
 class TestPipelineManagerRegistry:
-    """Tests for pipeline manager registration."""
+    """Registered names load the intended family and expose its image workflow."""
 
-    def test_registers_krea2_pipeline_type(self):
-        """PipelineManager exposes the dedicated Krea 2 wrapper."""
-        assert PipelineManager.PIPELINE_TYPES["krea2"] is Krea2PipelineWrapper
-
-    def test_registers_flux2_klein_pipeline_type(self):
-        """PipelineManager exposes the dedicated FLUX.2 Klein wrapper."""
-        assert PipelineManager.PIPELINE_TYPES["flux2-klein"] is Flux2KleinPipelineWrapper
+    @pytest.mark.parametrize(
+        "family,wrapper,workflow",
+        [
+            ("krea2", Krea2PipelineWrapper, "image2image"),
+            ("flux2-klein", Flux2KleinPipelineWrapper, "image_conditioned"),
+        ],
+    )
+    async def test_loads_registered_family(
+        self, family: str, wrapper: type[BasePipeline], workflow: str
+    ) -> None:
+        config = Mock(data={})
+        config.get.return_value = {"type": family}
+        manager = PipelineManager(config)
+        with patch.object(wrapper, "load"):
+            await manager.load_model("selected")
+        assert manager.current_model == "selected"
+        assert manager.family == family
+        assert manager.validate_request(has_image=True) == workflow
 
 
 class TestPipelineManagerLoad:
@@ -427,7 +513,7 @@ class TestPipelineManagerLoad:
 
     async def test_passes_full_config_without_activating_unrequested_embeddings(self) -> None:
         """Only selected resources activate; all wrappers receive the full config contract."""
-        model_config = {"type": "flux2", "repo": "example/flux2"}
+        model_config = {"type": "flux2", "repo": "example/flux2", "variant": "dev"}
         config = Mock()
         config.get.return_value = model_config
         config.data = {"embeddings": {"example": {"source": "local", "path": "/tmp/x"}}}
@@ -442,7 +528,12 @@ class TestPipelineManagerLoad:
         """Named LoRA resolution is based on wrapper capability, not model type."""
         lora_path = tmp_path / "portrait.safetensors"
         lora_path.write_bytes(b"test")
-        model_config = {"type": "qwen", "repo": "example/qwen", "loras": ["portrait"]}
+        model_config = {
+            "type": "qwen",
+            "repo": "example/qwen",
+            "variant": "image",
+            "loras": ["portrait"],
+        }
         config = Mock()
         config.get.return_value = model_config
         config.data = {
@@ -470,6 +561,7 @@ class TestPipelineManagerLoad:
         model_config = {
             "type": "qwen",
             "repo": "example/qwen",
+            "variant": "image",
             "lora": "example/qwen-lightning",
             "lora_weights": "lightning.safetensors",
         }
@@ -499,7 +591,7 @@ class TestPipelineManagerLoad:
 
     async def test_failed_auto_load_lora_does_not_block_model(self, capsys):
         """A broken global auto-load LoRA is skipped without blocking the model."""
-        model_config = {"type": "qwen", "repo": "example/qwen"}
+        model_config = {"type": "qwen", "repo": "example/qwen", "variant": "image"}
         config = Mock()
         config.get.return_value = model_config
         config.data = {
@@ -529,7 +621,7 @@ class TestPipelineManagerLoad:
 
     async def test_malformed_auto_load_lora_does_not_block_model(self, capsys):
         """A malformed global auto-load LoRA is skipped without blocking the model."""
-        model_config = {"type": "qwen", "repo": "example/qwen"}
+        model_config = {"type": "qwen", "repo": "example/qwen", "variant": "image"}
         config = Mock()
         config.get.return_value = model_config
         config.data = {
@@ -558,7 +650,7 @@ class TestPipelineManagerLoad:
 
     async def test_auto_load_adapter_failure_does_not_block_model(self, capsys):
         """A global adapter load failure is skipped without blocking the model."""
-        model_config = {"type": "qwen", "repo": "example/qwen"}
+        model_config = {"type": "qwen", "repo": "example/qwen", "variant": "image"}
         config = Mock()
         config.get.return_value = model_config
         config.data = {
@@ -592,6 +684,7 @@ class TestPipelineManagerLoad:
         model_config = {
             "type": "qwen",
             "repo": "example/qwen",
+            "variant": "image",
             "loras": ["shared"],
         }
         config = Mock()
@@ -623,7 +716,7 @@ class TestPipelineManagerLoad:
 
     async def test_failed_auto_adapter_rolls_back_partial_external_state(self):
         """A failed auto adapter removes weights mutated before the loader raised."""
-        model_config = {"type": "qwen", "repo": "example/qwen"}
+        model_config = {"type": "qwen", "repo": "example/qwen", "variant": "image"}
         config = Mock()
         config.get.return_value = model_config
         config.data = {
@@ -663,7 +756,7 @@ class TestPipelineManagerLoad:
 
     async def test_auto_adapter_activation_failure_does_not_block_model(self, capsys):
         """A global adapter activation failure is skipped without blocking the model."""
-        model_config = {"type": "qwen", "repo": "example/qwen"}
+        model_config = {"type": "qwen", "repo": "example/qwen", "variant": "image"}
         config = Mock()
         config.get.return_value = model_config
         config.data = {
@@ -694,7 +787,7 @@ class TestPipelineManagerLoad:
 
     async def test_failed_auto_rollback_aborts_contaminated_pipeline(self):
         """An adapter that cannot be rolled back prevents the pipeline from becoming active."""
-        model_config = {"type": "qwen", "repo": "example/qwen"}
+        model_config = {"type": "qwen", "repo": "example/qwen", "variant": "image"}
         config = Mock()
         config.get.return_value = model_config
         config.data = {
@@ -748,7 +841,7 @@ class TestPipelineManagerLoad:
 
     async def test_failed_load_unloads_partial_pipeline(self):
         """A failed load releases a pipeline created before the error."""
-        model_config = {"type": "qwen", "repo": "example/qwen"}
+        model_config = {"type": "qwen", "repo": "example/qwen", "variant": "image"}
         config = Mock()
         config.get.return_value = model_config
         config.data = {"models": {"qwen": model_config}}
@@ -780,7 +873,7 @@ class TestPipelineManagerLoad:
 
     async def test_cleanup_error_does_not_mask_load_error(self, capsys):
         """Cleanup failures preserve the original model-load exception."""
-        model_config = {"type": "qwen", "repo": "example/qwen"}
+        model_config = {"type": "qwen", "repo": "example/qwen", "variant": "image"}
         config = Mock()
         config.get.return_value = model_config
         config.data = {"models": {"qwen": model_config}}

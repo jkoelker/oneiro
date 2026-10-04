@@ -41,6 +41,23 @@ class TestOffloadType:
 class TestDevicePolicyAutoDetect:
     """Tests for DevicePolicy.auto_detect()."""
 
+    @pytest.mark.parametrize(
+        "controls",
+        [
+            {"offload_type": "invalid"},
+            {"group_offload_type": "invalid"},
+            {"group_offload_num_blocks_per_group": 0},
+            {"group_offload_num_blocks_per_group": -1},
+            {"group_offload_num_blocks_per_group": 1.5},
+        ],
+    )
+    def test_invalid_placement_controls_fail_without_components(
+        self, controls: dict[str, Any]
+    ) -> None:
+        """Reject deterministic placement errors before the loader can unload or fetch assets."""
+        with pytest.raises(ValueError):
+            DevicePolicy.auto_detect(**controls)
+
     def test_returns_device_policy(self):
         policy = DevicePolicy.auto_detect()
         assert isinstance(policy, DevicePolicy)

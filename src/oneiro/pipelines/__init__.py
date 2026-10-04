@@ -168,6 +168,8 @@ class PipelineManager:
 
         if isinstance(new_pipeline, CivitaiCheckpointPipeline):
             model_config = await new_pipeline.resolve_config(model_config, self._civitai_client)
+        else:
+            new_pipeline.validate_config(model_config, self.config.data)
         family = new_pipeline.family
         full_config = self.config.data
         embeddings = parse_embeddings_from_config(full_config, model_config)

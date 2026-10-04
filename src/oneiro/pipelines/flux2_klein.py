@@ -4,7 +4,6 @@ from typing import Any
 
 from diffusers import Flux2KleinAutoBlocks, Flux2KleinBaseAutoBlocks
 
-from oneiro.device import DevicePolicy
 from oneiro.pipelines.modular import ModularPipelineWrapper
 
 
@@ -15,8 +14,10 @@ class Flux2KleinPipelineWrapper(ModularPipelineWrapper):
     default_steps = 4
     default_guidance_scale = 1.0
 
-    def load(self, model_config: dict[str, Any], full_config: dict[str, Any] | None = None) -> None:
-        """Load the published Klein variant, with explicit metadata for custom sources."""
+    def validate_config(
+        self, model_config: dict[str, Any], full_config: dict[str, Any] | None = None
+    ) -> None:
+        """Resolve distilled/base graph and placement without loading components."""
         repo = model_config.get("repo", "black-forest-labs/FLUX.2-klein-9B")
         known = {
             "black-forest-labs/FLUX.2-klein-4B": "distilled",
@@ -34,17 +35,16 @@ class Flux2KleinPipelineWrapper(ModularPipelineWrapper):
         ):
             raise ValueError("Klein does not support textual inversion embeddings")
         distilled = variant == "distilled"
+        self.variant = variant
         self.default_steps, self.default_guidance_scale = (4, 1.0) if distilled else (50, 4.0)
+        self._recipe_guidance_scale = self.default_guidance_scale
+        self._component_repo = repo
+        self.blocks = Flux2KleinAutoBlocks() if distilled else Flux2KleinBaseAutoBlocks()
+        super().validate_config(model_config, full_config)
+
+    def load(self, model_config: dict[str, Any], full_config: dict[str, Any] | None = None) -> None:
+        """Load the preflighted Klein variant under shared resource ownership."""
+        self.validate_config(model_config, full_config)
         self._configure_cpu_threads(model_config.get("cpu_utilization", 0.75))
-        self.policy = DevicePolicy.auto_detect(
-            cpu_offload=model_config.get("cpu_offload", True),
-            offload_type=model_config.get("offload_type", "group"),
-            group_offload_type=model_config.get("group_offload_type", "leaf_level"),
-            group_offload_use_stream=model_config.get("group_offload_use_stream", True),
-            group_offload_num_blocks_per_group=model_config.get(
-                "group_offload_num_blocks_per_group"
-            ),
-        )
-        blocks = Flux2KleinAutoBlocks() if distilled else Flux2KleinBaseAutoBlocks()
-        self.initialize_pipeline(repo, blocks)
-        self.pipe.register_to_config(is_distilled=distilled)
+        self.initialize_pipeline(self._component_repo, self.blocks)
+        self.pipe.register_to_config(is_distilled=self.variant == "distilled")

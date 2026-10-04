@@ -66,6 +66,14 @@ class DevicePolicy:
         Returns:
             DevicePolicy configured for the best available device
         """
+        from diffusers.hooks.group_offloading import GroupOffloadingType
+
+        group_offload_type = GroupOffloadingType(group_offload_type).value
+        if group_offload_num_blocks_per_group is not None and (
+            type(group_offload_num_blocks_per_group) is not int
+            or group_offload_num_blocks_per_group < 1
+        ):
+            raise ValueError("group_offload_num_blocks_per_group must be a positive integer")
         if torch.cuda.is_available():
             device = "cuda"
             # Use bfloat16 only if supported, else float16

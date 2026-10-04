@@ -36,6 +36,21 @@ class ModularPipelineWrapper(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipeline
         super().__init__()
         self.components_manager: ComponentsManager | None = None
         self._original_guider: Any = None
+        self._recipe_guidance_scale = self.default_guidance_scale
+
+    def validate_config(
+        self, model_config: dict[str, Any], full_config: dict[str, Any] | None = None
+    ) -> None:
+        """Use the actual placement policy in both metadata preflight and loading."""
+        self.policy = DevicePolicy.auto_detect(
+            cpu_offload=model_config.get("cpu_offload", True),
+            offload_type=model_config.get("offload_type", "group"),
+            group_offload_type=model_config.get("group_offload_type", "leaf_level"),
+            group_offload_use_stream=model_config.get("group_offload_use_stream", True),
+            group_offload_num_blocks_per_group=model_config.get(
+                "group_offload_num_blocks_per_group"
+            ),
+        )
 
     @property
     def supports_inpaint(self) -> bool:
@@ -158,10 +173,7 @@ class ModularPipelineWrapper(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipeline
             raise ValueError(f"Unsupported generation controls: {sorted(unknown)}")
         if negative_prompt is not None and "negative_prompt" not in allowed:
             raise ValueError(f"Negative prompts are not supported for {workflow}")
-        recipe_controlled = guider is not None and not guider.config.enabled
-        if recipe_controlled or ("guidance_scale" not in allowed and guider is None):
-            if guidance_scale != self.default_guidance_scale:
-                raise ValueError("Guidance is controlled by the distilled recipe")
+        self.validate_guidance(guidance_scale, allowed, guider)
         if kwargs.get("output_type", "pil") != "pil":
             raise ValueError("Image generation requires output_type='pil'")
         if kwargs.get("loras") and not callable(getattr(self.pipe, "load_lora_weights", None)):
@@ -171,6 +183,13 @@ class ModularPipelineWrapper(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipeline
         return super().generate(
             prompt, negative_prompt, width, height, seed, steps, guidance_scale, **kwargs
         )
+
+    def validate_guidance(self, scale: float, allowed: set[str], guider: Any) -> None:
+        """Validate native guidance capability against the recipe, never a profile override."""
+        recipe_controlled = guider is not None and not guider.config.enabled
+        if recipe_controlled or ("guidance_scale" not in allowed and guider is None):
+            if scale != self._recipe_guidance_scale:
+                raise ValueError("Guidance is controlled by the distilled recipe")
 
     def pre_generate(self, **kwargs: Any) -> None:
         """Apply explicitly requested native resources; post_generate rolls them back."""

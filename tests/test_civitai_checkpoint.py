@@ -21,6 +21,7 @@ from PIL import Image
 from safetensors.torch import save_file
 
 from oneiro.device import DevicePolicy, OffloadMode
+from oneiro.pipelines import PipelineManager
 from oneiro.pipelines.backports.krea2 import BackportedKrea2Transformer2DModel
 from oneiro.pipelines.base import BasePipeline
 from oneiro.pipelines.civitai_checkpoint import (
@@ -87,6 +88,65 @@ class TestCheckpointPreflight:
         assert pipeline.validate_request(has_image=True) == (
             "image_conditioned" if family == "flux2" else "image2image"
         )
+
+    @pytest.mark.parametrize("source", ["local", "remote"])
+    @pytest.mark.parametrize(
+        "base", ["Krea 2", "Flux.2 Klein 9B", "Z-Image Turbo", "Flux.1 Schnell"]
+    )
+    async def test_distilled_profile_guidance_rejected_before_assets(
+        self, base: str, source: str
+    ) -> None:
+        """Arbitrary profile defaults cannot validate themselves or unload the current model."""
+        from unittest.mock import Mock
+
+        profile = {"type": "civitai", "base_model": base, "guidance_scale": 7.0}
+        if source == "local":
+            profile["checkpoint_path"] = "unused"
+        else:
+            profile["civitai_model_id"] = 1
+        config = Mock(data={})
+        config.get.return_value = profile
+        manager = PipelineManager(config)
+        client = AsyncMock()
+        client.get_model.return_value = SimpleNamespace(
+            latest_version=SimpleNamespace(base_model=base)
+        )
+        manager.set_civitai_client(client)
+        old = Mock(family="sdxl")
+        manager.pipeline, manager.current_model = old, "old"
+        with patch.object(CivitaiCheckpointPipeline, "load") as load:
+            with pytest.raises(ValueError, match="distilled recipe"):
+                await manager.load_model("bad")
+        old.unload.assert_not_called()
+        client.download_model_version.assert_not_awaited()
+        load.assert_not_called()
+        assert manager.pipeline is old and manager.current_model == "old"
+
+    @pytest.mark.parametrize(
+        "base,recipe,scale",
+        [
+            ("Krea 2", {}, 0.0),
+            ("Flux.2 Klein 9B", {}, 1.0),
+            ("Z-Image Turbo", {}, 0.0),
+            ("Flux.1 Schnell", {}, 0.0),
+            ("Pony", {}, 7.0),
+            ("Qwen", {}, 7.0),
+            ("SD 3.5 Large Turbo", {}, 7.0),
+            ("Krea 2", {"component_repo": "krea/Krea-2-Raw"}, 7.0),
+            ("Flux.2 Klein 9B-base", {}, 7.0),
+            ("Flux.1 Dev", {}, 7.0),
+        ],
+    )
+    async def test_recipe_fixed_and_ordinary_guidance_profiles_remain_valid(
+        self, base: str, recipe: dict[str, Any], scale: float
+    ) -> None:
+        """Native disabled/absent guidance is fixed; enabled CFG/embedding recipes stay configurable."""
+        wrapper = CivitaiCheckpointPipeline()
+        await wrapper.resolve_config(
+            {"checkpoint_path": "unused", "base_model": base, "guidance_scale": scale, **recipe},
+            None,
+        )
+        assert wrapper.default_guidance_scale == scale
 
     @pytest.mark.parametrize(
         "base_model",

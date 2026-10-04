@@ -4,7 +4,6 @@ from typing import Any
 
 from diffusers import FluxAutoBlocks
 
-from oneiro.device import DevicePolicy
 from oneiro.pipelines.modular import ModularPipelineWrapper
 
 
@@ -23,8 +22,10 @@ class Flux1PipelineWrapper(ModularPipelineWrapper):
             inputs.discard("guidance_scale")
         return inputs
 
-    def load(self, model_config: dict[str, Any], full_config: dict[str, Any] | None = None) -> None:
-        """Load a known official variant, or require explicit custom-source metadata."""
+    def validate_config(
+        self, model_config: dict[str, Any], full_config: dict[str, Any] | None = None
+    ) -> None:
+        """Resolve a known variant and actual placement without loading components."""
         repo = model_config.get("repo", "black-forest-labs/FLUX.1-dev")
         known = {
             "black-forest-labs/FLUX.1-dev": "dev",
@@ -43,16 +44,14 @@ class Flux1PipelineWrapper(ModularPipelineWrapper):
         self.default_steps, self.default_guidance_scale = (
             (28, 3.5) if variant == "dev" else (4, 0.0)
         )
+        self._recipe_guidance_scale = self.default_guidance_scale
+        self._component_repo, self.blocks = repo, FluxAutoBlocks()
+        super().validate_config(model_config, full_config)
+
+    def load(self, model_config: dict[str, Any], full_config: dict[str, Any] | None = None) -> None:
+        """Load the preflighted native variant through shared placement."""
+        self.validate_config(model_config, full_config)
         self._configure_cpu_threads(model_config.get("cpu_utilization", 0.75))
-        self.policy = DevicePolicy.auto_detect(
-            cpu_offload=model_config.get("cpu_offload", True),
-            offload_type=model_config.get("offload_type", "group"),
-            group_offload_type=model_config.get("group_offload_type", "leaf_level"),
-            group_offload_use_stream=model_config.get("group_offload_use_stream", True),
-            group_offload_num_blocks_per_group=model_config.get(
-                "group_offload_num_blocks_per_group"
-            ),
-        )
-        self.initialize_pipeline(repo, FluxAutoBlocks())
+        self.initialize_pipeline(self._component_repo, self.blocks)
         self.pipe.vae.enable_tiling()
         self.pipe.vae.enable_slicing()
