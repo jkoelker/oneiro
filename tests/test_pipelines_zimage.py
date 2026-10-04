@@ -3,6 +3,7 @@
 import io
 from functools import wraps
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -19,6 +20,83 @@ from tests.test_pipelines_modular import (
     place_embedding_wrapper,
 )
 from tests.test_pipelines_modular import offline as offline
+
+
+@pytest.mark.parametrize("scale,encoded", [(0.0, ["positive"]), (5.0, ["positive", "negative"])])
+def test_native_negative_encoding_uses_actual_cfg_boundary(
+    monkeypatch: pytest.MonkeyPatch, scale: float, encoded: list[str]
+) -> None:
+    """Native Turbo guidance 0 encodes no negative text; the native CFG path still does."""
+    from tests.test_krea2_backport import TinyTextEncoder, TinyTokenizer
+
+    observed = []
+
+    class Tokenizer(TinyTokenizer):
+        def apply_chat_template(self, messages: list[dict[str, str]], **kwargs: Any) -> str:
+            text = messages[0]["content"]
+            observed.append(text)
+            return text
+
+    wrapper, _ = load_hosted(
+        ZImagePipelineWrapper,
+        monkeypatch,
+        assets={"tokenizer": Tokenizer(), "text_encoder": TinyTextEncoder()},
+    )
+    native = wrapper.inpaint_pipe
+    native.transformer.in_channels = 4
+    monkeypatch.setattr(
+        ZImageInpaintPipeline, "_execution_device", property(lambda self: torch.device("cpu"))
+    )
+
+    def stop(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("native model computation boundary")
+
+    monkeypatch.setattr(native, "prepare_latents", stop)
+    with pytest.raises(RuntimeError, match="native model computation boundary"):
+        native(
+            "positive",
+            negative_prompt="negative",
+            guidance_scale=scale,
+            image=Image.new("RGB", (32, 32)),
+            mask_image=Image.new("L", (32, 32)),
+            num_inference_steps=2,
+            strength=1.0,
+        )
+    assert native.do_classifier_free_guidance is (scale > 0)
+    assert observed == encoded
+    wrapper.unload()
+
+
+@pytest.mark.parametrize("source", ["hosted", "checkpoint"])
+@pytest.mark.parametrize("workflow", ["text2image", "image2image", "inpainting"])
+def test_turbo_rejects_ineffective_negative_before_resources(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source: str, workflow: str
+) -> None:
+    """A native input slot must not let Turbo report negative conditioning it never applies."""
+    from unittest.mock import Mock
+
+    from tests.test_civitai_checkpoint import checkpoint_wrapper
+
+    if source == "hosted":
+        wrapper, _ = load_hosted(ZImagePipelineWrapper, monkeypatch)
+    else:
+        wrapper, config, components = checkpoint_wrapper(
+            tmp_path, monkeypatch, "Z-Image Turbo", "turbo"
+        )
+        components["vae"].config = SimpleNamespace(block_out_channels=[8, 8])
+        wrapper.load(config)
+    controls = {} if workflow == "text2image" else {"init_image": image_bytes()}
+    if workflow == "inpainting":
+        controls["mask_image"] = image_bytes()
+    capture_generation(wrapper, monkeypatch)
+    decode, setup = Mock(wraps=wrapper._load_init_image), Mock(wraps=wrapper.pre_generate)
+    monkeypatch.setattr(wrapper, "_load_init_image", decode)
+    monkeypatch.setattr(wrapper, "pre_generate", setup)
+    with pytest.raises(ValueError, match="Negative prompts"):
+        wrapper.generate("positive", negative_prompt="negative", **controls)
+    decode.assert_not_called()
+    setup.assert_not_called()
+    wrapper.unload()
 
 
 def test_native_inpaint_sees_real_adapters(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

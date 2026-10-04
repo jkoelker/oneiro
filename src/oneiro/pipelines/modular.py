@@ -173,7 +173,10 @@ class ModularPipelineWrapper(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipeline
         )
         if unknown:
             raise ValueError(f"Unsupported generation controls: {sorted(unknown)}")
-        if negative_prompt is not None and "negative_prompt" not in allowed:
+        if negative_prompt is not None and (
+            "negative_prompt" not in allowed
+            or (self.family == "zimage" and guider is not None and not guider.config.enabled)
+        ):
             raise ValueError(f"Negative prompts are not supported for {workflow}")
         self.validate_guidance(guidance_scale, allowed, guider)
         if kwargs.get("output_type", "pil") != "pil":
