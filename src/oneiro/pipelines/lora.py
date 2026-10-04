@@ -634,6 +634,7 @@ class LoraLoaderMixin:
         self._lora_configs: list[LoraConfig] = []
         self._loaded_adapters: list[str] = []
         self._static_lora_configs: list[LoraConfig] = []
+        self._lora_load_failed = False
 
     def load_single_lora(
         self,
@@ -658,26 +659,30 @@ class LoraLoaderMixin:
             )
         if self.pipe is None:
             raise RuntimeError("Pipeline not loaded")
+        if not callable(getattr(self.pipe, "load_lora_weights", None)):
+            raise ValueError("This pipeline does not support LoRA adapters")
 
         adapter_name = lora.adapter_name or f"lora_{len(self._loaded_adapters)}"
 
-        if lora.source == LoraSource.HUGGINGFACE:
-            print(f"Loading LoRA from HF: {lora.repo} (adapter: {adapter_name})")
-            self.pipe.load_lora_weights(
-                lora.repo,
-                weight_name=lora.weight_name,
-                adapter_name=adapter_name,
-            )
-        elif lora.source in (LoraSource.CIVITAI, LoraSource.LOCAL):
-            if lora._resolved_path is None:
-                raise ValueError(f"LoRA path not resolved: {lora}")
-            print(f"Loading LoRA from path: {lora._resolved_path} (adapter: {adapter_name})")
-            self.pipe.load_lora_weights(
-                str(lora._resolved_path),
-                adapter_name=adapter_name,
-            )
-        else:
-            raise ValueError(f"Unknown LoRA source: {lora.source}")
+        try:
+            if lora.source == LoraSource.HUGGINGFACE:
+                print(f"Loading LoRA from HF: {lora.repo} (adapter: {adapter_name})")
+                self.pipe.load_lora_weights(
+                    lora.repo,
+                    weight_name=lora.weight_name,
+                    adapter_name=adapter_name,
+                )
+            elif lora.source in (LoraSource.CIVITAI, LoraSource.LOCAL):
+                if lora._resolved_path is None:
+                    raise ValueError(f"LoRA path not resolved: {lora}")
+                print(f"Loading LoRA from path: {lora._resolved_path} (adapter: {adapter_name})")
+                self.pipe.load_lora_weights(str(lora._resolved_path), adapter_name=adapter_name)
+            else:
+                raise ValueError(f"Unknown LoRA source: {lora.source}")
+        except Exception:
+            # A native loader can mutate PEFT before it raises and before we record the name.
+            self._lora_load_failed = True
+            raise
 
         self._loaded_adapters.append(adapter_name)
         self._lora_configs.append(lora)
@@ -793,6 +798,7 @@ class LoraLoaderMixin:
         finally:
             self._loaded_adapters.clear()
             self._lora_configs.clear()
+            self._lora_load_failed = False
 
     def fuse_loras(self, lora_scale: float = 1.0) -> None:
         """Fuse LoRA weights into base model for faster inference.
@@ -853,7 +859,7 @@ class LoraLoaderMixin:
         adapters_match = self._loaded_adapters == static_names
         configs_match = self._lora_configs == self._static_lora_configs
 
-        if adapters_match and configs_match:
+        if adapters_match and configs_match and not self._lora_load_failed:
             # Adapters match - just reset weights if there are static LoRAs
             if self._static_lora_configs:
                 adapter_weights = [lora.weight for lora in self._static_lora_configs]
@@ -861,7 +867,7 @@ class LoraLoaderMixin:
             return
 
         # Adapters don't match - need to restore to static baseline
-        self.unload_loras()
+        self.unload_loras(force=True)
         if self._static_lora_configs:
             self.load_loras_sync(self._static_lora_configs)
             print(f"Restored {len(self._static_lora_configs)} static LoRA(s)")

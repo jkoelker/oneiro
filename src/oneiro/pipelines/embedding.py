@@ -406,6 +406,8 @@ class EmbeddingLoaderMixin:
             )
         if self.pipe is None:
             raise RuntimeError("Pipeline not loaded")
+        if not callable(getattr(self.pipe, "load_textual_inversion", None)):
+            raise ValueError("This pipeline does not support textual inversion embeddings")
 
         # Determine token - use configured token, or auto-detect
         token = embedding.token or embedding.name

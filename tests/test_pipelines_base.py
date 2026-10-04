@@ -42,6 +42,9 @@ class TestGenerationResult:
         assert result.height == 64
         assert result.steps == 20
         assert result.guidance_scale == 7.5
+        assert result.workflow == "text2image"
+        assert result.strength is None
+        assert result.model_name is None
 
     def test_negative_prompt_optional(self):
         """GenerationResult accepts None for negative_prompt."""
@@ -665,6 +668,53 @@ class TestBasePipelineLoadInitImage:
         with patch("oneiro.pipelines.base.MAX_INPUT_IMAGE_PIXELS", 100):
             with pytest.raises(ValueError, match="Input image is too large"):
                 pipeline._load_init_image(buffer.getvalue())
+
+    def test_load_init_image_rejects_oversized_attachment(self) -> None:
+        """Execution repeats the attachment byte limit before decoding."""
+        pipeline = ConcretePipeline()
+        with patch("oneiro.pipelines.base.MAX_INPUT_IMAGE_BYTES", 3):
+            with pytest.raises(ValueError, match="25 MiB"):
+                pipeline._load_init_image(b"1234")
+
+    def test_load_init_image_rejects_unapproved_format(self) -> None:
+        """Pillow support alone does not make GIF an accepted attachment."""
+        buffer = io.BytesIO()
+        Image.new("RGB", (8, 8)).save(buffer, format="GIF")
+        with pytest.raises(ValueError, match="PNG, JPEG, or WebP"):
+            ConcretePipeline()._load_init_image(buffer.getvalue())
+
+
+class TestBasePipelineLifecycle:
+    """Validation precedes setup and setup failures still reach cleanup."""
+
+    def test_invalid_attachment_precedes_pre_generate(self) -> None:
+        pipeline = ConcretePipeline()
+        pipeline.pipe = Mock()
+        pipeline.pre_generate = Mock()
+        with pytest.raises(ValueError, match="Invalid image"):
+            pipeline.generate("test", init_image=b"bad")
+        pipeline.pre_generate.assert_not_called()
+
+    def test_pre_generate_failure_runs_post_generate(self) -> None:
+        pipeline = ConcretePipeline()
+        pipeline.pipe = Mock()
+        pipeline.pre_generate = Mock(side_effect=RuntimeError("setup failed"))
+        pipeline.post_generate = Mock()
+        with pytest.raises(RuntimeError, match="setup failed"):
+            pipeline.generate("test")
+        pipeline.post_generate.assert_called_once()
+
+    def test_request_controls_do_not_reach_generation_kwargs(self) -> None:
+        pipeline = ConcretePipeline()
+        pipeline.pipe = Mock()
+        pipeline.pipe.return_value.images = [Image.new("RGB", (8, 8))]
+        pipeline.pre_generate = Mock()
+        original = pipeline.build_generation_kwargs
+        pipeline.build_generation_kwargs = Mock(wraps=original)
+        pipeline.generate("test", loras=["adapter"], scheduler="default")
+        pipeline.pre_generate.assert_called_once_with(loras=["adapter"], scheduler="default")
+        assert "loras" not in pipeline.build_generation_kwargs.call_args.kwargs
+        assert "scheduler" not in pipeline.build_generation_kwargs.call_args.kwargs
 
 
 class TestBasePipelineConfigureCpuThreads:
