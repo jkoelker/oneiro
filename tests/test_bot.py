@@ -1,9 +1,13 @@
 """Tests for bot helper functions."""
 
+import asyncio
 import io
+import json
 import socket
+import threading
 import zlib
 from collections.abc import Callable
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -12,6 +16,7 @@ import discord
 import httpx
 import pytest
 import respx
+import torch
 from discord.webhook.async_ import handle_message_parameters
 from PIL import Image
 
@@ -117,6 +122,215 @@ def _image_bytes(format: str = "PNG") -> bytes:
     return buffer.getvalue()
 
 
+def _model_context(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
+    """Keep actual native schedulers and manager ownership; replace only model assets."""
+    from tests.test_civitai_checkpoint import checkpoint_wrapper
+
+    pipeline, profile, components = checkpoint_wrapper(tmp_path, monkeypatch)
+    pipeline.load(profile)
+    profiles = {name: {"type": "civitai", **profile} for name in ("pony", "new", "third")}
+    config = MagicMock(data={"models": profiles}, state_path=None)
+    config.get.side_effect = lambda *keys, default=None: (
+        profiles[keys[1]] if len(keys) == 2 and keys[0] == "models" else default
+    )
+    manager = PipelineManager(config)
+    manager.pipeline, manager.current_model = pipeline, "pony"
+
+    def load(owner: CivitaiCheckpointPipeline, *args: Any) -> None:
+        owner.initialize_pipeline(profile["component_repo"], owner.blocks, components)
+
+    monkeypatch.setattr(CivitaiCheckpointPipeline, "load", load)
+    monkeypatch.setattr(
+        "oneiro.pipelines.civitai_checkpoint.get_weighted_text_embeddings_sdxl",
+        lambda *args, **kwargs: (torch.ones(1),) * 4,
+    )
+    ctx = MagicMock()
+    ctx.bot.pipeline_manager, ctx.bot.config = manager, config
+    ctx.defer, ctx.respond = AsyncMock(), AsyncMock()
+    ctx.followup.send = AsyncMock(return_value=MagicMock(edit=AsyncMock()))
+    return ctx
+
+
+@pytest.mark.parametrize("target", ["pony", "new"], ids=["already-active", "post-load"])
+@pytest.mark.parametrize("cancel_generation", [False, True])
+async def test_model_scheduler_waits_for_owned_inference(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, target: str, cancel_generation: bool
+) -> None:
+    """Both real command branches must wait for inference and its scheduler restoration."""
+    from diffusers import EulerDiscreteScheduler
+
+    ctx = _model_context(tmp_path, monkeypatch)
+    manager = ctx.bot.pipeline_manager
+    old = manager.pipeline
+    profile = old.pipe.scheduler
+    started, release = threading.Event(), threading.Event()
+
+    def inference(values: dict[str, Any], is_img2img: bool) -> dict[str, Any]:
+        started.set()
+        assert release.wait(10)
+        return {"images": [Image.new("RGB", (32, 32))]}
+
+    monkeypatch.setattr(old, "run_inference", inference)
+    generation = asyncio.create_task(manager.generate("positive", scheduler="ddim"))
+    command = None
+    try:
+        assert await asyncio.to_thread(started.wait, 10)
+        owned_scheduler = old.pipe.scheduler
+        if cancel_generation:
+            generation.cancel()
+            await asyncio.sleep(0)
+            generation.cancel()
+        command = asyncio.create_task(
+            _register_test_commands()["model"](ctx, target, scheduler="euler")
+        )
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert manager._lock.locked() and not command.done()
+        assert old.pipe.scheduler is owned_scheduler
+        release.set()
+        if cancel_generation:
+            with pytest.raises(asyncio.CancelledError):
+                await generation
+        else:
+            await generation
+        await command
+        assert manager.current_model == target
+        assert isinstance(manager.pipeline.pipe.scheduler, EulerDiscreteScheduler)
+        if target == "pony":
+            assert manager.pipeline.pipe.scheduler is not profile
+        ctx.defer.assert_awaited_once()
+    finally:
+        release.set()
+        await asyncio.gather(
+            *[task for task in (generation, command) if task], return_exceptions=True
+        )
+        if manager.pipeline:
+            manager.pipeline.unload()
+
+
+@pytest.mark.parametrize("target", ["pony", "new"], ids=["already-active", "post-load"])
+async def test_cancelled_model_scheduler_drains_worker_before_switch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, target: str
+) -> None:
+    """Repeated command cancellation cannot release ownership while scheduler setup is running."""
+    ctx = _model_context(tmp_path, monkeypatch)
+    manager = ctx.bot.pipeline_manager
+    started, release = threading.Event(), threading.Event()
+    original = CivitaiCheckpointPipeline.configure_scheduler
+    loop_thread = threading.get_ident()
+
+    def configure(owner: CivitaiCheckpointPipeline, name: str | None) -> None:
+        original(owner, name)
+        if name == "euler":
+            started.set()
+            if threading.get_ident() != loop_thread:
+                assert release.wait(10)
+
+    monkeypatch.setattr(CivitaiCheckpointPipeline, "configure_scheduler", configure)
+    command = asyncio.create_task(
+        _register_test_commands()["model"](ctx, target, scheduler="euler")
+    )
+    switch = None
+    try:
+        assert await asyncio.to_thread(started.wait, 10)
+        command.cancel()
+        await asyncio.sleep(0)
+        command.cancel()
+        switch = asyncio.create_task(manager.load_model("third"))
+        await asyncio.sleep(0)
+        assert manager._lock.locked() and not command.done() and not switch.done()
+        assert manager.current_model == target
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await command
+        await switch
+        assert manager.current_model == "third"
+    finally:
+        release.set()
+        await asyncio.gather(*[task for task in (command, switch) if task], return_exceptions=True)
+        if manager.pipeline:
+            manager.pipeline.unload()
+
+
+async def test_model_post_load_scheduler_cannot_mutate_a_competing_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Interleaving after load returns must never install the requested scheduler on another model."""
+    from diffusers import EulerDiscreteScheduler
+
+    ctx = _model_context(tmp_path, monkeypatch)
+    manager = ctx.bot.pipeline_manager
+    original = manager.load_model
+    loaded, release = asyncio.Event(), asyncio.Event()
+    targets = []
+
+    async def load(name: str, **kwargs: Any) -> None:
+        await original(name, **kwargs)
+        if name == "new":
+            targets.append(manager.pipeline.pipe.scheduler)
+            loaded.set()
+            await release.wait()
+
+    monkeypatch.setattr(manager, "load_model", load)
+    command = asyncio.create_task(_register_test_commands()["model"](ctx, "new", scheduler="euler"))
+    try:
+        await asyncio.wait_for(loaded.wait(), 10)
+        await manager.load_model("third")
+        competing = manager.pipeline.pipe.scheduler
+        release.set()
+        await command
+        assert manager.current_model == "third"
+        assert manager.pipeline.pipe.scheduler is competing
+        assert isinstance(targets[0], EulerDiscreteScheduler)
+    finally:
+        release.set()
+        await asyncio.gather(command, return_exceptions=True)
+        if manager.pipeline:
+            manager.pipeline.unload()
+
+
+async def test_model_active_branch_reloads_its_target_after_queued_switch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A command queued behind another switch must bind its override to its named model."""
+    from diffusers import EulerDiscreteScheduler
+
+    ctx = _model_context(tmp_path, monkeypatch)
+    manager = ctx.bot.pipeline_manager
+    started, release = threading.Event(), threading.Event()
+
+    def inference(values: dict[str, Any], is_img2img: bool) -> dict[str, Any]:
+        started.set()
+        assert release.wait(10)
+        return {"images": [Image.new("RGB", (32, 32))]}
+
+    monkeypatch.setattr(manager.pipeline, "run_inference", inference)
+    generation = asyncio.create_task(manager.generate("positive"))
+    switch = command = None
+    try:
+        assert await asyncio.to_thread(started.wait, 10)
+        switch = asyncio.create_task(manager.load_model("third"))
+        await asyncio.sleep(0)
+        command = asyncio.create_task(
+            _register_test_commands()["model"](ctx, "pony", scheduler="euler")
+        )
+        await asyncio.sleep(0)
+        assert manager.current_model == "pony" and not command.done()
+        release.set()
+        await generation
+        await switch
+        await command
+        assert manager.current_model == "pony"
+        assert isinstance(manager.pipeline.pipe.scheduler, EulerDiscreteScheduler)
+    finally:
+        release.set()
+        await asyncio.gather(
+            *[task for task in (generation, switch, command) if task], return_exceptions=True
+        )
+        if manager.pipeline:
+            manager.pipeline.unload()
+
+
 @pytest.mark.parametrize(
     ("base_model", "inputs"),
     [
@@ -211,6 +425,35 @@ async def test_dream_parameter_precedence(
     request = ctx.bot.generation_queue._pending_requests[0].request
     assert (request["steps"], request["guidance_scale"]) == expected
 
+
+@pytest.mark.parametrize("target", ["pony", "new"])
+@pytest.mark.parametrize("guidance", [0.0, 2.5])
+async def test_model_persists_generation_overrides(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, target: str, guidance: float
+) -> None:
+    """Both actual /model branches persist overrides readable after a config reload."""
+    ctx = _model_context(tmp_path, monkeypatch)
+    profile = ctx.bot.config.get("models", "pony")
+    base = tmp_path / "config.toml"
+    base.write_text(
+        '[defaults]\nmodel = "pony"\n\n'
+        + "\n\n".join(
+            f"[models.{name}]\n"
+            + "\n".join(f"{key} = {json.dumps(value)}" for key, value in profile.items())
+            for name in ("pony", "new")
+        )
+    )
+    config = Config(base, state_path=tmp_path / "state.json")
+    config.load()
+    ctx.bot.config = ctx.bot.pipeline_manager.config = config
+
+    await _register_test_commands()["model"](ctx, target, steps=17, guidance_scale=guidance)
+
+    reloaded = Config(base, state_path=config.state_path)
+    reloaded.load()
+    assert reloaded.get("model_overrides", target) == {"steps": 17, "guidance_scale": guidance}
+    assert reloaded.get("defaults", "model") == target
+    assert ctx.bot.pipeline_manager.current_model == target
 
 
 @pytest.mark.parametrize("variant", ["raw", "turbo"])

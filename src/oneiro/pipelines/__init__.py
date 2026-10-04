@@ -134,14 +134,25 @@ class PipelineManager:
         """
         self._civitai_client = client
 
-    async def load_model(self, model_name: str | None = None) -> None:
+    async def load_model(
+        self, model_name: str | None = None, *, scheduler: str | None = None
+    ) -> None:
         """Load a model by name from config.
 
         Args:
             model_name: Name of model to load. If None, loads default from config.
+            scheduler: Persistent checkpoint override applied to that target under ownership.
         """
+
+        async def load_owned() -> None:
+            await self._load_model(model_name)
+            if scheduler is not None:
+                if not isinstance(self.pipeline, CivitaiCheckpointPipeline):
+                    raise ValueError("Scheduler override is not supported for this pipeline type")
+                await asyncio.to_thread(self.pipeline.configure_scheduler, scheduler)
+
         async with self._lock:
-            await self._await_owned(self._load_model(model_name))
+            await self._await_owned(load_owned())
 
     async def _load_model(self, model_name: str | None = None) -> None:
         """Load while already owning the lock, including lazy load during generation."""

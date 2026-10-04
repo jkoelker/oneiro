@@ -586,17 +586,18 @@ def register_commands(bot: "OneiroBot") -> None:
             # Model is already active - handle overrides only
             overrides_applied = []
 
-            if scheduler and ctx.bot.pipeline_manager.pipeline is not None:
-                if isinstance(ctx.bot.pipeline_manager.pipeline, CivitaiCheckpointPipeline):
-                    ctx.bot.pipeline_manager.pipeline.configure_scheduler(scheduler)
-                    overrides_applied.append(f"scheduler=`{scheduler}`")
-                else:
-                    await ctx.respond(
-                        f"✅ Model `{model}` is already active.\n"
-                        f"⚠️ Scheduler override is not supported for this pipeline type.",
-                        ephemeral=True,
+            if scheduler:
+                # Waiting for inference ownership can exceed Discord's response window.
+                await ctx.defer()
+                try:
+                    await ctx.bot.pipeline_manager.load_model(model, scheduler=scheduler)
+                except ValueError as error:
+                    await ctx.followup.send(
+                        f"❌ Failed to configure model: {error}", ephemeral=True
                     )
                     return
+                overrides_applied.append(f"scheduler=`{scheduler}`")
+            send = ctx.followup.send if scheduler else ctx.respond
 
             # Save steps/guidance_scale overrides to state
             if ctx.bot.config.state_path:
@@ -610,12 +611,12 @@ def register_commands(bot: "OneiroBot") -> None:
                     overrides_applied.append(f"guidance_scale={guidance_scale}")
 
             if overrides_applied:
-                await ctx.respond(
+                await send(
                     f"✅ Model `{model}` already active. Set: {', '.join(overrides_applied)}",
                     ephemeral=True,
                 )
             else:
-                await ctx.respond(
+                await send(
                     f"✅ Model `{model}` is already active.",
                     ephemeral=True,
                 )
@@ -627,7 +628,7 @@ def register_commands(bot: "OneiroBot") -> None:
         try:
             loading_msg = await ctx.followup.send(f"⏳ Loading model `{model}`...")
             try:
-                await ctx.bot.pipeline_manager.load_model(model)
+                await ctx.bot.pipeline_manager.load_model(model, scheduler=scheduler)
             except CivitaiError as e:
                 await ctx.followup.send(
                     **format_exception_response("❌ Failed to load model", e), ephemeral=True
@@ -636,10 +637,6 @@ def register_commands(bot: "OneiroBot") -> None:
             except ValueError as e:
                 await ctx.followup.send(f"❌ Failed to load model: {e}", ephemeral=True)
                 return
-
-            if scheduler and ctx.bot.pipeline_manager.pipeline is not None:
-                if isinstance(ctx.bot.pipeline_manager.pipeline, CivitaiCheckpointPipeline):
-                    ctx.bot.pipeline_manager.pipeline.configure_scheduler(scheduler)
 
             if ctx.bot.config.state_path:
                 ctx.bot.config.set("defaults", "model", value=model)
