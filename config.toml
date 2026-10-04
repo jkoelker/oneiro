@@ -171,8 +171,10 @@ verify_hashes = true
 # Missing, unknown, and retired metadata is rejected; it never falls back to SDXL.
 # Local checkpoints require a known base_model. Remote metadata cannot be bypassed.
 # Custom variant-sensitive component repos require an explicit matching variant:
-# flux1: dev/schnell; flux2: dev; flux2-klein: distilled/base;
+# flux1: dev/schnell; flux2-klein: distilled/base;
 # krea2: raw/turbo; qwen: image; zimage: turbo.
+# FLUX.2 checkpoints select their native graph from base_model, not variant;
+# the explicit matching dev variant requirement applies only to hosted FLUX.2.
 #
 # Supported base models include:
 # - SDXL 1.0, SDXL Turbo, SDXL Lightning, Pony, Illustrious (1024x1024)

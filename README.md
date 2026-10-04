@@ -65,8 +65,10 @@ Before reusing an older config or persisted state:
    `/fetch` persists the resolved `family`, `variant`, and `component_repo` together with
    those CivitAI IDs, not legacy pipeline-class/offload overrides.
 4. For custom variant-sensitive sources, specify `variant`: FLUX.1 `dev`/`schnell`,
-   FLUX.2 `dev`, Klein `distilled`/`base`, Krea `raw`/`turbo`, Qwen `image`, Z-Image `turbo`.
-   Known official sources resolve their variant; explicit contradictions are rejected.
+   hosted FLUX.2 `dev`, Klein `distilled`/`base`, Krea `raw`/`turbo`, Qwen `image`,
+   Z-Image `turbo`. These sources resolve known official variants and reject explicit
+   contradictions. FLUX.2 checkpoints always select the native FLUX.2 graph from
+   `base_model`; their component-source `variant` is neither required nor validated.
    Repository-name substrings are not a recipe detector.
 
 The retained profiles in `config.toml` keep their sampling defaults: Krea Turbo 8 steps/0.0
@@ -79,10 +81,12 @@ execution, so a queued request cannot silently use stale capabilities after a mo
 CFG and negative prompts are recipe-specific, not a universal switch. Krea Raw accepts
 negative prompts and CFG; Turbo rejects negatives and non-recipe guidance. FLUX.1/2 and
 Klein do not expose negative prompts here; Schnell and distilled Klein reject unsupported
-guidance overrides. Qwen and SDXL/SD3 use native CFG. Classic SDXL/SD3 checkpoint guidance
-`<=1` preserves positive-only/no-CFG sampling at the checkpoint boundary, with the native
-LCM recipe retained. Z-Image mask generation remains its native pipeline, sharing components,
-adapters, and placement with the modular owner; source and mask align to the requested size.
+guidance overrides. Qwen and SDXL/SD3 use native CFG; Qwen and classic SDXL/SD3 checkpoint
+guidance `<=1` preserve positive-only/no-CFG sampling, with the native LCM recipe retained.
+Z-Image Turbo rejects negative prompts, including masks, because its fixed guidance 0
+does not apply negative conditioning. Z-Image mask generation remains its native pipeline,
+sharing components, adapters, and placement with the modular owner; source and mask align
+to the requested size.
 
 ### Placement and quantization
 
