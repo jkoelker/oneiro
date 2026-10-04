@@ -1,10 +1,12 @@
 """Offline Z-Image modular workflows and retained native mask exception."""
 
+import io
 from functools import wraps
 from pathlib import Path
 from typing import Any
 
 import pytest
+import torch
 from diffusers import ZImageInpaintPipeline
 from PIL import Image
 
@@ -198,3 +200,137 @@ def test_custom_source_needs_variant(monkeypatch: pytest.MonkeyPatch) -> None:
     """Unknown sources must explicitly declare Turbo."""
     with pytest.raises(ValueError, match="variant"):
         load_hosted(ZImagePipelineWrapper, monkeypatch, {"repo": "custom/turbo"})
+
+
+@pytest.mark.parametrize(
+    "size,region",
+    [
+        ((32, 32), (8, 4, 24, 20)),
+        ((64, 32), (16, 4, 48, 20)),
+        ((32, 64), (8, 8, 24, 40)),
+        ((64, 64), (16, 8, 48, 40)),
+    ],
+    ids=["same-size", "wider", "taller", "larger-square"],
+)
+def test_native_inpaint_resizes_source_and_aligned_mask(
+    monkeypatch: pytest.MonkeyPatch,
+    size: tuple[int, int],
+    region: tuple[int, int, int, int],
+) -> None:
+    """Real native VAE/denoising must use requested, mutually aligned image coordinates."""
+    from diffusers import AutoencoderKL, ZImageTransformer2DModel
+
+    from tests.test_krea2_backport import TinyTextEncoder
+
+    transformer = ZImageTransformer2DModel(
+        in_channels=4,
+        dim=16,
+        n_layers=1,
+        n_refiner_layers=1,
+        n_heads=2,
+        n_kv_heads=2,
+        cap_feat_dim=8,
+        axes_dims=[4, 2, 2],
+        axes_lens=[128, 128, 128],
+    ).eval()
+    vae = AutoencoderKL(
+        down_block_types=("DownEncoderBlock2D",) * 4,
+        up_block_types=("UpDecoderBlock2D",) * 4,
+        block_out_channels=(8,) * 4,
+        norm_num_groups=4,
+        latent_channels=4,
+        shift_factor=0.0,
+    ).eval()
+    wrapper, _ = load_hosted(
+        ZImagePipelineWrapper,
+        monkeypatch,
+        assets={"transformer": transformer, "vae": vae, "text_encoder": TinyTextEncoder()},
+    )
+    native = wrapper.inpaint_pipe
+    native.set_progress_bar_config(disable=True)
+    resources = dict(native.components)
+    seen = {}
+
+    def prompt(**kwargs: Any) -> tuple[list[torch.Tensor], None]:
+        return [torch.zeros(4, 8)], None
+
+    monkeypatch.setattr(native, "encode_prompt", prompt)
+    original_latents = native.prepare_latents
+    original_mask_latents = native.prepare_mask_latents
+
+    def record_latents(image: torch.Tensor, *args: Any, **kwargs: Any) -> Any:
+        seen["source"] = image.detach().clone()
+        return original_latents(image, *args, **kwargs)
+
+    def record_mask_latents(
+        mask: torch.Tensor, masked_image: torch.Tensor, *args: Any, **kwargs: Any
+    ) -> Any:
+        seen["mask"] = mask.detach().clone()
+        seen["masked_source"] = masked_image.detach().clone()
+        return original_mask_latents(mask, masked_image, *args, **kwargs)
+
+    # Observation only: all latent preparation, VAE encode/decode and denoising stay native.
+    monkeypatch.setattr(native, "prepare_latents", record_latents)
+    monkeypatch.setattr(native, "prepare_mask_latents", record_mask_latents)
+    source = Image.new("RGB", (32, 32), "black")
+    source.paste("white", (8, 4, 24, 20))
+    buffer = io.BytesIO()
+    source.save(buffer, format="PNG")
+    result = wrapper.generate(
+        "test",
+        init_image=buffer.getvalue(),
+        mask_image=buffer.getvalue(),
+        width=size[0],
+        height=size[1],
+        steps=2,
+        strength=1.0,
+        seed=42,
+    )
+    assert result.image.size == size
+    assert (result.width, result.height) == size
+    assert result.workflow == "inpainting" and result.guidance_scale == 0.0
+    assert seen["source"].shape == (1, 3, size[1], size[0])
+    assert seen["mask"].shape == (1, 1, size[1], size[0])
+    expected_mask = torch.zeros(size[1], size[0])
+    left, top, right, bottom = region
+    expected_mask[top:bottom, left:right] = 1
+    torch.testing.assert_close(seen["mask"][0, 0], expected_mask)
+    assert torch.equal(seen["source"][0, 0] > 0, expected_mask.bool())
+    assert seen["masked_source"][0, :, expected_mask.bool()].count_nonzero() == 0
+    assert all(
+        wrapper.pipe.components[name] is native.components[name] is resource
+        for name, resource in resources.items()
+    )
+    wrapper.unload()
+
+
+@pytest.mark.parametrize("image_only", [False, True], ids=["default-text", "image-only"])
+def test_non_mask_routing_keeps_source_coordinates(
+    monkeypatch: pytest.MonkeyPatch, image_only: bool
+) -> None:
+    """Native-mask normalization must not resize inputs to the shared modular paths."""
+    from oneiro.pipelines.base import BasePipeline
+
+    wrapper, _ = load_hosted(ZImagePipelineWrapper, monkeypatch)
+    seen = []
+
+    def modular_boundary(owner: Any, gen_kwargs: dict[str, Any], is_img2img: bool) -> Any:
+        seen.append(gen_kwargs)
+        assert is_img2img is image_only
+        raise RuntimeError("modular boundary reached")
+
+    monkeypatch.setattr(BasePipeline, "run_inference", modular_boundary)
+    controls = {"init_image": image_bytes(), "width": 64, "height": 32} if image_only else {}
+    with pytest.raises(RuntimeError, match="modular boundary reached"):
+        wrapper.generate("test", **controls)
+    assert seen[0]["num_inference_steps"] == 9
+    assert "guidance_scale" not in seen[0]
+    assert wrapper.pipe.guider.config.enabled is False
+    assert (seen[0]["width"], seen[0]["height"]) == ((64, 32) if image_only else (1024, 1024))
+    if image_only:
+        assert seen[0]["image"].size == (32, 32)
+        assert seen[0]["strength"] == 0.75
+    else:
+        assert "image" not in seen[0] and "strength" not in seen[0]
+    assert "mask_image" not in seen[0]
+    wrapper.unload()

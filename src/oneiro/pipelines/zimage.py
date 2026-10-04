@@ -4,6 +4,7 @@ import inspect
 from typing import Any
 
 from diffusers import ZImageAutoBlocks, ZImageInpaintPipeline
+from PIL import Image
 
 from oneiro.device import DevicePolicy
 from oneiro.pipelines.modular import ModularPipelineWrapper
@@ -87,6 +88,12 @@ class ZImagePipelineWrapper(ModularPipelineWrapper):
         if "mask_image" in gen_kwargs:
             if self.inpaint_pipe is None:
                 raise RuntimeError("Z-Image native inpaint pipeline not loaded")
+            # Native inpaint preprocesses the source without the requested dimensions.
+            size = (gen_kwargs["width"], gen_kwargs["height"])
+            gen_kwargs["image"] = gen_kwargs["image"].resize(size, Image.Resampling.LANCZOS)
+            gen_kwargs["mask_image"] = gen_kwargs["mask_image"].resize(
+                size, Image.Resampling.NEAREST
+            )
             return {"images": self.inpaint_pipe(**gen_kwargs).images}
         return super().run_inference(gen_kwargs, is_img2img)
 
