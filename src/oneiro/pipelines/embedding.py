@@ -484,6 +484,8 @@ class EmbeddingLoaderMixin:
     def unload_single_embedding(self, token: str) -> None:
         """Unload a single embedding by token.
 
+        Native removal errors propagate without clearing resource tracking.
+
         Args:
             token: The token to unload
 
@@ -498,10 +500,7 @@ class EmbeddingLoaderMixin:
             raise ValueError(f"Embedding token '{token}' not found in loaded embeddings")
 
         print(f"Unloading embedding: {token}")
-        try:
-            self.pipe.unload_textual_inversion(token)
-        except Exception as e:
-            print(f"Warning: Error unloading embedding '{token}': {e}")
+        self.pipe.unload_textual_inversion(token)
 
         self._loaded_tokens.remove(token)
         self._embedding_configs = [
@@ -509,15 +508,12 @@ class EmbeddingLoaderMixin:
         ]
 
     def unload_embeddings(self) -> None:
-        """Unload all embeddings and free memory."""
+        """Unload all embeddings, clearing tracking only after native removal succeeds."""
         if self.pipe is None or not self._loaded_tokens:
             return
 
         print(f"Unloading {len(self._loaded_tokens)} embedding(s)")
-        try:
-            self.pipe.unload_textual_inversion()
-        except Exception as e:
-            print(f"Warning: Error unloading embeddings: {e}")
+        self.pipe.unload_textual_inversion()
 
         self._loaded_tokens.clear()
         self._embedding_configs.clear()

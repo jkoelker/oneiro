@@ -317,11 +317,8 @@ def test_unsupported_explicit_embedding_uses_clear_error(tmp_path: Path) -> None
         )
 
 
-@pytest.mark.parametrize("offload_type", [None, OffloadType.SEQUENTIAL])
-def test_supported_native_embedding_loader(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, offload_type: OffloadType | None
-) -> None:
-    """SDXL's real native textual-inversion loader remains reachable through the mixin."""
+def local_embedding_wrapper(tmp_path: Path) -> tuple[Any, Any]:
+    """Supply native SDXL textual inversion with a tiny local CLIP and embedding."""
     from diffusers import StableDiffusionXLAutoBlocks
     from transformers import CLIPTextConfig, CLIPTextModel, CLIPTokenizer
 
@@ -331,6 +328,8 @@ def test_supported_native_embedding_loader(
     encoder = CLIPTextModel(
         CLIPTextConfig(
             vocab_size=2,
+            bos_token_id=0,
+            eos_token_id=1,
             hidden_size=8,
             intermediate_size=16,
             num_hidden_layers=1,
@@ -339,22 +338,51 @@ def test_supported_native_embedding_loader(
     )
     tokenizer = CLIPTokenizer(vocab={"<|startoftext|>": 0, "<|endoftext|>": 1}, merges=[])
     wrapper.pipe.register_components(text_encoder=encoder, tokenizer=tokenizer)
-    if offload_type is not None:
-        from accelerate import cpu_offload
-
-        def cpu_sequential(module: torch.nn.Module, **kwargs: Any) -> Any:
-            assert kwargs["execution_device"] == torch.device("cuda")
-            return cpu_offload(module, **{**kwargs, "execution_device": torch.device("cpu")})
-
-        monkeypatch.setattr("accelerate.cpu_offload", cpu_sequential)
-        wrapper.policy = DevicePolicy(device="cuda", dtype=torch.float32, offload_type=offload_type)
-        wrapper.policy.apply_to_modular_pipeline(wrapper.pipe, wrapper.components_manager)
     path = tmp_path / "embedding.pt"
     torch.save({"<style>": torch.arange(8).float()}, path)
     embedding = EmbeddingConfig(
         name="style", token="<style>", source=EmbeddingSource.LOCAL, path=str(path)
     )
     embedding._resolved_path = path
+    return wrapper, embedding
+
+
+def place_embedding_wrapper(
+    wrapper: Any, offload_type: OffloadType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Retain native hooks while substituting only accelerator transfer boundaries."""
+    from accelerate import cpu_offload
+    from diffusers.hooks import apply_group_offloading
+
+    def cpu_sequential(module: torch.nn.Module, **kwargs: Any) -> Any:
+        assert kwargs["execution_device"] == torch.device("cuda")
+        return cpu_offload(module, **{**kwargs, "execution_device": torch.device("cpu")})
+
+    def cpu_group(module: torch.nn.Module, **kwargs: Any) -> None:
+        assert kwargs["onload_device"] == torch.device("cuda")
+        apply_group_offloading(module, **{**kwargs, "onload_device": torch.device("cpu")})
+
+    monkeypatch.setattr("accelerate.cpu_offload", cpu_sequential)
+    monkeypatch.setattr(torch.accelerator, "current_accelerator", lambda: torch.device("cuda"))
+    monkeypatch.setattr("diffusers.hooks.apply_group_offloading", cpu_group)
+    wrapper.policy = DevicePolicy(
+        device="cuda",
+        dtype=torch.float32,
+        offload_type=offload_type,
+        group_offload_use_stream=False,
+    )
+    wrapper.policy.apply_to_modular_pipeline(wrapper.pipe, wrapper.components_manager)
+
+
+@pytest.mark.parametrize("offload_type", [None, OffloadType.SEQUENTIAL])
+def test_supported_native_embedding_loader(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, offload_type: OffloadType | None
+) -> None:
+    """SDXL's real native textual-inversion loader remains reachable through the mixin."""
+    wrapper, embedding = local_embedding_wrapper(tmp_path)
+    encoder, tokenizer = wrapper.pipe.text_encoder, wrapper.pipe.tokenizer
+    if offload_type is not None:
+        place_embedding_wrapper(wrapper, offload_type, monkeypatch)
     wrapper.load_single_embedding(embedding)
     if offload_type is not None:
         from accelerate.hooks import remove_hook_from_module
@@ -366,6 +394,118 @@ def test_supported_native_embedding_loader(
         encoder.get_input_embeddings().weight[token_id], torch.arange(8).float()
     )
     assert wrapper.active_embeddings == ["<style>"]
+
+
+@pytest.mark.parametrize("removal", ["single", "all"])
+def test_group_embedding_mutations_refresh_native_snapshots(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, removal: str
+) -> None:
+    """Native snapshot transfers retain added rows and hook the replacement on removal."""
+    from diffusers.hooks.group_offloading import ModuleGroup
+
+    wrapper, embedding = local_embedding_wrapper(tmp_path)
+    encoder, tokenizer = wrapper.pipe.text_encoder, wrapper.pipe.tokenizer
+    original = ModuleGroup._init_cpu_param_dict
+
+    def cpu_snapshot(group: ModuleGroup) -> dict[Any, torch.Tensor]:
+        # Exercise native streamed snapshot construction without CUDA streams/pinning.
+        stream = group.stream
+        group.stream = object()
+        try:
+            return original(group)
+        finally:
+            group.stream = stream
+
+    monkeypatch.setattr(ModuleGroup, "_init_cpu_param_dict", cpu_snapshot)
+    monkeypatch.setattr(
+        ModuleGroup, "_to_cpu", staticmethod(lambda tensor, _: tensor.detach().cpu().clone())
+    )
+    place_embedding_wrapper(wrapper, OffloadType.GROUP, monkeypatch)
+    baseline = encoder.get_input_embeddings().weight.detach().clone()
+    wrapper.load_embeddings_sync([embedding])
+    matrix = encoder.get_input_embeddings()
+    group = matrix._diffusers_hook.get_hook("group_offloading").group
+    group._process_tensors_from_modules(pinned_memory=group.cpu_param_dict)
+    assert matrix.weight.shape == (3, 8)
+    token_id = tokenizer.convert_tokens_to_ids("<style>")
+    torch.testing.assert_close(matrix(torch.tensor([token_id]))[0], torch.arange(8).float())
+    if removal == "single":
+        wrapper.unload_single_embedding("<style>")
+    else:
+        wrapper.unload_embeddings()
+    matrix = encoder.get_input_embeddings()
+    assert matrix.weight.shape == (2, 8)
+    group = matrix._diffusers_hook.get_hook("group_offloading").group
+    group._process_tensors_from_modules(pinned_memory=group.cpu_param_dict)
+    torch.testing.assert_close(matrix(torch.tensor([0, 1])), baseline)
+    assert "<style>" not in tokenizer.get_vocab()
+    assert wrapper.active_embeddings == []
+    wrapper.unload()
+
+
+@pytest.mark.parametrize("removal", ["single", "all"])
+def test_sequential_embedding_removal_restores_owned_hooks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, removal: str
+) -> None:
+    """Both native removals resize real weights and reinstall working sequential hooks."""
+    wrapper, embedding = local_embedding_wrapper(tmp_path)
+    encoder, tokenizer = wrapper.pipe.text_encoder, wrapper.pipe.tokenizer
+    baseline = encoder.get_input_embeddings().weight.detach().clone()
+    place_embedding_wrapper(wrapper, OffloadType.SEQUENTIAL, monkeypatch)
+    wrapper.load_single_embedding(embedding)
+    if removal == "single":
+        wrapper.unload_single_embedding("<style>")
+    else:
+        wrapper.unload_embeddings()
+    matrix = encoder.get_input_embeddings()
+    assert matrix.weight.shape == (2, 8)
+    assert matrix.weight.device.type == "meta"
+    torch.testing.assert_close(matrix(torch.tensor([0, 1])), baseline)
+    assert hasattr(encoder, "_hf_hook")
+    assert matrix.weight.device.type == "meta"
+    assert "<style>" not in tokenizer.get_vocab()
+    assert wrapper.active_embeddings == []
+    assert wrapper._embedding_configs == []
+    wrapper.unload()
+
+
+@pytest.mark.parametrize("offload_type", [OffloadType.GROUP, OffloadType.SEQUENTIAL])
+@pytest.mark.parametrize("removal", ["single", "all"])
+def test_embedding_removal_failure_restores_owned_hooks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    offload_type: OffloadType,
+    removal: str,
+) -> None:
+    """Even failure after native mutation restores placement without clearing tracking."""
+    wrapper, embedding = local_embedding_wrapper(tmp_path)
+    encoder = wrapper.pipe.text_encoder
+    baseline = encoder.get_input_embeddings().weight.detach().clone()
+    place_embedding_wrapper(wrapper, offload_type, monkeypatch)
+    wrapper.load_single_embedding(embedding)
+    original = wrapper.pipe.unload_textual_inversion
+
+    def fail_after_removal(*args: Any, **kwargs: Any) -> None:
+        original(*args, **kwargs)
+        raise RuntimeError("failed after native removal")
+
+    monkeypatch.setattr(wrapper.pipe, "unload_textual_inversion", fail_after_removal)
+    with pytest.raises(RuntimeError, match="failed after native removal"):
+        if removal == "single":
+            wrapper.unload_single_embedding("<style>")
+        else:
+            wrapper.unload_embeddings()
+    assert wrapper.active_embeddings == ["<style>"]
+    assert wrapper._embedding_configs == [embedding]
+    matrix = encoder.get_input_embeddings()
+    assert matrix.weight.shape == (2, 8)
+    torch.testing.assert_close(matrix(torch.tensor([0, 1])), baseline)
+    if offload_type == OffloadType.SEQUENTIAL:
+        assert hasattr(encoder, "_hf_hook")
+        assert matrix.weight.device.type == "meta"
+    else:
+        assert matrix._diffusers_hook.get_hook("group_offloading") is not None
+    wrapper.unload()
 
 
 @pytest.mark.parametrize("workflow", ["image2image", "inpainting", "reference"])

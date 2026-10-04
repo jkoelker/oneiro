@@ -172,8 +172,8 @@ class ModularPipelineWrapper(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipeline
             self.load_loras_sync(kwargs["loras"])
 
     @contextmanager
-    def _resource_update(self) -> Iterator[None]:
-        """Suspend sequential hooks so native loaders cannot reenable classic pipelines."""
+    def _resource_update(self, *, refresh_group: bool = False) -> Iterator[None]:
+        """Suspend sequential hooks and refresh native groups after embedding mutations."""
         from accelerate import cpu_offload
         from accelerate.hooks import remove_hook_from_module
 
@@ -182,7 +182,17 @@ class ModularPipelineWrapper(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipeline
             and getattr(self.pipe, "_oneiro_offload_type", None) == OffloadType.SEQUENTIAL.value
         )
         if not sequential:
-            yield
+            try:
+                yield
+            finally:
+                if refresh_group and self.pipe is not None:
+                    from diffusers.hooks.group_offloading import (
+                        _maybe_remove_and_reapply_group_offloading,
+                    )
+
+                    encoder = self.pipe.components.get("text_encoder")
+                    if isinstance(encoder, torch.nn.Module):
+                        _maybe_remove_and_reapply_group_offloading(encoder)
             return
         modules = {
             id(module): module
@@ -219,8 +229,18 @@ class ModularPipelineWrapper(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipeline
 
     def load_single_embedding(self, embedding: EmbeddingConfig) -> str:
         """Load supported native textual inversions without classic offload callbacks."""
-        with self._resource_update():
+        with self._resource_update(refresh_group=True):
             return super().load_single_embedding(embedding)
+
+    def unload_single_embedding(self, token: str) -> None:
+        """Remove a native embedding with real weights and refresh its owned placement."""
+        with self._resource_update(refresh_group=True):
+            super().unload_single_embedding(token)
+
+    def unload_embeddings(self) -> None:
+        """Remove all native embeddings under the same lifecycle as individual updates."""
+        with self._resource_update(refresh_group=True):
+            super().unload_embeddings()
 
     def build_generation_kwargs(
         self,

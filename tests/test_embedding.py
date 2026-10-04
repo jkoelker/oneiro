@@ -611,8 +611,8 @@ class TestEmbeddingLoaderMixin:
 
         assert pipeline._loaded_tokens == ["token1"]
 
-    def test_unload_single_embedding_handles_exception(self, capsys):
-        """Unloading handles exceptions gracefully."""
+    def test_unload_single_embedding_propagates_exception(self) -> None:
+        """Native removal failure preserves tracking and reaches the caller."""
         from oneiro.pipelines.embedding import EmbeddingLoaderMixin
 
         class MockPipeline(EmbeddingLoaderMixin):
@@ -627,15 +627,15 @@ class TestEmbeddingLoaderMixin:
             EmbeddingConfig(name="emb1", source=EmbeddingSource.LOCAL, path="/p", token="token1"),
         ]
 
-        pipeline.unload_single_embedding("token1")
+        configs = list(pipeline._embedding_configs)
+        with pytest.raises(RuntimeError, match="API error"):
+            pipeline.unload_single_embedding("token1")
 
-        assert "token1" not in pipeline._loaded_tokens
-        captured = capsys.readouterr()
-        assert "Warning" in captured.out
-        assert "API error" in captured.out
+        assert pipeline._loaded_tokens == ["token1"]
+        assert pipeline._embedding_configs == configs
 
-    def test_unload_embeddings_handles_exception(self, capsys):
-        """Unloading all handles exceptions gracefully."""
+    def test_unload_embeddings_propagates_exception(self) -> None:
+        """Batch removal failure does not falsely clear the loaded resource state."""
         from oneiro.pipelines.embedding import EmbeddingLoaderMixin
 
         class MockPipeline(EmbeddingLoaderMixin):
@@ -650,12 +650,12 @@ class TestEmbeddingLoaderMixin:
             EmbeddingConfig(name="emb1", source=EmbeddingSource.LOCAL, path="/p", token="token1"),
         ]
 
-        pipeline.unload_embeddings()
+        configs = list(pipeline._embedding_configs)
+        with pytest.raises(RuntimeError, match="API error"):
+            pipeline.unload_embeddings()
 
-        assert pipeline._loaded_tokens == []
-        assert pipeline._embedding_configs == []
-        captured = capsys.readouterr()
-        assert "Warning" in captured.out
+        assert pipeline._loaded_tokens == ["token1"]
+        assert pipeline._embedding_configs == configs
 
     def test_unload_embedding_by_name_when_no_token(self):
         """Unloading works when embedding uses name as token."""
