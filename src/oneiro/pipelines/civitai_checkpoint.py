@@ -822,6 +822,15 @@ class CivitaiCheckpointPipeline(ModularPipelineWrapper):
         **kwargs: Any,
     ) -> dict[str, Any]:
         """Inject weighted embeddings only when the selected native graph declares them."""
+        if self.family in {"sdxl", "sd3"} and guidance_scale <= 1.0:
+            # Classic <=1 means positive-only; native CFG uses 1, not 0, for that path.
+            # LCM's native loop disables CFG and needs its original embedding scale.
+            if (
+                self.family != "sdxl"
+                or getattr(getattr(self.pipe.unet, "config", None), "time_cond_proj_dim", None)
+                is None
+            ):
+                guidance_scale = 1.0
         values = super().build_generation_kwargs(
             prompt,
             negative_prompt,

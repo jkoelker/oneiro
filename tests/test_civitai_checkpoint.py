@@ -13,7 +13,10 @@ from unittest.mock import AsyncMock, patch
 import pytest
 import torch
 from diffusers import DDIMScheduler, FlowMatchEulerDiscreteScheduler
+from diffusers.modular_pipelines.modular_pipeline import PipelineState
 from diffusers.modular_pipelines.modular_pipeline_utils import ComponentSpec
+from diffusers.modular_pipelines.stable_diffusion_3.denoise import StableDiffusion3DenoiseStep
+from diffusers.modular_pipelines.stable_diffusion_xl.denoise import StableDiffusionXLDenoiseStep
 from PIL import Image
 from safetensors.torch import save_file
 
@@ -471,6 +474,222 @@ class TestCheckpointComponents:
             result = pipeline._load_checkpoint_components(tmp_path / "unused", {})
         assert set(result) == {"tokenizer", "transformer"}
         assert pipeline.policy is policy
+
+
+def native_guidance_checkpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    base: str,
+    time_cond_proj_dim: int | None = None,
+) -> tuple[CivitaiCheckpointPipeline, list[dict[str, Any]]]:
+    """Exercise native denoising and real scheduler updates with asset-free predictions."""
+    pipeline, config, components = checkpoint_wrapper(tmp_path, monkeypatch, base)
+    observations: list[dict[str, Any]] = []
+    predictions: list[float] = []
+
+    class Prediction(torch.nn.Module):
+        """Make positive/negative conditioning distinguishable without model weights."""
+
+        def __init__(self) -> None:
+            """Declare the native SDXL guidance-embedding capability."""
+            super().__init__()
+            self.config = SimpleNamespace(time_cond_proj_dim=time_cond_proj_dim)
+
+        def forward(
+            self,
+            sample: torch.Tensor | None = None,
+            timestep: Any = None,
+            *,
+            hidden_states: torch.Tensor | None = None,
+            encoder_hidden_states: torch.Tensor,
+            **kwargs: Any,
+        ) -> tuple[torch.Tensor]:
+            """Return +10 or -10 according to the conditioning chosen by native guidance."""
+            value = encoder_hidden_states.flatten()[0].item()
+            predictions.append(value)
+            latents = sample if sample is not None else hidden_states
+            return (torch.full_like(latents, value),)
+
+    components["unet" if pipeline.family == "sdxl" else "transformer"] = Prediction()
+    pipeline.load(config)
+    monkeypatch.setattr(
+        f"oneiro.pipelines.civitai_checkpoint.get_weighted_text_embeddings_{pipeline.family}",
+        lambda *args, **kwargs: (
+            torch.full((1, 2, 2), 10.0),
+            torch.full((1, 2, 2), -10.0),
+            torch.full((1, 2), 10.0),
+            torch.full((1, 2), -10.0),
+        ),
+    )
+    scheduler_step = pipeline.pipe.scheduler.step
+
+    def record_step(
+        model_output: torch.Tensor, timestep: Any, sample: torch.Tensor, **kwargs: Any
+    ) -> Any:
+        """Observe the native denoiser output before the real scheduler consumes it."""
+        observations.append(
+            {
+                "noise": model_output.clone(),
+                "predictions": list(predictions),
+                "guider": pipeline.pipe.guider,
+                "scale": pipeline.pipe.guider.guidance_scale,
+            }
+        )
+        return scheduler_step(model_output, timestep, sample, **kwargs)
+
+    monkeypatch.setattr(pipeline.pipe.scheduler, "step", record_step)
+    denoise = (
+        StableDiffusionXLDenoiseStep()
+        if pipeline.family == "sdxl"
+        else StableDiffusion3DenoiseStep()
+    )
+    denoise.set_progress_bar_config(disable=True)
+
+    def inference(values: dict[str, Any], is_img2img: bool) -> dict[str, Any]:
+        """Run actual native loop/denoiser/guider math; decoding is irrelevant to this gate."""
+        predictions.clear()
+        state = PipelineState()
+        assert values["prompt_embeds"].flatten()[0] == 10.0
+        assert values["negative_prompt_embeds"].flatten()[0] == -10.0
+        for name, value in values.items():
+            state.set(name, value, "denoiser_input_fields" if name.endswith("embeds") else None)
+        pipeline.pipe.scheduler.set_timesteps(1)
+        state.set("timesteps", pipeline.pipe.scheduler.timesteps)
+        state.set("latents", torch.zeros(1, 1, 2, 2))
+        for name in ("add_time_ids", "negative_add_time_ids"):
+            state.set(name, torch.zeros(1, 6), "denoiser_input_fields")
+        denoise(pipeline.pipe, state)
+        return {"images": [Image.new("RGB", (32, 32))]}
+
+    monkeypatch.setattr(pipeline, "run_inference", inference)
+    return pipeline, observations
+
+
+class TestCheckpointNativeGuidance:
+    """Classic no-CFG requests must yield positive predictions through native denoisers."""
+
+    @pytest.mark.parametrize(
+        "base", ["SDXL Turbo", "SDXL Lightning", "SDXL Hyper", "SD 3.5 Large Turbo"]
+    )
+    def test_zero_guidance_defaults_use_positive_native_prediction(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, base: str
+    ) -> None:
+        """Retained zero defaults must not select the negative/unconditional prediction."""
+        pipeline, observations = native_guidance_checkpoint(tmp_path, monkeypatch, base)
+        try:
+            result = pipeline.generate("positive", negative_prompt="negative", steps=1)
+            assert result.guidance_scale == 0.0
+            assert observations[0]["noise"].unique().tolist() == [10.0]
+            assert observations[0]["predictions"] == [10.0]
+        finally:
+            pipeline.unload()
+
+    @pytest.mark.parametrize("base", ["Pony", "SD 3.5 Large"])
+    @pytest.mark.parametrize(
+        "scale,noise,predictions",
+        [
+            (-0.5, 10.0, [10.0]),
+            (0.0, 10.0, [10.0]),
+            (0.5, 10.0, [10.0]),
+            (1.0, 10.0, [10.0]),
+            (1.0000000001, 10.0, [10.0]),
+            (1.01, 10.2, [10.0, -10.0]),
+            (3.0, 50.0, [10.0, -10.0]),
+        ],
+    )
+    def test_native_no_cfg_threshold_and_normal_cfg(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        base: str,
+        scale: float,
+        noise: float,
+        predictions: list[float],
+    ) -> None:
+        """Classic <=1 is positive-only; above it preserve native CFG and near-one tolerance."""
+        pipeline, observations = native_guidance_checkpoint(tmp_path, monkeypatch, base)
+        try:
+            result = pipeline.generate(
+                "positive", negative_prompt="negative", guidance_scale=scale, steps=1
+            )
+            assert result.guidance_scale == scale
+            torch.testing.assert_close(observations[0]["noise"], torch.full((1, 1, 2, 2), noise))
+            assert observations[0]["predictions"] == predictions
+        finally:
+            pipeline.unload()
+
+    @pytest.mark.parametrize("scale", [0.0, 0.5, 1.0, 3.0])
+    def test_sdxl_embedded_guidance_keeps_native_no_cfg_scale(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scale: float
+    ) -> None:
+        """LCM's native loop disables CFG while its separate guidance-embedding scale stays intact."""
+        pipeline, observations = native_guidance_checkpoint(
+            tmp_path, monkeypatch, "SDXL 1.0 LCM", time_cond_proj_dim=4
+        )
+        try:
+            pipeline.generate("positive", negative_prompt="negative", guidance_scale=scale, steps=1)
+            assert observations[0]["noise"].unique().tolist() == [10.0]
+            assert observations[0]["predictions"] == [10.0]
+            assert observations[0]["scale"] == scale
+        finally:
+            pipeline.unload()
+
+    @pytest.mark.parametrize(
+        "base,time_cond_proj_dim,cfg_noise",
+        [
+            ("SDXL Turbo", None, 50.0),
+            ("SD 3.5 Large Turbo", None, 50.0),
+            ("SDXL 1.0 LCM", 4, 10.0),
+        ],
+    )
+    @pytest.mark.parametrize("failure", [False, True])
+    def test_request_guider_restores_after_native_success_or_failure(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        base: str,
+        time_cond_proj_dim: int | None,
+        cfg_noise: float,
+        failure: bool,
+    ) -> None:
+        """Native mutations remain on request-local guiders, across success/failure and CFG changes."""
+        pipeline, observations = native_guidance_checkpoint(
+            tmp_path, monkeypatch, base, time_cond_proj_dim
+        )
+        original = pipeline.pipe.guider
+        original_config, original_state = dict(original.config), original.get_state()
+        inference = pipeline.run_inference
+
+        def fail_after_native(values: dict[str, Any], is_img2img: bool) -> Any:
+            """Fail only after the actual native loop produced a prediction."""
+            inference(values, is_img2img)
+            raise RuntimeError("failed after native denoising")
+
+        try:
+            for scale, noise in [(0.0, 10.0), (3.0, cfg_noise), (0.5, 10.0), (None, 10.0)]:
+                monkeypatch.setattr(
+                    pipeline, "run_inference", fail_after_native if failure else inference
+                )
+                if failure:
+                    with pytest.raises(RuntimeError, match="after native denoising"):
+                        pipeline.generate(
+                            "positive", negative_prompt="negative", guidance_scale=scale, steps=1
+                        )
+                else:
+                    pipeline.generate(
+                        "positive", negative_prompt="negative", guidance_scale=scale, steps=1
+                    )
+                torch.testing.assert_close(
+                    observations[-1]["noise"], torch.full((1, 1, 2, 2), noise)
+                )
+                assert observations[-1]["guider"] is not original
+                assert pipeline.pipe.guider is original
+                assert dict(original.config) == original_config
+                assert original.get_state() == original_state
+                assert pipeline._original_guider is None
+            assert len({id(item["guider"]) for item in observations}) == 4
+        finally:
+            pipeline.unload()
 
 
 class TestCheckpointGeneration:
