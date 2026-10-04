@@ -118,8 +118,8 @@ class ModularPipelineWrapper(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipeline
         if strength is not None:
             if workflow not in {"image2image", "inpainting"}:
                 raise ValueError(f"Denoising strength is not supported for {workflow}")
-            if not math.isfinite(strength) or not 0.0 <= strength <= 1.0:
-                raise ValueError("Strength must be finite and between 0 and 1")
+            if not math.isfinite(strength) or not 0.0 < strength <= 1.0:
+                raise ValueError("Strength must be finite, greater than 0, and at most 1")
         return workflow
 
     def generate(

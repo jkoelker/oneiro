@@ -241,11 +241,43 @@ async def test_dream_admits_krea_image_mask_reference_workflows(
     assert request["guidance_scale"] == (4.5 if variant == "raw" else 0.0)
 
 
-@pytest.mark.parametrize("strength", [0.0, 0.45, 1.0])
-async def test_dream_preserves_explicit_strength(strength: float) -> None:
-    """A supplied denoising strength, including zero, survives queue admission."""
-    ctx = await _dream_context()
-    await _register_test_commands()["dream"](ctx, "prompt", image=_attachment(), strength=strength)
+@pytest.mark.parametrize("variant", ["raw", "turbo"])
+@pytest.mark.parametrize("has_mask", [False, True])
+@pytest.mark.parametrize("strength", [0.0, float("nan"), float("inf")])
+async def test_dream_rejects_invalid_denoising_strength_before_io(
+    variant: str, has_mask: bool, strength: float
+) -> None:
+    """Zero/nonfinite denoising strength cannot read attachments, resolve LoRAs, or queue."""
+    ctx = await _dream_context(component_repo=f"krea/Krea-2-{variant.title()}")
+    attachments = {"image": _attachment()}
+    if has_mask:
+        attachments["mask"] = _attachment()
+    with patch(
+        "oneiro.discord.commands.resolve_loras", new=AsyncMock(return_value=LoraResolutionResult())
+    ) as resolve:
+        await _register_test_commands()["dream"](ctx, "prompt", strength=strength, **attachments)
+    ctx.defer.assert_awaited_once()
+    for attachment in attachments.values():
+        attachment.read.assert_not_awaited()
+    resolve.assert_not_awaited()
+    ctx.bot.generation_queue.add.assert_not_called()
+    failure = ctx.followup.send.await_args
+    assert failure.kwargs == {"ephemeral": True}
+    assert "Strength" in failure.args[0] and "Traceback" not in failure.args[0]
+
+
+@pytest.mark.parametrize("variant", ["raw", "turbo"])
+@pytest.mark.parametrize("has_mask", [False, True])
+@pytest.mark.parametrize("strength", [0.45, 1.0])
+async def test_dream_preserves_explicit_strength(
+    variant: str, has_mask: bool, strength: float
+) -> None:
+    """Valid supplied denoising strengths survive image/mask queue admission unchanged."""
+    ctx = await _dream_context(component_repo=f"krea/Krea-2-{variant.title()}")
+    attachments = {"image": _attachment()}
+    if has_mask:
+        attachments["mask"] = _attachment()
+    await _register_test_commands()["dream"](ctx, "prompt", strength=strength, **attachments)
     assert ctx.bot.generation_queue._pending_requests[0].request["strength"] == strength
 
 

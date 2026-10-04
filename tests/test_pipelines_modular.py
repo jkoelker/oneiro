@@ -6,6 +6,7 @@ from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -19,6 +20,9 @@ from oneiro.pipelines.backports.krea2 import (
     Krea2AutoBlocks,
     Krea2TurboAutoBlocks,
 )
+from oneiro.pipelines.civitai_checkpoint import CivitaiCheckpointPipeline
+from oneiro.pipelines.flux2 import Flux2PipelineWrapper
+from oneiro.pipelines.krea2 import Krea2PipelineWrapper
 from oneiro.pipelines.lora import LoraConfig, LoraSource
 from tests.test_krea2_backport import TINY_CONFIG, TinyTextEncoder, TinyTokenizer
 
@@ -86,9 +90,10 @@ def local_wrapper(tmp_path: Path, blocks: Any = None, omit: str | None = None) -
 
 
 @pytest.mark.parametrize("blocks_class", [Krea2AutoBlocks, Krea2TurboAutoBlocks])
-def test_modular_workflow_validation(tmp_path: Path, blocks_class: type) -> None:
+def test_modular_workflow_validation(blocks_class: type) -> None:
     """Strength denotes denoising, not text or reference conditioning."""
-    wrapper = local_wrapper(tmp_path, blocks_class())
+    wrapper = Krea2PipelineWrapper()
+    wrapper.blocks = blocks_class()
     assert wrapper.validate_request(has_image=True) == "image2image"
     assert wrapper.validate_request(has_image=True, has_mask=True) == "inpainting"
     assert wrapper.validate_request(has_reference=True) == "reference"
@@ -101,16 +106,17 @@ def test_modular_workflow_validation(tmp_path: Path, blocks_class: type) -> None
         {"has_reference": True, "strength": 0.75},
         *(
             {"has_image": True, "strength": value}
-            for value in (float("nan"), float("inf"), -0.1, 1.1)
+            for value in (0.0, float("nan"), float("inf"), -0.1, 1.1)
         ),
     ):
         with pytest.raises(ValueError):
             wrapper.validate_request(**request)
 
 
-def test_conditioned_workflow_rejects_strength(tmp_path: Path) -> None:
+def test_conditioned_workflow_rejects_strength() -> None:
     """FLUX.2 images condition generation; they do not select denoising strength."""
-    wrapper = local_wrapper(tmp_path, Flux2AutoBlocks())
+    wrapper = Flux2PipelineWrapper()
+    wrapper.blocks = Flux2AutoBlocks()
     assert wrapper.validate_request(has_image=True) == "image_conditioned"
     assert wrapper.supports_inpaint is False
     with pytest.raises(ValueError):
@@ -241,11 +247,11 @@ def test_dynamic_lora_rollback(
         assert any(hasattr(child, "_diffusers_hook") for child in transformer.modules())
 
 
-def test_invalid_controls_precede_lora_mutation(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_invalid_controls_precede_lora_mutation(monkeypatch: pytest.MonkeyPatch) -> None:
     """Bad workflows, bytes, and unsupported controls never enter resource setup."""
-    wrapper = local_wrapper(tmp_path)
+    wrapper = Krea2PipelineWrapper()
+    wrapper.blocks = Krea2TurboAutoBlocks()
+    wrapper.pipe = SimpleNamespace(components={"guider": None}, load_lora_weights=lambda *_: None)
 
     def forbidden(**kwargs: Any) -> None:
         raise AssertionError("resource mutation preceded validation")
@@ -253,6 +259,7 @@ def test_invalid_controls_precede_lora_mutation(
     monkeypatch.setattr(wrapper, "pre_generate", forbidden)
     for request in (
         {"init_image": b"bad"},
+        {"init_image": image_bytes(), "strength": 0.0},
         {"mask_image": image_bytes()},
         {"strength": 0.75},
         {"control_image": image_bytes()},
@@ -266,6 +273,57 @@ def test_invalid_controls_precede_lora_mutation(
     ):
         with pytest.raises(ValueError):
             wrapper.generate("test", loras=["unused"], **request)
+
+
+@pytest.mark.parametrize(
+    ("base_model", "component_repo", "has_mask"),
+    [
+        ("Krea 2", "krea/Krea-2-Raw", False),
+        ("Krea 2", "krea/Krea-2-Raw", True),
+        ("Krea 2", "krea/Krea-2-Turbo", False),
+        ("Krea 2", "krea/Krea-2-Turbo", True),
+        ("Pony", None, False),
+        ("Pony", None, True),
+        ("Flux.1 D", None, False),
+        ("SD 3.5", None, False),
+        ("Qwen", None, False),
+        ("Qwen", None, True),
+        ("Z-Image Turbo", None, False),
+        ("Z-Image Turbo", None, True),
+    ],
+)
+@pytest.mark.parametrize("strength", [0.0, float("nan"), float("inf")])
+async def test_invalid_denoising_strength_precedes_decode_and_resource_mutation(
+    base_model: str,
+    component_repo: str | None,
+    has_mask: bool,
+    strength: float,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Real native denoising declarations reject invalid strength before backend side effects."""
+    wrapper = CivitaiCheckpointPipeline()
+    await wrapper.resolve_config(
+        {"checkpoint_path": "unused", "base_model": base_model, "component_repo": component_repo},
+        None,
+    )
+    assert wrapper.validate_request(has_image=True, has_mask=has_mask) == (
+        "inpainting" if has_mask else "image2image"
+    )
+    wrapper.pipe = SimpleNamespace(
+        components={"scheduler": object(), "guider": None}, load_lora_weights=lambda *_: None
+    )
+    decode = Mock(wraps=wrapper._load_init_image)
+    mutate = Mock(side_effect=AssertionError("resource mutation preceded strength validation"))
+    monkeypatch.setattr(wrapper, "_load_init_image", decode)
+    monkeypatch.setattr(wrapper, "pre_generate", mutate)
+    request = {"init_image": image_bytes(), "strength": strength}
+    if has_mask:
+        request["mask_image"] = image_bytes()
+    lora = LoraConfig(name="unused", source=LoraSource.LOCAL, path="unused")
+    with pytest.raises(ValueError, match="Strength"):
+        wrapper.generate("test", loras=[lora], **request)
+    decode.assert_not_called()
+    mutate.assert_not_called()
 
 
 def test_modular_unload_releases_ownership(tmp_path: Path) -> None:
