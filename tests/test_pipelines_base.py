@@ -191,6 +191,110 @@ async def test_preflight_failure_keeps_old_model() -> None:
     assert result.model_name == "old" and manager.pipeline is old
 
 
+@pytest.mark.parametrize("active", [False, True], ids=["switch-target", "already-active"])
+@pytest.mark.parametrize(
+    ("source", "scheduler", "error"),
+    [
+        ("hosted-qwen", "euler", "Scheduler override is not supported"),
+        ("checkpoint-pony", "not-a-scheduler", "Unknown scheduler"),
+        ("checkpoint-qwen", "euler", "not compatible with qwen"),
+    ],
+    ids=["unsupported-hosted", "unknown-checkpoint-name", "incompatible-checkpoint-family"],
+)
+async def test_manager_scheduler_admission_preserves_model_and_resources(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    active: bool,
+    source: str,
+    scheduler: str,
+    error: str,
+) -> None:
+    """The actual target policy rejects controls before resources, assets, or model mutation."""
+    from diffusers import ModularPipeline
+    from diffusers.modular_pipelines.modular_pipeline_utils import ComponentSpec
+
+    from oneiro.pipelines.civitai_checkpoint import CivitaiCheckpointPipeline
+    from tests.test_civitai_checkpoint import checkpoint_wrapper
+    from tests.test_pipelines_modular import capture_generation, load_hosted
+
+    def forbid_network(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("No downloads allowed in scheduler admission gates")
+
+    monkeypatch.setattr("socket.socket.connect", forbid_network)
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    monkeypatch.setenv("TRANSFORMERS_OFFLINE", "1")
+    if active and source.startswith("checkpoint"):
+        base, variant = ("Pony", None) if source == "checkpoint-pony" else ("Qwen", "image")
+        old, profile, _ = checkpoint_wrapper(tmp_path, monkeypatch, base, variant)
+        old.load(profile)
+        profile = {"type": "civitai", **profile}
+        monkeypatch.setattr(
+            "oneiro.pipelines.civitai_checkpoint.get_weighted_text_embeddings_sdxl",
+            lambda *args, **kwargs: (torch.ones(1),) * 4,
+        )
+    else:
+        old, _ = load_hosted(QwenPipelineWrapper, monkeypatch, {"cpu_offload": False})
+        if source == "hosted-qwen":
+            profile = {"type": "qwen", "cpu_offload": False}
+        else:
+            profile = {
+                "type": "civitai",
+                "civitai_model_id": 1,
+                "cpu_offload": False,
+            }
+    profile["inline_loras"] = [{"name": "style", "source": "huggingface", "repo": "unused/style"}]
+    config = Mock(data={"models": {"target": profile}})
+    config.get.side_effect = lambda *keys, default=None: (
+        profile
+        if keys == ("models", "target")
+        else "target"
+        if keys == ("defaults", "model")
+        else default
+    )
+    manager = PipelineManager(config)
+    manager.pipeline, manager.current_model = old, "target" if active else "old"
+    client = AsyncMock()
+    client.get_model.return_value = Mock(
+        latest_version=Mock(base_model="Pony" if source == "checkpoint-pony" else "Qwen")
+    )
+    manager.set_civitai_client(client)
+    calls = capture_generation(old, monkeypatch)
+    previous_name = manager.current_model
+    previous_scheduler = old.pipe.scheduler
+    try:
+        with (
+            patch.object(old, "unload", wraps=old.unload) as unload,
+            patch.object(old.pipe, "update_components", wraps=old.pipe.update_components) as update,
+            patch.object(ModularPipeline, "_load_pipeline_config") as assets,
+            patch.object(ComponentSpec, "load") as component,
+            patch.object(CivitaiCheckpointPipeline, "_load_checkpoint_components") as conversion,
+            patch(
+                "oneiro.pipelines.resolve_lora_path",
+                side_effect=AssertionError("Scheduler admission crossed resource resolution"),
+            ) as lora,
+            patch("oneiro.pipelines.resolve_embedding_path") as embedding,
+        ):
+            with pytest.raises(ValueError, match=error):
+                await manager.load_model(None if active else "target", scheduler=scheduler)
+            unload.assert_not_called()
+            update.assert_not_called()
+            assets.assert_not_called()
+            component.assert_not_called()
+            conversion.assert_not_called()
+            lora.assert_not_awaited()
+            embedding.assert_not_awaited()
+            client.download_model_version.assert_not_awaited()
+            assert manager.pipeline is old and manager.current_model == previous_name
+            assert old.pipe.scheduler is previous_scheduler
+        assert (await manager.generate("still usable")).model_name == previous_name
+        assert len(calls) == 1
+    finally:
+        if manager.pipeline:
+            manager.pipeline.unload()
+        if old.pipe:
+            old.unload()
+
+
 @pytest.mark.parametrize(
     "pipeline_type,repo,variant",
     [

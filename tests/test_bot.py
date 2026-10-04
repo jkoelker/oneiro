@@ -151,6 +151,72 @@ def _model_context(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
     return ctx
 
 
+@pytest.mark.parametrize("fail_assets", [False, True], ids=["successful-assets", "failing-assets"])
+async def test_model_hosted_scheduler_rejects_before_switch_assets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fail_assets: bool
+) -> None:
+    """The registered command must preserve a usable model even if target assets would fail."""
+    from diffusers import ModularPipeline
+    from diffusers.modular_pipelines.modular_pipeline_utils import ComponentSpec
+
+    from oneiro.pipelines.qwen import QwenPipelineWrapper
+    from tests.test_pipelines_modular import capture_generation, load_hosted
+
+    ctx = _model_context(tmp_path, monkeypatch)
+    manager = ctx.bot.pipeline_manager
+    old = manager.pipeline
+    calls = capture_generation(old, monkeypatch)
+    profile = {"type": "qwen", "cpu_offload": False}
+    ctx.bot.config.data["models"]["qwen"] = profile
+    # Install only source/component asset doubles; keep the actual Qwen loader and scheduler.
+    prepared, records = load_hosted(QwenPipelineWrapper, monkeypatch, profile)
+    prepared.unload()
+    records["spec_loads"].clear()
+    component_load = ComponentSpec.load
+
+    def load(spec: ComponentSpec, **kwargs: Any) -> Any:
+        if fail_assets:
+            records["spec_loads"].append(spec.name)
+            raise OSError("deliberate asset failure")
+        return component_load(spec, **kwargs)
+
+    monkeypatch.setattr(ComponentSpec, "load", load)
+    scheduler = old.pipe.scheduler
+    source = MagicMock(wraps=ModularPipeline._load_pipeline_config.__func__)
+    try:
+        with (
+            patch.object(old, "unload", wraps=old.unload) as unload,
+            patch.object(old.pipe, "update_components", wraps=old.pipe.update_components) as update,
+            patch.object(
+                ModularPipeline,
+                "_load_pipeline_config",
+                new=classmethod(source),
+            ),
+            patch("oneiro.pipelines.resolve_lora_path") as lora,
+            patch("oneiro.pipelines.resolve_embedding_path") as embedding,
+        ):
+            await _register_test_commands()["model"](ctx, "qwen", scheduler="euler")
+            messages = [str(call) for call in ctx.followup.send.await_args_list]
+            assert any("Scheduler override is not supported" in text for text in messages), messages
+            unload.assert_not_called()
+            source.assert_not_called()
+            update.assert_not_called()
+            lora.assert_not_awaited()
+            embedding.assert_not_awaited()
+            assert records["spec_loads"] == []
+            assert manager.pipeline is old and manager.current_model == "pony"
+            assert old.pipe.scheduler is scheduler
+        assert (await manager.generate("still usable")).model_name == "pony"
+        assert len(calls) == 1
+        ctx.defer.assert_awaited_once()
+        ctx.bot.config.set.assert_not_called()
+    finally:
+        if manager.pipeline:
+            manager.pipeline.unload()
+        if old.pipe:
+            old.unload()
+
+
 @pytest.mark.parametrize("target", ["pony", "new"], ids=["already-active", "post-load"])
 @pytest.mark.parametrize("cancel_generation", [False, True])
 async def test_model_scheduler_waits_for_owned_inference(

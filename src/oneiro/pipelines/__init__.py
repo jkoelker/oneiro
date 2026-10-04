@@ -145,16 +145,25 @@ class PipelineManager:
         """
 
         async def load_owned() -> None:
-            await self._load_model(model_name)
+            await self._load_model(model_name, scheduler=scheduler)
             if scheduler is not None:
-                if not isinstance(self.pipeline, CivitaiCheckpointPipeline):
-                    raise ValueError("Scheduler override is not supported for this pipeline type")
-                await asyncio.to_thread(self.pipeline.configure_scheduler, scheduler)
+                target = cast(CivitaiCheckpointPipeline, self.pipeline)
+                await asyncio.to_thread(target.configure_scheduler, scheduler)
 
         async with self._lock:
             await self._await_owned(load_owned())
 
-    async def _load_model(self, model_name: str | None = None) -> None:
+    @staticmethod
+    def _validate_scheduler_override(pipeline: BasePipeline, scheduler: str | None) -> None:
+        """Admit the override with the actual target's policy, without component mutation."""
+        if scheduler is not None:
+            if not isinstance(pipeline, CivitaiCheckpointPipeline):
+                raise ValueError("Scheduler override is not supported for this pipeline type")
+            pipeline._validate_scheduler(scheduler)
+
+    async def _load_model(
+        self, model_name: str | None = None, *, scheduler: str | None = None
+    ) -> None:
         """Load while already owning the lock, including lazy load during generation."""
         # Get model name from config if not specified
         if model_name is None:
@@ -162,6 +171,7 @@ class PipelineManager:
 
         # Already loaded this model
         if self.current_model == model_name and self.pipeline is not None:
+            self._validate_scheduler_override(self.pipeline, scheduler)
             return
 
         # Get model config - model_name is guaranteed to be str at this point
@@ -181,6 +191,7 @@ class PipelineManager:
             model_config = await new_pipeline.resolve_config(model_config, self._civitai_client)
         else:
             new_pipeline.validate_config(model_config, self.config.data)
+        self._validate_scheduler_override(new_pipeline, scheduler)
         family = new_pipeline.family
         full_config = self.config.data
         embeddings = parse_embeddings_from_config(full_config, model_config)
