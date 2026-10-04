@@ -76,10 +76,18 @@ class ModularPipelineWrapper(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipeline
             missing = sorted(name for name in required if self.pipe.components.get(name) is None)
             if missing:
                 raise RuntimeError(f"Missing required pipeline components: {', '.join(missing)}")
+            self._initialize_native_inpaint()
             self.policy.apply_to_modular_pipeline(self.pipe, self.components_manager)
         except Exception:
             self.unload()
             raise
+
+    def _initialize_native_inpaint(self) -> None:
+        """Let Z-Image attach its native mask view before the single shared placement."""
+
+    def workflow_inputs(self, workflow: str) -> set[str]:
+        """Read real input declarations, with a narrow native-inpaint override seam."""
+        return set(self.blocks.get_workflow(workflow).input_names)
 
     def validate_request(
         self,
@@ -135,8 +143,7 @@ class ModularPipelineWrapper(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipeline
             has_reference=kwargs.get("reference_image") is not None,
             strength=kwargs.get("strength"),
         )
-        selected = self.blocks.get_workflow(workflow)
-        allowed = set(selected.input_names)
+        allowed = self.workflow_inputs(workflow)
         guider = self.pipe.components.get("guider")
         if "true_cfg_scale" in kwargs:
             if guider is None:
@@ -264,7 +271,7 @@ class ModularPipelineWrapper(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipeline
             has_reference=reference is not None,
             strength=strength,
         )
-        allowed = set(self.blocks.get_workflow(workflow).input_names)
+        allowed = self.workflow_inputs(workflow)
         unknown = kwargs.keys() - allowed
         if unknown:
             raise ValueError(f"Unsupported generation controls: {sorted(unknown)}")

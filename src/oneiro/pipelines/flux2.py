@@ -1,141 +1,50 @@
-"""FLUX.2 pipeline wrapper with CPU offloading, LoRA, and embedding support."""
+"""Hosted FLUX.2 recipe preserving repository-native quantization."""
 
 from typing import Any
 
-import torch
-from PIL import Image
+from diffusers import Flux2AutoBlocks, Flux2Transformer2DModel
+from transformers import Mistral3ForConditionalGeneration
 
 from oneiro.device import DevicePolicy
-from oneiro.pipelines.base import BasePipeline, GenerationResult
-from oneiro.pipelines.embedding import EmbeddingLoaderMixin, parse_embeddings_from_config
-from oneiro.pipelines.lora import LoraLoaderMixin
+from oneiro.pipelines.modular import ModularPipelineWrapper
 
 
-class Flux2PipelineWrapper(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipeline):
-    """Wrapper for FLUX.2 with CPU offloading, multi-LoRA, and embedding support."""
+class Flux2PipelineWrapper(ModularPipelineWrapper):
+    """Use native text/image-conditioned blocks with one shared resource lifecycle."""
 
-    def __init__(self) -> None:
-        super().__init__()
+    family = "flux2"
+    default_steps = 28
+    default_guidance_scale = 4.0
 
     def load(self, model_config: dict[str, Any], full_config: dict[str, Any] | None = None) -> None:
-        """Load FLUX.2 model with components on CPU for memory efficiency."""
-        from diffusers import Flux2Pipeline, Flux2Transformer2DModel
-        from transformers import Mistral3ForConditionalGeneration
-
+        """Load components on CPU, letting their hosted configs select BNB quantization."""
         repo = model_config.get("repo", "diffusers/FLUX.2-dev-bnb-4bit")
-        cpu_offload = model_config.get("cpu_offload", True)
-        offload_type = model_config.get("offload_type", "group")
-        group_offload_type = model_config.get("group_offload_type", "leaf_level")
-        group_offload_use_stream = model_config.get("group_offload_use_stream", True)
-        group_offload_num_blocks_per_group = model_config.get("group_offload_num_blocks_per_group")
-        cpu_utilization = model_config.get("cpu_utilization", 0.75)
-
-        print(f"Loading FLUX.2 from {repo}")
-
-        # Configure CPU threading for text encoder
-        self._configure_cpu_threads(cpu_utilization)
-
+        known = {"diffusers/FLUX.2-dev-bnb-4bit", "black-forest-labs/FLUX.2-dev"}
+        variant = model_config.get("variant", "dev" if repo in known else None)
+        if variant != "dev":
+            raise ValueError("FLUX.2 requires variant='dev' for custom model sources")
+        if (
+            model_config.get("embeddings")
+            or model_config.get("inline_embeddings")
+            or (full_config or {}).get("embeddings", {}).get("auto_load")
+        ):
+            raise ValueError("FLUX.2 does not support textual inversion embeddings")
+        self._configure_cpu_threads(model_config.get("cpu_utilization", 0.75))
         self.policy = DevicePolicy.auto_detect(
-            cpu_offload=cpu_offload,
-            offload_type=offload_type,
-            group_offload_type=group_offload_type,
-            group_offload_use_stream=group_offload_use_stream,
-            group_offload_num_blocks_per_group=group_offload_num_blocks_per_group,
+            cpu_offload=model_config.get("cpu_offload", True),
+            offload_type=model_config.get("offload_type", "group"),
+            group_offload_type=model_config.get("group_offload_type", "leaf_level"),
+            group_offload_use_stream=model_config.get("group_offload_use_stream", True),
+            group_offload_num_blocks_per_group=model_config.get(
+                "group_offload_num_blocks_per_group"
+            ),
         )
-
-        # Load transformer and text encoder on CPU first
-        print("  Loading transformer on CPU...")
         transformer = Flux2Transformer2DModel.from_pretrained(
-            repo,
-            subfolder="transformer",
-            torch_dtype=self.policy.dtype,
+            repo, subfolder="transformer", torch_dtype=self.policy.dtype
         )
-
-        print("  Loading text encoder on CPU...")
         text_encoder = Mistral3ForConditionalGeneration.from_pretrained(
-            repo,
-            subfolder="text_encoder",
-            torch_dtype=self.policy.dtype,
+            repo, subfolder="text_encoder", torch_dtype=self.policy.dtype
         )
-
-        print("  Creating pipeline...")
-        self.pipe = Flux2Pipeline.from_pretrained(
-            repo,
-            transformer=transformer,
-            text_encoder=text_encoder,
-            torch_dtype=self.policy.dtype,
+        self.initialize_pipeline(
+            repo, Flux2AutoBlocks(), {"transformer": transformer, "text_encoder": text_encoder}
         )
-
-        # Load embeddings if full_config provided
-        if full_config:
-            embeddings = parse_embeddings_from_config(full_config, model_config)
-            if embeddings:
-                print(f"  Loading {len(embeddings)} embedding(s)...")
-                self.load_embeddings_sync(embeddings)
-
-        self.policy.apply_to_pipeline(self.pipe)
-
-        print(f"FLUX.2 loaded from {repo}")
-
-    def generate(
-        self,
-        prompt: str,
-        negative_prompt: str | None = None,
-        width: int = 1024,
-        height: int = 1024,
-        seed: int = -1,
-        steps: int = 28,
-        guidance_scale: float = 4.0,
-        **kwargs: Any,
-    ) -> GenerationResult:
-        """Generate image with FLUX.2."""
-        return super().generate(
-            prompt=prompt,
-            negative_prompt=negative_prompt,
-            width=width,
-            height=height,
-            seed=seed,
-            steps=steps,
-            guidance_scale=guidance_scale,
-            **kwargs,
-        )
-
-    def build_generation_kwargs(
-        self,
-        prompt: str,
-        negative_prompt: str | None,  # Not used by FLUX.2 but stored in result
-        width: int,
-        height: int,
-        steps: int,
-        guidance_scale: float,
-        generator: torch.Generator,
-        init_image: Image.Image | None,
-        strength: float,
-        **kwargs: Any,
-    ) -> dict[str, Any]:
-        """Build FLUX.2 generation kwargs."""
-        if init_image:
-            print(f"FLUX.2 img2img: '{prompt[:50]}...' strength={strength}")
-            return {
-                "prompt": prompt,
-                "image": init_image,
-                "strength": strength,
-                "num_inference_steps": steps,
-                "guidance_scale": guidance_scale,
-                "generator": generator,
-            }
-        else:
-            print(f"FLUX.2 generating: '{prompt[:50]}...'")
-            return {
-                "prompt": prompt,
-                "height": height,
-                "width": width,
-                "num_inference_steps": steps,
-                "guidance_scale": guidance_scale,
-                "generator": generator,
-            }
-
-    def post_generate(self, **kwargs: Any) -> None:
-        """Reset LoRA state after generation to prevent state leakage."""
-        super().post_generate(**kwargs)
-        self.restore_static_loras()

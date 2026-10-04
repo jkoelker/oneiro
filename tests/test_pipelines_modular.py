@@ -4,6 +4,7 @@ import io
 import socket
 from collections.abc import Iterator
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -654,3 +655,290 @@ def test_optional_controlnet_is_not_required(tmp_path: Path) -> None:
     wrapper = local_wrapper(tmp_path, StableDiffusionXLAutoBlocks(), omit="controlnet")
     assert wrapper.pipe.controlnet is None
     assert wrapper.validate_request(has_image=True, has_mask=True) == "inpainting"
+
+
+def load_hosted(
+    wrapper_class: type,
+    monkeypatch: pytest.MonkeyPatch,
+    config: dict[str, Any] | None = None,
+    full_config: dict[str, Any] | None = None,
+    assets: dict[str, Any] | None = None,
+) -> tuple[Any, dict[str, Any]]:
+    """Keep real native initialization/ownership; replace only asset-loading boundaries."""
+    import diffusers
+    from diffusers import Flux2Transformer2DModel, ModularPipeline
+    from transformers import AutoTokenizer, Mistral3ForConditionalGeneration
+
+    from oneiro.pipelines.base import BasePipeline
+    from oneiro.pipelines.modular import ModularPipelineWrapper
+
+    assert issubclass(wrapper_class, ModularPipelineWrapper), "Hosted loading is still classic"
+    records: dict[str, Any] = {"spec_loads": [], "pretrained": []}
+
+    def hosted_index(cls: type, *args: Any, **kwargs: Any) -> tuple[None, dict[str, Any]]:
+        blocks = getattr(diffusers, cls.default_blocks_name)()
+        return None, {
+            spec.name: (spec.type_hint.__module__.split(".")[0], spec.type_hint.__name__)
+            for spec in blocks.expected_components
+            if spec.default_creation_method == "from_pretrained"
+        }
+
+    monkeypatch.setattr(ModularPipeline, "_load_pipeline_config", classmethod(hosted_index))
+    monkeypatch.setattr(BasePipeline, "_configure_cpu_threads", lambda *a: 1)
+
+    def component(name: str) -> Any:
+        if assets and name in assets:
+            return assets[name]
+        if "tokenizer" in name:
+            return TinyTokenizer()
+        if name == "scheduler":
+            return FlowMatchEulerDiscreteScheduler()
+        module = torch.nn.Linear(2, 2)
+        module.config = SimpleNamespace(block_out_channels=[8, 8])
+        if name == "vae":
+            module.enable_tiling = lambda: setattr(module, "use_tiling", True)
+            module.enable_slicing = lambda: setattr(module, "use_slicing", True)
+        return module
+
+    def load_spec(spec: ComponentSpec, **kwargs: Any) -> Any:
+        records["spec_loads"].append(spec.name)
+        return component(spec.name)
+
+    monkeypatch.setattr(ComponentSpec, "load", load_spec)
+    for cls, name in (
+        (Flux2Transformer2DModel, "transformer"),
+        (Mistral3ForConditionalGeneration, "text_encoder"),
+        (BackportedKrea2Transformer2DModel, "backported_transformer"),
+        (AutoTokenizer, "tokenizer"),
+    ):
+
+        def load_asset(*args: Any, _name: str = name, **kwargs: Any) -> Any:
+            asset = component(_name)
+            if _name in {"transformer", "text_encoder"}:
+                asset.quantization_config = {"quant_method": "bitsandbytes", "load_in_4bit": True}
+            records["pretrained"].append((_name, args, kwargs, asset))
+            return asset
+
+        monkeypatch.setattr(cls, "from_pretrained", load_asset)
+    wrapper = wrapper_class()
+    wrapper.load(config or {}, full_config)
+    return wrapper, records
+
+
+def capture_generation(wrapper: Any, monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
+    """Observe real wrapper routing at the model-computation boundary."""
+    calls = []
+
+    def infer(gen_kwargs: dict[str, Any], is_img2img: bool) -> dict[str, Any]:
+        calls.append({**gen_kwargs, "guider": wrapper.pipe.components.get("guider")})
+        return {"images": [Image.new("RGB", (gen_kwargs["width"], gen_kwargs["height"]))]}
+
+    monkeypatch.setattr(wrapper, "run_inference", infer)
+    return calls
+
+
+@pytest.mark.parametrize(
+    "module,class_name,config,graph,steps,guidance,image_workflow,mask",
+    [
+        ("flux1", "Flux1PipelineWrapper", {}, "FluxAutoBlocks", 28, 3.5, "image2image", False),
+        (
+            "flux1",
+            "Flux1PipelineWrapper",
+            {"repo": "black-forest-labs/FLUX.1-schnell"},
+            "FluxAutoBlocks",
+            4,
+            0.0,
+            "image2image",
+            False,
+        ),
+        (
+            "flux2",
+            "Flux2PipelineWrapper",
+            {},
+            "Flux2AutoBlocks",
+            28,
+            4.0,
+            "image_conditioned",
+            False,
+        ),
+        (
+            "flux2_klein",
+            "Flux2KleinPipelineWrapper",
+            {},
+            "Flux2KleinAutoBlocks",
+            4,
+            1.0,
+            "image_conditioned",
+            False,
+        ),
+        (
+            "flux2_klein",
+            "Flux2KleinPipelineWrapper",
+            {"repo": "black-forest-labs/FLUX.2-klein-base-9B"},
+            "Flux2KleinBaseAutoBlocks",
+            50,
+            4.0,
+            "image_conditioned",
+            False,
+        ),
+        ("qwen", "QwenPipelineWrapper", {}, "QwenImageAutoBlocks", 8, 4.0, "image2image", True),
+        ("krea2", "Krea2PipelineWrapper", {}, "Krea2TurboAutoBlocks", 8, 0.0, "image2image", True),
+        (
+            "krea2",
+            "Krea2PipelineWrapper",
+            {"repo": "krea/Krea-2-Raw"},
+            "Krea2AutoBlocks",
+            28,
+            4.5,
+            "image2image",
+            True,
+        ),
+        ("zimage", "ZImagePipelineWrapper", {}, "ZImageAutoBlocks", 9, 0.0, "image2image", True),
+    ],
+)
+def test_hosted_family_workflows(
+    monkeypatch: pytest.MonkeyPatch,
+    module: str,
+    class_name: str,
+    config: dict[str, Any],
+    graph: str,
+    steps: int,
+    guidance: float,
+    image_workflow: str,
+    mask: bool,
+) -> None:
+    """Recipes choose real graphs and consumer-visible defaults without loading weights."""
+    import importlib
+
+    from oneiro.pipelines.modular import ModularPipelineWrapper
+
+    cls = getattr(importlib.import_module(f"oneiro.pipelines.{module}"), class_name)
+    assert issubclass(cls, ModularPipelineWrapper)
+    wrapper, _ = load_hosted(cls, monkeypatch, config)
+    default_repos = {
+        "flux1": "black-forest-labs/FLUX.1-dev",
+        "flux2": "diffusers/FLUX.2-dev-bnb-4bit",
+        "flux2_klein": "black-forest-labs/FLUX.2-klein-9B",
+        "qwen": "Qwen/Qwen-Image",
+        "krea2": "krea/Krea-2-Turbo",
+        "zimage": "Tongyi-MAI/Z-Image-Turbo",
+    }
+    assert wrapper.pipe._pretrained_model_name_or_path == config.get("repo", default_repos[module])
+    assert type(wrapper.blocks).__name__ == graph
+    assert wrapper.validate_request(has_image=True) == image_workflow
+    assert wrapper.supports_inpaint is mask
+    calls = capture_generation(wrapper, monkeypatch)
+    result = wrapper.generate("a cat", seed=7, width=64, height=32)
+    assert result.steps == steps
+    assert result.guidance_scale == guidance
+    assert result.image.size == (64, 32)
+    assert calls[0]["generator"].initial_seed() == 7
+    assert calls[0]["num_inference_steps"] == steps
+    if calls[0]["guider"] is not None and calls[0]["guider"].config.enabled:
+        assert calls[0]["guider"].config.guidance_scale == guidance
+    elif "guidance_scale" in calls[0]:
+        assert calls[0]["guidance_scale"] == guidance
+    wrapper.generate("a cat", width=64, height=32, init_image=image_bytes())
+    assert isinstance(calls[-1]["image"], Image.Image)
+    assert ("strength" in calls[-1]) is (image_workflow == "image2image")
+    if image_workflow == "image_conditioned":
+        with pytest.raises(ValueError, match="strength"):
+            wrapper.generate("a cat", init_image=image_bytes(), strength=0.5)
+    manager = wrapper.components_manager
+    wrapper.unload()
+    assert manager.components == {}
+    assert wrapper.pipe is None
+
+
+@pytest.mark.parametrize(
+    "module,class_name,config",
+    [
+        ("qwen", "QwenPipelineWrapper", {"variant": "image"}),
+        ("krea2", "Krea2PipelineWrapper", {"variant": "raw"}),
+        ("flux2_klein", "Flux2KleinPipelineWrapper", {"variant": "base"}),
+    ],
+)
+def test_guidance_override_does_not_leak(
+    monkeypatch: pytest.MonkeyPatch, module: str, class_name: str, config: dict[str, Any]
+) -> None:
+    """Each CFG request copies the native guider and cleanup restores its identity."""
+    import importlib
+
+    cls = getattr(importlib.import_module(f"oneiro.pipelines.{module}"), class_name)
+    # Explicit variant metadata is valid for a custom source, not a conflicting official one.
+    wrapper, _ = load_hosted(cls, monkeypatch, {"repo": "custom/model", **config})
+    original = wrapper.pipe.guider
+    calls = capture_generation(wrapper, monkeypatch)
+    wrapper.generate("test", guidance_scale=2.5)
+    assert calls[0]["guider"] is not original
+    assert calls[0]["guider"].config.guidance_scale == 2.5
+    assert wrapper.pipe.guider is original
+    wrapper.generate("test")
+    assert calls[1]["guider"].config.guidance_scale == wrapper.default_guidance_scale
+    assert wrapper.pipe.guider is original
+
+
+@pytest.mark.parametrize(
+    "module,class_name",
+    [
+        ("flux1", "Flux1PipelineWrapper"),
+        ("flux2", "Flux2PipelineWrapper"),
+        ("flux2_klein", "Flux2KleinPipelineWrapper"),
+        ("qwen", "QwenPipelineWrapper"),
+        ("krea2", "Krea2PipelineWrapper"),
+        ("zimage", "ZImagePipelineWrapper"),
+    ],
+)
+def test_unsupported_embedding_is_not_ignored(
+    monkeypatch: pytest.MonkeyPatch, module: str, class_name: str
+) -> None:
+    """Explicit named/inline embedding requests cannot become decorative mixins/warnings."""
+    import importlib
+
+    cls = getattr(importlib.import_module(f"oneiro.pipelines.{module}"), class_name)
+    with pytest.raises(ValueError, match="embeddings"):
+        load_hosted(cls, monkeypatch, {"embeddings": ["missing"]})
+    with pytest.raises(ValueError, match="embeddings"):
+        load_hosted(cls, monkeypatch, {"inline_embeddings": [{"path": "unused"}]})
+    with pytest.raises(ValueError, match="embeddings"):
+        load_hosted(cls, monkeypatch, full_config={"embeddings": {"auto_load": ["style"]}})
+
+
+@pytest.mark.parametrize(
+    "module,class_name",
+    [
+        ("flux1", "Flux1PipelineWrapper"),
+        ("flux2", "Flux2PipelineWrapper"),
+        ("flux2_klein", "Flux2KleinPipelineWrapper"),
+        ("qwen", "QwenPipelineWrapper"),
+        ("krea2", "Krea2PipelineWrapper"),
+        ("zimage", "ZImagePipelineWrapper"),
+    ],
+)
+def test_hosted_placement_configuration(
+    monkeypatch: pytest.MonkeyPatch, module: str, class_name: str
+) -> None:
+    """All recipes retain offload overrides without installing classic pipeline hooks."""
+    import importlib
+
+    from oneiro.device import OffloadMode
+
+    cls = getattr(importlib.import_module(f"oneiro.pipelines.{module}"), class_name)
+    wrapper, _ = load_hosted(
+        cls,
+        monkeypatch,
+        {
+            "cpu_offload": False,
+            "offload_type": "sequential",
+            "group_offload_type": "block_level",
+            "group_offload_use_stream": False,
+            "group_offload_num_blocks_per_group": 2,
+        },
+    )
+    assert wrapper.policy.offload == OffloadMode.NEVER
+    assert wrapper.policy.offload_type == OffloadType.SEQUENTIAL
+    assert wrapper.policy.group_offload_type == "block_level"
+    assert wrapper.policy.group_offload_use_stream is False
+    assert wrapper.policy.group_offload_num_blocks_per_group == 2
+    assert wrapper.components_manager.model_hooks is None
+    assert all(not hasattr(value, "_hf_hook") for value in wrapper.pipe.components.values())
