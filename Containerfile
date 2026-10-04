@@ -9,16 +9,20 @@ COPY --from=uv /uv /uvx /bin/
 
 # Install dependencies first for caching (only rebuilds when pyproject.toml changes)
 COPY pyproject.toml README.md LICENSE ./
-RUN python -c 'from importlib.metadata import version; print("torch==" + version("torch"))' > /app/torch-constraints.txt \
+# This disposable image uses distro-managed Python; retain its existing Torch wheel.
+# spin is unused development tooling whose Click cap conflicts with Hugging Face Hub.
+RUN python -c 'from importlib.metadata import version; print("torch==" + version("torch"))' > /app/runtime-constraints.txt \
+    && uv pip uninstall --system --break-system-packages spin \
     && mkdir -p src/oneiro \
     && touch src/oneiro/__init__.py \
-    && uv pip install --system --no-cache --constraint /app/torch-constraints.txt .
+    && uv pip install --system --break-system-packages --no-cache --constraint /app/runtime-constraints.txt .
 
 # Copy source and reinstall without deps (fast rebuild on source changes)
 COPY config.toml .
 COPY src/ src/
 
-RUN uv pip install --system --no-cache --no-deps .
+# Discard the bootstrap wheel's build cache before installing the real package initializer.
+RUN rm -rf /app/build && uv pip install --system --break-system-packages --no-cache --no-deps .
 
 # Environment configuration
 ENV HF_HOME=/data/huggingface

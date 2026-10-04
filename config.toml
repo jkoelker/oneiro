@@ -19,7 +19,7 @@ guidance_scale = 0.0
 [models.flux2-dev]
 type = "flux2"
 repo = "diffusers/FLUX.2-dev-bnb-4bit"
-quantized = true
+# Quantization comes from the repository's component configs, not a boolean toggle.
 cpu_offload = true
 offload_type = "group"          # "group" | "model" | "sequential"
 group_offload_type = "leaf_level"
@@ -60,11 +60,11 @@ transformer = "unsloth/Qwen-Image-GGUF:qwen-image-Q4_K_S.gguf"
 lora = "lightx2v/Qwen-Image-Lightning"
 lora_weights = "Qwen-Image-Lightning-8steps-V1.0.safetensors"
 cpu_offload = true
-offload_type = "group"          # Dedicated CivitAI Qwen checkpoints can still use sequential_cpu_offload
+offload_type = "group"          # Use "sequential" explicitly for lower-memory checkpoint loading
 group_offload_type = "leaf_level"
 steps = 8
 true_cfg_scale = 1.3
-requires_negative = true
+# Negative prompts are optional native CFG inputs; no synthetic negative is inserted.
 
 [blacklist]
 words = ["loli", "shota", "child", "children", "minor", "underage"]
@@ -167,22 +167,28 @@ verify_hashes = true
 # =============================================================================
 #
 # CivitAI checkpoints can be loaded using the "civitai" pipeline type.
-# The system auto-detects the appropriate diffusers pipeline based on
-# the model's baseModel metadata from CivitAI.
+# The actual family and native recipe are resolved from CivitAI baseModel metadata.
+# Missing, unknown, and retired metadata is rejected; it never falls back to SDXL.
+# Local checkpoints require a known base_model. Remote metadata cannot be bypassed.
+# Custom variant-sensitive component repos require an explicit matching variant:
+# flux1: dev/schnell; flux2: dev; flux2-klein: distilled/base;
+# krea2: raw/turbo; qwen: image; zimage: turbo.
 #
 # Supported base models include:
-# - SD 1.5, SD 2.1 (512x512 default)
 # - SDXL 1.0, SDXL Turbo, SDXL Lightning, Pony, Illustrious (1024x1024)
-# - Qwen/Qwen-Image (1024x1024, 8 steps, true_cfg_scale 4.0)
+# - Qwen/Qwen-Image (1024x1024, 8 steps, guidance_scale 4.0)
 # - Flux.1 Dev, Flux.1 Schnell (1024x1024, no negative prompt)
-# - Flux.2 Klein 9B/4B (1024x1024, 4 steps, guidance 1.0)
+# - Flux.2; Flux.2 Klein 9B/4B (4 steps/1.0 distilled; 50 steps/4.0 base)
 # - SD 3, SD 3.5 Medium/Large (1024x1024)
 # - Z-Image/Z-Image Turbo (1024x1024, 9 steps, guidance 0.0)
-# - PixArt Alpha/Sigma, Kolors, Hunyuan DiT, AuraFlow
+# - Krea 2 (Turbo: 8 steps/0.0; Raw: 28 steps/4.5)
+# SD1/SD2, PixArt, Kolors, Hunyuan-DiT, Lumina, and AuraFlow are retired.
+# pipeline_class and sequential_cpu_offload overrides are no longer accepted.
+# /fetch writes civitai_model_id/civitai_version_id/component_repo/family/variant.
 #
 # SCHEDULER OPTIONS:
-# The scheduler controls the denoising process. Available options:
-#   - dpm++_karras: DPM++ with Karras sigmas (recommended for SD/SDXL/Pony)
+# Non-default scheduler overrides are supported only for SDXL-family checkpoints:
+#   - dpm++_karras: DPM++ with Karras sigmas (recommended for SDXL/Pony)
 #   - dpm++: DPM++ without Karras sigmas
 #   - euler_a: Euler Ancestral (good variety, slightly random)
 #   - euler: Euler (deterministic)
@@ -191,9 +197,9 @@ verify_hashes = true
 #   - default: Keep the model's built-in scheduler
 #
 # Defaults by model type:
-#   - SD/SDXL/Pony/Illustrious: dpm++_karras
+#   - SDXL/Pony/Illustrious: dpm++_karras
 #   - Turbo/Lightning/LCM/Hyper: default (keep optimized scheduler)
-#   - Flux/SD3/PixArt/etc: default (flow-based models)
+#   - FLUX/SD3/Qwen/Krea/Z-Image: default (native flow scheduler)
 #
 # Example 1: CivitAI checkpoint by model ID (downloads automatically)
 # [models.civitai-example]
@@ -201,38 +207,38 @@ verify_hashes = true
 # civitai_model_id = 12345        # Required: CivitAI model ID
 # civitai_version_id = 67890      # Optional: specific version (default: latest)
 # cpu_offload = true              # Optional: enable CPU offloading (default: true)
+# offload_type = "group"          # "group" | "model" | "sequential", also for Qwen
 #
-# Example 2: CivitAI checkpoint with base model override
+# Example 2: CivitAI checkpoint with sampling defaults
 # [models.pony-checkpoint]
 # type = "civitai"
 # civitai_model_id = 257749       # Pony Diffusion V6 XL
-# base_model = "Pony"             # Override auto-detection if needed
+# base_model = "Pony"             # Must match the actual remote family
 # steps = 25
 # guidance_scale = 7.0
 #
 # Example 3: Local checkpoint file (already downloaded)
 # [models.local-sdxl]
 # type = "civitai"
-# checkpoint_path = "~/.cache/civitai/models/my_model.safetensors"
+# checkpoint_path = "/path/to/my_model.safetensors"
 # base_model = "SDXL 1.0"         # Required when using local path
 #
 # Example 4: CivitAI checkpoint with LoRAs
 # [models.civitai-with-loras]
 # type = "civitai"
 # civitai_model_id = 12345
-# [[models.civitai-with-loras.loras]]
+# [[models.civitai-with-loras.inline_loras]]
 # source = "civitai"
 # id = 99999
 # weight = 0.8
 #
-# Example 5: Manual pipeline override (advanced)
-# [models.custom-pipeline]
+# Example 5: Local Krea Raw checkpoint with explicit component recipe
+# [models.local-krea-raw]
 # type = "civitai"
 # checkpoint_path = "/path/to/model.safetensors"
-# pipeline_class = "StableDiffusionXLPipeline"  # Manual override
-# steps = 30
-# guidance_scale = 5.0
-# supports_negative_prompt = true
+# base_model = "Krea 2"
+# component_repo = "krea/Krea-2-Raw"
+# variant = "raw"                 # Required for custom component repositories
 #
 # Example 6: CivitAI checkpoint with custom scheduler
 # [models.realistic-xl]
@@ -276,11 +282,9 @@ verify_hashes = true
 # # component_repo = "Qwen/Qwen-Image"
 # # single_file_config_repo = "Qwen/Qwen-Image"
 # # transformer_subfolder = "transformer"
-# # Qwen transformer-only checkpoints can be very large; by default they still use
-# # sequential CPU offload on CUDA unless offload_type is set explicitly.
+# # All families default to group offload on CUDA; choose sequential explicitly.
 # # qwen_transformer_dtype = "bfloat16"     # Optional explicit override
-# # sequential_cpu_offload = true           # Legacy toggle for the default Qwen behavior
-# # offload_type = "group"                  # Explicitly use group offload instead
+# # offload_type = "sequential"             # Lower-memory placement option
 # # group_offload_type = "leaf_level"       # "leaf_level" | "block_level"
 #
 # Example 10: FLUX.2 Klein CivitAI checkpoint (transformer-only single file)
