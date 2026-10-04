@@ -1,161 +1,53 @@
-"""FLUX.1 pipeline wrapper with CPU offloading."""
+"""Hosted FLUX.1 dev/schnell recipes over the released native workflows."""
 
 from typing import Any
 
-import torch
-from PIL import Image
+from diffusers import FluxAutoBlocks
 
-from oneiro.device import DevicePolicy
-from oneiro.pipelines.base import BasePipeline, GenerationResult
+from oneiro.pipelines.modular import ModularPipelineWrapper
 
 
-class Flux1PipelineWrapper(BasePipeline):
-    """Wrapper for FLUX.1 (dev/schnell variants).
+class Flux1PipelineWrapper(ModularPipelineWrapper):
+    """Use native text/img2img blocks and the selected model's sampling defaults."""
 
-    FLUX.1 uses:
-    - FluxPipeline from diffusers (inherits FluxLoraLoaderMixin for LoRA support)
-    - FluxTransformer2DModel (MMDiT architecture)
-    - T5-v1.1-XXL + CLIP ViT-L/14 text encoders
-    - AutoencoderKL VAE
-    - FlowMatchEulerDiscreteScheduler
+    family = "flux1"
+    default_steps = 28
+    default_guidance_scale = 3.5
+    variant = "dev"
 
-    LoRA Support:
-    - FluxPipeline inherits from FluxLoraLoaderMixin (not the deprecated LoraLoaderMixin)
-    - LoRA weights are loaded via self.pipe.load_lora_weights() which uses the
-      FLUX-specific mixin from diffusers.loaders.lora_pipeline
+    def workflow_inputs(self, workflow: str) -> set[str]:
+        """Schnell lacks guidance embeddings despite the common graph's input slot."""
+        inputs = super().workflow_inputs(workflow)
+        if self.variant == "schnell":
+            inputs.discard("guidance_scale")
+        return inputs
 
-    Variants:
-    - FLUX.1-dev: High-quality distilled (steps=28, guidance_scale=3.5)
-    - FLUX.1-schnell: Fast 4-step generation (steps=4, guidance_scale=0.0)
-    """
+    def validate_config(
+        self, model_config: dict[str, Any], full_config: dict[str, Any] | None = None
+    ) -> None:
+        """Resolve a known variant and actual placement without loading components."""
+        repo = model_config.get("repo", "black-forest-labs/FLUX.1-dev")
+        known = {
+            "black-forest-labs/FLUX.1-dev": "dev",
+            "black-forest-labs/FLUX.1-schnell": "schnell",
+        }
+        variant = model_config.get("variant", known.get(repo))
+        if variant not in {"dev", "schnell"} or (repo in known and variant != known[repo]):
+            raise ValueError("FLUX.1 requires variant='dev' or 'schnell' matching the model")
+        if model_config.get("embeddings") or model_config.get("inline_embeddings"):
+            raise ValueError("FLUX.1 does not support textual inversion embeddings")
+        self.variant = variant
+        self.default_steps, self.default_guidance_scale = (
+            (28, 3.5) if variant == "dev" else (4, 0.0)
+        )
+        self._recipe_guidance_scale = self.default_guidance_scale
+        self._component_repo, self.blocks = repo, FluxAutoBlocks()
+        super().validate_config(model_config, full_config)
 
     def load(self, model_config: dict[str, Any], full_config: dict[str, Any] | None = None) -> None:
-        """Load FLUX.1 model with optional CPU offloading and LoRA support.
-
-        Args:
-            model_config: Configuration dict with keys:
-                - repo: HuggingFace repo ID (default: "black-forest-labs/FLUX.1-dev")
-                - cpu_offload: Enable CPU offloading (default: True)
-                - offload_type: Offload implementation: group, model, or sequential
-                - cpu_utilization: Fraction of CPU cores to use (default: 0.75)
-                - lora: LoRA repository ID (optional)
-                - lora_weights: LoRA weights filename (optional, required if lora is set)
-        """
-        from diffusers import FluxPipeline
-
-        repo = model_config.get("repo", "black-forest-labs/FLUX.1-dev")
-        cpu_offload = model_config.get("cpu_offload", True)
-        offload_type = model_config.get("offload_type", "group")
-        group_offload_type = model_config.get("group_offload_type", "leaf_level")
-        group_offload_use_stream = model_config.get("group_offload_use_stream", True)
-        group_offload_num_blocks_per_group = model_config.get("group_offload_num_blocks_per_group")
-        cpu_utilization = model_config.get("cpu_utilization", 0.75)
-
-        print(f"Loading FLUX.1 from {repo}")
-
-        # Configure CPU threading for text encoder
-        self._configure_cpu_threads(cpu_utilization)
-
-        self.policy = DevicePolicy.auto_detect(
-            cpu_offload=cpu_offload,
-            offload_type=offload_type,
-            group_offload_type=group_offload_type,
-            group_offload_use_stream=group_offload_use_stream,
-            group_offload_num_blocks_per_group=group_offload_num_blocks_per_group,
-        )
-
-        print("  Creating pipeline...")
-        self.pipe = FluxPipeline.from_pretrained(
-            repo,
-            torch_dtype=self.policy.dtype,
-        )
-
-        # Memory optimization for large T5 encoder and high-res VAE decoding
+        """Load the preflighted native variant through shared placement."""
+        self.validate_config(model_config, full_config)
+        self._configure_cpu_threads(model_config.get("cpu_utilization", 0.75))
+        self.initialize_pipeline(self._component_repo, self.blocks)
         self.pipe.vae.enable_tiling()
         self.pipe.vae.enable_slicing()
-
-        # Load LoRA if specified
-        lora_repo = model_config.get("lora")
-        lora_weights = model_config.get("lora_weights")
-
-        if lora_repo and lora_weights:
-            print(f"Loading LoRA from {lora_repo}")
-            self.pipe.load_lora_weights(lora_repo, weight_name=lora_weights)
-
-        self.policy.apply_to_pipeline(self.pipe)
-
-        print(f"FLUX.1 loaded from {repo}")
-
-    def generate(
-        self,
-        prompt: str,
-        negative_prompt: str | None = None,
-        width: int = 1024,
-        height: int = 1024,
-        seed: int = -1,
-        steps: int = 28,
-        guidance_scale: float = 3.5,
-        **kwargs: Any,
-    ) -> GenerationResult:
-        """Generate image with FLUX.1.
-
-        Args:
-            prompt: Text prompt for generation.
-            negative_prompt: Not used by FLUX.1 but accepted for API compatibility.
-            width: Output image width (default: 1024).
-            height: Output image height (default: 1024).
-            seed: Random seed (-1 for random).
-            steps: Number of inference steps (default: 28 for dev, 4 for schnell).
-            guidance_scale: Guidance scale (default: 3.5 for dev, 0.0 for schnell).
-            **kwargs: Additional parameters (init_image, strength for img2img).
-
-        Returns:
-            GenerationResult with generated image and metadata.
-        """
-        return super().generate(
-            prompt=prompt,
-            negative_prompt=negative_prompt,
-            width=width,
-            height=height,
-            seed=seed,
-            steps=steps,
-            guidance_scale=guidance_scale,
-            **kwargs,
-        )
-
-    def build_generation_kwargs(
-        self,
-        prompt: str,
-        negative_prompt: str | None,  # Not used by FLUX.1 but accepted for API compatibility
-        width: int,
-        height: int,
-        steps: int,
-        guidance_scale: float,
-        generator: torch.Generator,
-        init_image: Image.Image | None,
-        strength: float,
-        **kwargs: Any,
-    ) -> dict[str, Any]:
-        """Build FLUX.1 generation kwargs. Adds max_sequence_length=512."""
-        if init_image:
-            print(f"FLUX.1 img2img: '{prompt[:50]}...' strength={strength}")
-            return {
-                "prompt": prompt,
-                "image": init_image,
-                "strength": strength,
-                "num_inference_steps": steps,
-                "guidance_scale": guidance_scale,
-                "generator": generator,
-                "max_sequence_length": 512,
-            }
-        else:
-            print(f"FLUX.1 generating: '{prompt[:50]}...'")
-            return {
-                "prompt": prompt,
-                "height": height,
-                "width": width,
-                "num_inference_steps": steps,
-                "guidance_scale": guidance_scale,
-                "generator": generator,
-                "max_sequence_length": 512,
-            }

@@ -1,6 +1,14 @@
 """Tests for bot helper functions."""
 
+import asyncio
+import io
+import json
+import socket
+import threading
+import zlib
 from collections.abc import Callable
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -8,10 +16,14 @@ import discord
 import httpx
 import pytest
 import respx
+import torch
 from discord.webhook.async_ import handle_message_parameters
+from PIL import Image
 
 from oneiro.civitai import CivitaiClient, CivitaiError, ModelVersion
+from oneiro.config import Config
 from oneiro.discord.commands import (
+    MAX_DREAM_ATTACHMENT_BYTES,
     get_generation_defaults,
     is_krea2_base_model,
     krea2_component_repo,
@@ -23,14 +35,30 @@ from oneiro.discord.handlers import (
     create_dream_callbacks,
     format_exception_response,
 )
-from oneiro.pipelines.civitai_checkpoint import get_krea2_checkpoint_precision
-from oneiro.queue import QueueStatus
+from oneiro.lora_detector import AutoLoraDetector
+from oneiro.pipelines import GenerationResult, LoraConfig, LoraSource, PipelineManager
+from oneiro.pipelines.civitai_checkpoint import CivitaiCheckpointPipeline
+from oneiro.pipelines.krea2_checkpoint import get_krea2_checkpoint_precision
+from oneiro.queue import GenerationQueue, QueueStatus
 from oneiro.services.generation import (
     MAX_LORA_WEIGHT,
     MIN_LORA_WEIGHT,
+    LoraResolutionResult,
     parse_lora_param,
     validate_lora_weight,
 )
+
+
+@pytest.fixture(autouse=True)
+def offline_commands(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Forbid live Discord, CivitAI, or model-source connections in command tests."""
+
+    def disallow_connection(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("Network access is forbidden in the command gate")
+
+    monkeypatch.setattr(socket.socket, "connect", disallow_connection)
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    monkeypatch.setenv("TRANSFORMERS_OFFLINE", "1")
 
 
 def _register_test_commands() -> dict[str, Any]:
@@ -47,6 +75,780 @@ def _register_test_commands() -> dict[str, Any]:
     bot.slash_command.side_effect = slash_command
     register_commands(bot)
     return commands
+
+
+async def _dream_context(base_model: str = "Krea 2", **recipe: Any) -> Any:
+    """Use real metadata-only workflow declarations; never load weights or Discord."""
+    profile = {"type": "civitai", "checkpoint_path": "unused", "base_model": base_model, **recipe}
+    pipeline = CivitaiCheckpointPipeline()
+    profile = await pipeline.resolve_config(profile, None)
+    config = MagicMock()
+    config.get.side_effect = lambda *keys, default=None: (
+        profile if keys == ("models", "submitted-model") else {}
+    )
+    manager = PipelineManager(config)
+    manager.pipeline = pipeline
+    manager.current_model = "submitted-model"
+    queue = GenerationQueue()
+    queue.add = MagicMock(wraps=queue.add)
+    message = MagicMock()
+    message.add_reaction = AsyncMock()
+    message.edit = AsyncMock()
+    ctx = MagicMock()
+    ctx.defer = AsyncMock()
+    ctx.followup.send = AsyncMock(return_value=message)
+    ctx.bot.pipeline_manager = manager
+    ctx.bot.config = config
+    ctx.bot.generation_queue = queue
+    ctx.bot.content_filter = None
+    ctx.bot.civitai_client = None
+    ctx.bot.lora_detector = None
+    return ctx
+
+
+def _attachment(contents: bytes = b"image", **metadata: Any) -> Any:
+    """Represent only Discord's external attachment boundary."""
+    attachment = SimpleNamespace(size=len(contents), filename="image.png", content_type="image/png")
+    for key, value in metadata.items():
+        setattr(attachment, key, value)
+    attachment.read = AsyncMock(return_value=contents)
+    return attachment
+
+
+def _image_bytes(format: str = "PNG") -> bytes:
+    """Encode a bounded local upload fixture."""
+    buffer = io.BytesIO()
+    Image.new("RGB", (8, 8), "blue").save(buffer, format=format)
+    return buffer.getvalue()
+
+
+def _model_context(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
+    """Keep actual native schedulers and manager ownership; replace only model assets."""
+    from tests.test_civitai_checkpoint import checkpoint_wrapper
+
+    pipeline, profile, components = checkpoint_wrapper(tmp_path, monkeypatch)
+    pipeline.load(profile)
+    profiles = {name: {"type": "civitai", **profile} for name in ("pony", "new", "third")}
+    config = MagicMock(data={"models": profiles}, state_path=None)
+    config.get.side_effect = lambda *keys, default=None: (
+        profiles[keys[1]] if len(keys) == 2 and keys[0] == "models" else default
+    )
+    manager = PipelineManager(config)
+    manager.pipeline, manager.current_model = pipeline, "pony"
+
+    def load(owner: CivitaiCheckpointPipeline, *args: Any) -> None:
+        owner.initialize_pipeline(profile["component_repo"], owner.blocks, components)
+
+    monkeypatch.setattr(CivitaiCheckpointPipeline, "load", load)
+    monkeypatch.setattr(
+        "oneiro.pipelines.civitai_checkpoint.get_weighted_text_embeddings_sdxl",
+        lambda *args, **kwargs: (torch.ones(1),) * 4,
+    )
+    ctx = MagicMock()
+    ctx.bot.pipeline_manager, ctx.bot.config = manager, config
+    ctx.defer, ctx.respond = AsyncMock(), AsyncMock()
+    ctx.followup.send = AsyncMock(return_value=MagicMock(edit=AsyncMock()))
+    return ctx
+
+
+@pytest.mark.parametrize("fail_assets", [False, True], ids=["successful-assets", "failing-assets"])
+async def test_model_hosted_scheduler_rejects_before_switch_assets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fail_assets: bool
+) -> None:
+    """The registered command must preserve a usable model even if target assets would fail."""
+    from diffusers import ModularPipeline
+    from diffusers.modular_pipelines.modular_pipeline_utils import ComponentSpec
+
+    from oneiro.pipelines.qwen import QwenPipelineWrapper
+    from tests.test_pipelines_modular import capture_generation, load_hosted
+
+    ctx = _model_context(tmp_path, monkeypatch)
+    manager = ctx.bot.pipeline_manager
+    old = manager.pipeline
+    calls = capture_generation(old, monkeypatch)
+    profile = {"type": "qwen", "cpu_offload": False}
+    ctx.bot.config.data["models"]["qwen"] = profile
+    # Install only source/component asset doubles; keep the actual Qwen loader and scheduler.
+    prepared, records = load_hosted(QwenPipelineWrapper, monkeypatch, profile)
+    prepared.unload()
+    records["spec_loads"].clear()
+    component_load = ComponentSpec.load
+
+    def load(spec: ComponentSpec, **kwargs: Any) -> Any:
+        if fail_assets:
+            records["spec_loads"].append(spec.name)
+            raise OSError("deliberate asset failure")
+        return component_load(spec, **kwargs)
+
+    monkeypatch.setattr(ComponentSpec, "load", load)
+    scheduler = old.pipe.scheduler
+    source = MagicMock(wraps=ModularPipeline._load_pipeline_config.__func__)
+    try:
+        with (
+            patch.object(old, "unload", wraps=old.unload) as unload,
+            patch.object(old.pipe, "update_components", wraps=old.pipe.update_components) as update,
+            patch.object(
+                ModularPipeline,
+                "_load_pipeline_config",
+                new=classmethod(source),
+            ),
+            patch("oneiro.pipelines.resolve_lora_path") as lora,
+            patch("oneiro.pipelines.resolve_embedding_path") as embedding,
+        ):
+            await _register_test_commands()["model"](ctx, "qwen", scheduler="euler")
+            messages = [str(call) for call in ctx.followup.send.await_args_list]
+            assert any("Scheduler override is not supported" in text for text in messages), messages
+            unload.assert_not_called()
+            source.assert_not_called()
+            update.assert_not_called()
+            lora.assert_not_awaited()
+            embedding.assert_not_awaited()
+            assert records["spec_loads"] == []
+            assert manager.pipeline is old and manager.current_model == "pony"
+            assert old.pipe.scheduler is scheduler
+        assert (await manager.generate("still usable")).model_name == "pony"
+        assert len(calls) == 1
+        ctx.defer.assert_awaited_once()
+        ctx.bot.config.set.assert_not_called()
+    finally:
+        if manager.pipeline:
+            manager.pipeline.unload()
+        if old.pipe:
+            old.unload()
+
+
+@pytest.mark.parametrize("target", ["pony", "new"], ids=["already-active", "post-load"])
+@pytest.mark.parametrize("cancel_generation", [False, True])
+async def test_model_scheduler_waits_for_owned_inference(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, target: str, cancel_generation: bool
+) -> None:
+    """Both real command branches must wait for inference and its scheduler restoration."""
+    from diffusers import EulerDiscreteScheduler
+
+    ctx = _model_context(tmp_path, monkeypatch)
+    manager = ctx.bot.pipeline_manager
+    old = manager.pipeline
+    profile = old.pipe.scheduler
+    started, release = threading.Event(), threading.Event()
+
+    def inference(values: dict[str, Any], is_img2img: bool) -> dict[str, Any]:
+        started.set()
+        assert release.wait(10)
+        return {"images": [Image.new("RGB", (32, 32))]}
+
+    monkeypatch.setattr(old, "run_inference", inference)
+    generation = asyncio.create_task(manager.generate("positive", scheduler="ddim"))
+    command = None
+    try:
+        assert await asyncio.to_thread(started.wait, 10)
+        owned_scheduler = old.pipe.scheduler
+        if cancel_generation:
+            generation.cancel()
+            await asyncio.sleep(0)
+            generation.cancel()
+        command = asyncio.create_task(
+            _register_test_commands()["model"](ctx, target, scheduler="euler")
+        )
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert manager._lock.locked() and not command.done()
+        assert old.pipe.scheduler is owned_scheduler
+        release.set()
+        if cancel_generation:
+            with pytest.raises(asyncio.CancelledError):
+                await generation
+        else:
+            await generation
+        await command
+        assert manager.current_model == target
+        assert isinstance(manager.pipeline.pipe.scheduler, EulerDiscreteScheduler)
+        if target == "pony":
+            assert manager.pipeline.pipe.scheduler is not profile
+        ctx.defer.assert_awaited_once()
+    finally:
+        release.set()
+        await asyncio.gather(
+            *[task for task in (generation, command) if task], return_exceptions=True
+        )
+        if manager.pipeline:
+            manager.pipeline.unload()
+
+
+@pytest.mark.parametrize("target", ["pony", "new"], ids=["already-active", "post-load"])
+async def test_cancelled_model_scheduler_drains_worker_before_switch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, target: str
+) -> None:
+    """Repeated command cancellation cannot release ownership while scheduler setup is running."""
+    ctx = _model_context(tmp_path, monkeypatch)
+    manager = ctx.bot.pipeline_manager
+    started, release = threading.Event(), threading.Event()
+    original = CivitaiCheckpointPipeline.configure_scheduler
+    loop_thread = threading.get_ident()
+
+    def configure(owner: CivitaiCheckpointPipeline, name: str | None) -> None:
+        original(owner, name)
+        if name == "euler":
+            started.set()
+            if threading.get_ident() != loop_thread:
+                assert release.wait(10)
+
+    monkeypatch.setattr(CivitaiCheckpointPipeline, "configure_scheduler", configure)
+    command = asyncio.create_task(
+        _register_test_commands()["model"](ctx, target, scheduler="euler")
+    )
+    switch = None
+    try:
+        assert await asyncio.to_thread(started.wait, 10)
+        command.cancel()
+        await asyncio.sleep(0)
+        command.cancel()
+        switch = asyncio.create_task(manager.load_model("third"))
+        await asyncio.sleep(0)
+        assert manager._lock.locked() and not command.done() and not switch.done()
+        assert manager.current_model == target
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await command
+        await switch
+        assert manager.current_model == "third"
+    finally:
+        release.set()
+        await asyncio.gather(*[task for task in (command, switch) if task], return_exceptions=True)
+        if manager.pipeline:
+            manager.pipeline.unload()
+
+
+async def test_model_post_load_scheduler_cannot_mutate_a_competing_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Interleaving after load returns must never install the requested scheduler on another model."""
+    from diffusers import EulerDiscreteScheduler
+
+    ctx = _model_context(tmp_path, monkeypatch)
+    manager = ctx.bot.pipeline_manager
+    original = manager.load_model
+    loaded, release = asyncio.Event(), asyncio.Event()
+    targets = []
+
+    async def load(name: str, **kwargs: Any) -> None:
+        await original(name, **kwargs)
+        if name == "new":
+            targets.append(manager.pipeline.pipe.scheduler)
+            loaded.set()
+            await release.wait()
+
+    monkeypatch.setattr(manager, "load_model", load)
+    command = asyncio.create_task(_register_test_commands()["model"](ctx, "new", scheduler="euler"))
+    try:
+        await asyncio.wait_for(loaded.wait(), 10)
+        await manager.load_model("third")
+        competing = manager.pipeline.pipe.scheduler
+        release.set()
+        await command
+        assert manager.current_model == "third"
+        assert manager.pipeline.pipe.scheduler is competing
+        assert isinstance(targets[0], EulerDiscreteScheduler)
+    finally:
+        release.set()
+        await asyncio.gather(command, return_exceptions=True)
+        if manager.pipeline:
+            manager.pipeline.unload()
+
+
+async def test_model_active_branch_reloads_its_target_after_queued_switch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A command queued behind another switch must bind its override to its named model."""
+    from diffusers import EulerDiscreteScheduler
+
+    ctx = _model_context(tmp_path, monkeypatch)
+    manager = ctx.bot.pipeline_manager
+    started, release = threading.Event(), threading.Event()
+
+    def inference(values: dict[str, Any], is_img2img: bool) -> dict[str, Any]:
+        started.set()
+        assert release.wait(10)
+        return {"images": [Image.new("RGB", (32, 32))]}
+
+    monkeypatch.setattr(manager.pipeline, "run_inference", inference)
+    generation = asyncio.create_task(manager.generate("positive"))
+    switch = command = None
+    try:
+        assert await asyncio.to_thread(started.wait, 10)
+        switch = asyncio.create_task(manager.load_model("third"))
+        await asyncio.sleep(0)
+        command = asyncio.create_task(
+            _register_test_commands()["model"](ctx, "pony", scheduler="euler")
+        )
+        await asyncio.sleep(0)
+        assert manager.current_model == "pony" and not command.done()
+        release.set()
+        await generation
+        await switch
+        await command
+        assert manager.current_model == "pony"
+        assert isinstance(manager.pipeline.pipe.scheduler, EulerDiscreteScheduler)
+    finally:
+        release.set()
+        await asyncio.gather(
+            *[task for task in (generation, switch, command) if task], return_exceptions=True
+        )
+        if manager.pipeline:
+            manager.pipeline.unload()
+
+
+@pytest.mark.parametrize(
+    ("base_model", "inputs"),
+    [
+        ("Flux.2", {"mask": True, "image": True}),
+        ("SD 3.5", {"reference_image": True}),
+        ("SDXL 1.0", {"reference_image": True}),
+        ("Krea 2", {"mask": True}),
+        ("Krea 2", {"image": True, "reference_image": True}),
+        ("Krea 2", {"image": True, "mask": True, "reference_image": True}),
+        ("Krea 2", {"reference_image": True, "strength": 0.75}),
+        ("Flux.2", {"image": True, "strength": 0.75}),
+        ("Flux.2 Klein 4B", {"reference_image": True, "strength": 0.0}),
+        ("Krea 2", {"strength": 0.75}),
+        *[("Krea 2", {"image": True, "strength": value}) for value in (-0.1, 1.1, float("nan"))],
+    ],
+)
+async def test_dream_rejects_unsupported_inputs_before_io(
+    base_model: str, inputs: dict[str, Any]
+) -> None:
+    """Capability and mixed-input failures cannot download, resolve resources, or queue."""
+    commands = _register_test_commands()
+    ctx = await _dream_context(base_model)
+    attachments = {key: _attachment() for key in inputs if key != "strength"}
+    params = {**inputs, **attachments}
+    with patch("oneiro.discord.commands.resolve_loras", new_callable=AsyncMock) as resolve:
+        await commands["dream"](ctx, "prompt", **params)
+    ctx.defer.assert_awaited_once()
+    for attachment in attachments.values():
+        attachment.read.assert_not_awaited()
+    resolve.assert_not_awaited()
+    ctx.bot.generation_queue.add.assert_not_called()
+    failure = ctx.followup.send.await_args
+    assert failure.kwargs == {"ephemeral": True}
+    assert "❌" in failure.args[0]
+    assert "Traceback" not in failure.args[0]
+
+
+@pytest.mark.parametrize(
+    "settings,overrides,user,expected",
+    [
+        ({"steps": 17, "guidance_scale": 6.0}, {}, {}, (17, 6.0)),
+        (
+            {"steps": 17, "guidance_scale": 6.0},
+            {"steps": 21, "guidance_scale": 2.5},
+            {},
+            (21, 2.5),
+        ),
+        (
+            {"steps": 17, "guidance_scale": 6.0},
+            {"steps": 21, "guidance_scale": 2.5},
+            {"steps": 11, "guidance_scale": 0.0},
+            (11, 0.0),
+        ),
+        ({"steps": 17, "guidance_scale": 6.0}, {"guidance_scale": 0.0}, {}, (17, 0.0)),
+        ({"steps": 17, "guidance_scale": 6.0, "true_cfg_scale": 1.3}, {}, {}, (17, 1.3)),
+        (
+            {"steps": 17, "guidance_scale": 6.0, "true_cfg_scale": 1.3},
+            {"guidance_scale": 2.5},
+            {},
+            (17, 2.5),
+        ),
+        (
+            {"steps": 17, "guidance_scale": 6.0, "true_cfg_scale": 1.3},
+            {"guidance_scale": 2.5},
+            {"guidance_scale": 0.0},
+            (17, 0.0),
+        ),
+    ],
+)
+async def test_dream_parameter_precedence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    settings: dict[str, Any],
+    overrides: dict[str, Any],
+    user: dict[str, Any],
+    expected: tuple[int, float],
+) -> None:
+    """Actual execution resolves user > persistent override > model/Qwen defaults."""
+    ctx = await _dream_context("Qwen")
+    base = tmp_path / "config.toml"
+    base.write_text(
+        '[models.submitted-model]\ntype = "civitai"\nbase_model = "Qwen"\n'
+        + "\n".join(f"{key} = {value}" for key, value in settings.items())
+    )
+    config = Config(base, state_path=tmp_path / "state.json")
+    config.load()
+    for key, value in overrides.items():
+        config.set("model_overrides", "submitted-model", key, value=value)
+    ctx.bot.config = ctx.bot.pipeline_manager.config = config
+    from oneiro.pipelines.qwen import QwenPipelineWrapper
+    from tests.test_pipelines_modular import capture_generation, load_hosted
+
+    ctx.bot.pipeline_manager.pipeline, _ = load_hosted(QwenPipelineWrapper, monkeypatch)
+    capture_generation(ctx.bot.pipeline_manager.pipeline, monkeypatch)
+
+    await _register_test_commands()["dream"](ctx, "prompt", **user)
+
+    request = ctx.bot.generation_queue._pending_requests[0].request
+    result = await ctx.bot.pipeline_manager.generate(**request)
+    assert (result.steps, result.guidance_scale) == expected
+
+
+@pytest.mark.parametrize("target", ["pony", "new"])
+@pytest.mark.parametrize("guidance", [0.0, 2.5])
+async def test_model_persists_generation_overrides(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, target: str, guidance: float
+) -> None:
+    """Both actual /model branches persist overrides readable after a config reload."""
+    ctx = _model_context(tmp_path, monkeypatch)
+    profile = ctx.bot.config.get("models", "pony")
+    base = tmp_path / "config.toml"
+    base.write_text(
+        '[defaults]\nmodel = "pony"\n\n'
+        + "\n\n".join(
+            f"[models.{name}]\n"
+            + "\n".join(f"{key} = {json.dumps(value)}" for key, value in profile.items())
+            for name in ("pony", "new")
+        )
+    )
+    config = Config(base, state_path=tmp_path / "state.json")
+    config.load()
+    ctx.bot.config = ctx.bot.pipeline_manager.config = config
+
+    await _register_test_commands()["model"](ctx, target, steps=17, guidance_scale=guidance)
+
+    reloaded = Config(base, state_path=config.state_path)
+    reloaded.load()
+    assert reloaded.get("model_overrides", target) == {"steps": 17, "guidance_scale": guidance}
+    assert reloaded.get("defaults", "model") == target
+    assert ctx.bot.pipeline_manager.current_model == target
+
+
+@pytest.mark.parametrize("variant", ["raw", "turbo"])
+@pytest.mark.parametrize(
+    "inputs", [{}, {"image": True}, {"image": True, "mask": True}, {"reference_image": True}]
+)
+async def test_dream_admits_krea_image_mask_reference_workflows(
+    variant: str, inputs: dict[str, bool], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The one-reference UI forwards bytes and leaves omitted strength omitted."""
+    ctx = await _dream_context(
+        krea2_component_repo=f"krea/Krea-2-{variant.title()}", variant=variant
+    )
+    attachments = {key: _attachment(_image_bytes()) for key in inputs}
+    await _register_test_commands()["dream"](ctx, "prompt", **attachments)
+    request = ctx.bot.generation_queue._pending_requests[0].request
+    assert "strength" not in request
+    for option, key in (
+        ("image", "init_image"),
+        ("mask", "mask_image"),
+        ("reference_image", "reference_image"),
+    ):
+        assert (key in request) is (option in inputs)
+        if option in inputs:
+            assert request[key] == _image_bytes()
+            attachments[option].read.assert_awaited_once()
+    assert "steps" not in request and "guidance_scale" not in request
+    from tests.test_pipelines_modular import capture_generation
+
+    pipeline = ctx.bot.pipeline_manager.pipeline
+    pipeline.pipe = pipeline.blocks.init_pipeline()
+    capture_generation(pipeline, monkeypatch)
+    result = await ctx.bot.pipeline_manager.generate(**request)
+    assert (result.steps, result.guidance_scale) == ((28, 4.5) if variant == "raw" else (8, 0.0))
+
+
+@pytest.mark.parametrize("variant", ["raw", "turbo"])
+@pytest.mark.parametrize("has_mask", [False, True])
+@pytest.mark.parametrize("strength", [0.0, float("nan"), float("inf")])
+async def test_dream_rejects_invalid_denoising_strength_before_io(
+    variant: str, has_mask: bool, strength: float
+) -> None:
+    """Zero/nonfinite denoising strength cannot read attachments, resolve LoRAs, or queue."""
+    ctx = await _dream_context(component_repo=f"krea/Krea-2-{variant.title()}")
+    attachments = {"image": _attachment()}
+    if has_mask:
+        attachments["mask"] = _attachment()
+    with patch(
+        "oneiro.discord.commands.resolve_loras", new=AsyncMock(return_value=LoraResolutionResult())
+    ) as resolve:
+        await _register_test_commands()["dream"](ctx, "prompt", strength=strength, **attachments)
+    ctx.defer.assert_awaited_once()
+    for attachment in attachments.values():
+        attachment.read.assert_not_awaited()
+    resolve.assert_not_awaited()
+    ctx.bot.generation_queue.add.assert_not_called()
+    failure = ctx.followup.send.await_args
+    assert failure.kwargs == {"ephemeral": True}
+    assert "Strength" in failure.args[0] and "Traceback" not in failure.args[0]
+
+
+@pytest.mark.parametrize("variant", ["raw", "turbo"])
+@pytest.mark.parametrize("has_mask", [False, True])
+@pytest.mark.parametrize("strength", [0.45, 1.0])
+async def test_dream_preserves_explicit_strength(
+    variant: str, has_mask: bool, strength: float
+) -> None:
+    """Valid supplied denoising strengths survive image/mask queue admission unchanged."""
+    ctx = await _dream_context(component_repo=f"krea/Krea-2-{variant.title()}")
+    attachments = {"image": _attachment()}
+    if has_mask:
+        attachments["mask"] = _attachment()
+    await _register_test_commands()["dream"](ctx, "prompt", strength=strength, **attachments)
+    assert ctx.bot.generation_queue._pending_requests[0].request["strength"] == strength
+
+
+@pytest.mark.parametrize("base_model", ["Flux.2", "Flux.2 Klein 4B", "Flux.2 Klein 9B-base"])
+@pytest.mark.parametrize("option", ["image", "reference_image"])
+async def test_dream_conditioning_omits_strength(base_model: str, option: str) -> None:
+    """Conditioning must not acquire the img2img default at submission."""
+    ctx = await _dream_context(base_model)
+    await _register_test_commands()["dream"](ctx, "prompt", **{option: _attachment()})
+    request = ctx.bot.generation_queue._pending_requests[0].request
+    assert "strength" not in request
+    assert request["init_image" if option == "image" else "reference_image"] == b"image"
+
+
+async def test_dream_loras_use_resolved_checkpoint_family() -> None:
+    """A CivitAI source cannot hide Krea's family from actual LoRA auto-detection."""
+    ctx = await _dream_context()
+    lora = LoraConfig(
+        name="style",
+        source=LoraSource.LOCAL,
+        path="unused",
+        base_model="Krea 2",
+        trigger_words=["style"],
+    )
+    detector = AutoLoraDetector()
+    detector.register_loras([lora])
+    ctx.bot.lora_detector = detector
+    await _register_test_commands()["dream"](ctx, "style portrait")
+    assert ctx.bot.generation_queue._pending_requests[0].request["loras"] == [lora]
+
+
+async def test_dream_unloaded_manager_rejects_malformed_inputs_privately() -> None:
+    """Lazy recovery still rejects model-independent image conflicts before upload I/O."""
+    ctx = await _dream_context()
+    ctx.bot.pipeline_manager.pipeline = None
+    reference = _attachment()
+    image = _attachment()
+    await _register_test_commands()["dream"](ctx, "prompt", image=image, reference_image=reference)
+    ctx.defer.assert_awaited_once()
+    reference.read.assert_not_awaited()
+    image.read.assert_not_awaited()
+    ctx.bot.generation_queue.add.assert_not_called()
+    failure = ctx.followup.send.await_args
+    assert failure.kwargs["ephemeral"] is True
+    assert "Reference and initial images cannot be combined" in failure.args[0]
+
+
+@pytest.mark.parametrize("model_name", ["execution-model", None])
+@pytest.mark.parametrize(
+    ("workflow", "strength", "mode"),
+    [
+        ("text2image", None, ""),
+        ("image2image", 0.75, " (img2img)"),
+        ("inpainting", 0.2, " (inpaint)"),
+        ("reference", None, " (reference)"),
+        ("image_conditioned", None, " (image conditioned)"),
+    ],
+)
+async def test_completion_uses_actual_workflow_and_model(
+    workflow: str, strength: float | None, mode: str, model_name: str | None
+) -> None:
+    """Execution metadata overrides stale submission-time mode, strength, and model."""
+    ctx = await _dream_context()
+    context = DreamContext(
+        ctx=ctx,
+        prompt="prompt",
+        negative_prompt=None,
+        current_model="submitted-model",
+        scheduler=None,
+        lora_configs=[],
+        auto_detected_loras=[],
+        is_img2img=True,
+        is_inpaint=True,
+        strength=0.9,
+        pipeline_manager=ctx.bot.pipeline_manager,
+    )
+    result = GenerationResult(
+        Image.new("RGB", (8, 8)),
+        7,
+        "prompt",
+        None,
+        8,
+        8,
+        4,
+        1.0,
+        workflow=workflow,
+        strength=strength,
+        model_name=model_name,
+    )
+    await create_dream_callbacks(context)[2](result)
+    embed = ctx.followup.send.await_args.kwargs["embed"]
+    assert embed.title == "🎨 Dream Generated" + mode
+    fields = {field.name: field.value for field in embed.fields}
+    assert fields["Model"] == ("`execution-model`" if model_name else "`submitted-model`")
+    assert ("Strength" in fields) is (strength is not None)
+    if strength is not None:
+        assert fields["Strength"] == f"{strength:.2f}"
+
+
+@pytest.mark.parametrize("failure", ["size", "type", "read", "decode", "format", "pixels"])
+async def test_reference_attachment_trust_boundaries(
+    failure: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """References retain metadata checks and the real backend's byte/decode/pixel boundary."""
+    ctx = await _dream_context()
+    contents = (
+        b"not an image"
+        if failure == "decode"
+        else _image_bytes("GIF" if failure == "format" else "PNG")
+    )
+    if failure == "pixels":
+        # Give Pillow a real oversized IHDR without allocating a 16-megapixel fixture.
+        header = bytearray(contents)
+        header[16:20] = (4097).to_bytes(4, "big")
+        header[20:24] = (4096).to_bytes(4, "big")
+        header[29:33] = zlib.crc32(header[12:29]).to_bytes(4, "big")
+        contents = bytes(header)
+    reference = _attachment(contents)
+    if failure == "size":
+        reference.size = MAX_DREAM_ATTACHMENT_BYTES + 1
+    elif failure == "type":
+        reference.filename, reference.content_type = "notes.txt", "text/plain"
+    elif failure == "read":
+        reference.read.side_effect = RuntimeError("https://civitai.com/download?token=SUPER_SECRET")
+    with patch(
+        "oneiro.discord.commands.resolve_loras", new=AsyncMock(return_value=LoraResolutionResult())
+    ) as resolve:
+        await _register_test_commands()["dream"](ctx, "prompt", reference_image=reference)
+    if failure in {"size", "type", "read"}:
+        resolve.assert_not_awaited()
+        ctx.bot.generation_queue.add.assert_not_called()
+        if failure != "read":
+            reference.read.assert_not_awaited()
+            reason = "25 MiB or smaller" if failure == "size" else "PNG, JPEG, or WebP"
+            assert reason in ctx.followup.send.await_args.args[0]
+        else:
+            response = ctx.followup.send.await_args.kwargs
+            assert response["ephemeral"] is True
+            assert "SUPER_SECRET" not in response["content"]
+            assert "token=<redacted>" in response["content"]
+    else:
+        queue = ctx.bot.generation_queue
+        pipeline = ctx.bot.pipeline_manager.pipeline
+        pipeline.pipe = SimpleNamespace(components={"scheduler": object(), "guider": None})
+        inference = MagicMock(side_effect=AssertionError("Invalid image reached inference"))
+        monkeypatch.setattr(pipeline, "run_inference", inference)
+        queued = queue._pending_requests[0]
+        assert queued.request["reference_image"] == contents
+        assert "strength" not in queued.request
+        queue._pipeline = ctx.bot.pipeline_manager
+        await queue._process_request(queued)
+        inference.assert_not_called()
+        assert queue.size == 0 and queue.user_count(ctx.author.id) == 0
+        public = ctx.followup.send.await_args_list[0].args[0]
+        assert public.startswith("❌ Generation failed:")
+        assert "Traceback" not in public and "SUPER_SECRET" not in public
+        reason = {
+            "decode": "Invalid image attachment",
+            "format": "PNG, JPEG, or WebP",
+            "pixels": "maximum supported size is 4096×4096",
+        }[failure]
+        assert reason in public
+
+
+@pytest.mark.parametrize(
+    "base_model",
+    [
+        None,
+        "SD 1.5",
+        "SD 2.1",
+        "PixArt",
+        "Kolors",
+        "Hunyuan DiT",
+        "Lumina",
+        "AuraFlow",
+        "Unknown future model",
+    ],
+)
+async def test_fetch_rejects_unsupported_checkpoint_before_download(base_model: str | None) -> None:
+    """Removed, missing, and unknown checkpoint metadata cannot cause a download."""
+    ctx = await _dream_context()
+    ctx.bot.config.state_path = "state.toml"
+    version = ModelVersion.from_dict({"id": 2, "modelId": 1, "name": "v1", "baseModel": base_model})
+    model = SimpleNamespace(
+        type="Checkpoint", name="unsupported", latest_version=version, versions=[version]
+    )
+    ctx.bot.civitai_client = MagicMock()
+    ctx.bot.civitai_client.get_model = AsyncMock(return_value=model)
+    ctx.bot.civitai_client.download_model_version = AsyncMock()
+    await _register_test_commands()["fetch"](ctx, "https://civitai.com/models/1")
+    ctx.bot.civitai_client.download_model_version.assert_not_awaited()
+    ctx.bot.config.set.assert_not_called()
+    failure = ctx.followup.send.await_args
+    assert failure.kwargs == {"ephemeral": True}
+    assert "base model" in failure.args[0] and "Traceback" not in failure.args[0]
+
+
+@pytest.mark.parametrize(
+    ("base_model", "family", "repo", "variant", "steps", "guidance"),
+    [
+        ("Pony", "sdxl", "stabilityai/stable-diffusion-xl-base-1.0", None, 25, 7.0),
+        ("Illustrious", "sdxl", "stabilityai/stable-diffusion-xl-base-1.0", None, 25, 7.0),
+        ("Flux.1 S", "flux1", "black-forest-labs/FLUX.1-schnell", "schnell", 4, 0.0),
+        ("Flux.2", "flux2", "black-forest-labs/FLUX.2-dev", None, 50, 4.0),
+        (
+            "Flux.2 Klein 4B-base",
+            "flux2-klein",
+            "black-forest-labs/FLUX.2-klein-base-4B",
+            "base",
+            50,
+            4.0,
+        ),
+        (
+            "Flux.2 Klein 9B",
+            "flux2-klein",
+            "black-forest-labs/FLUX.2-klein-9B",
+            "distilled",
+            4,
+            1.0,
+        ),
+        ("Qwen", "qwen", "Qwen/Qwen-Image", "image", 8, 4.0),
+        ("Z-Image Turbo", "zimage", "Tongyi-MAI/Z-Image-Turbo", "turbo", 9, 0.0),
+        ("SD 3.5 Large Turbo", "sd3", "stabilityai/stable-diffusion-3.5-large-turbo", None, 4, 0.0),
+    ],
+)
+async def test_fetch_retained_profile_resolves_recipe(
+    base_model: str, family: str, repo: str, variant: str | None, steps: int, guidance: float
+) -> None:
+    """Fetched profiles carry the reviewed component recipe and can be resolved unchanged."""
+    ctx = await _dream_context()
+    ctx.bot.config.state_path = "state.toml"
+    version = ModelVersion.from_dict({"id": 2, "modelId": 1, "name": "v1", "baseModel": base_model})
+    model = SimpleNamespace(
+        type="Checkpoint", name="retained", latest_version=version, versions=[version]
+    )
+    ctx.bot.civitai_client = MagicMock()
+    ctx.bot.civitai_client.get_model = AsyncMock(return_value=model)
+    ctx.bot.civitai_client.download_model_version = AsyncMock(return_value="local.safetensors")
+    await _register_test_commands()["fetch"](ctx, "https://civitai.com/models/1")
+    profile = ctx.bot.config.set.call_args.kwargs["value"]
+    assert profile["base_model"] == base_model
+    assert profile["component_repo"] == repo and profile["family"] == family
+    assert profile.get("variant") == variant
+    assert (profile["steps"], profile["guidance_scale"]) == (steps, guidance)
+    assert profile["civitai_model_id"] == 1 and profile["civitai_version_id"] == 2
+    assert not {"pipeline_class", "sequential_cpu_offload"} & profile.keys()
+    pipeline = CivitaiCheckpointPipeline()
+    resolved = await pipeline.resolve_config(profile, None)
+    assert resolved["component_repo"] == repo and resolved["variant"] == variant
 
 
 def test_short_exception_response_omits_file_and_is_valid_for_pycord():
@@ -336,11 +1138,7 @@ async def test_image_read_error_includes_traceback():
     error = RuntimeError("image exploded")
     image = MagicMock(filename="image.png", content_type="image/png", size=1)
     image.read = AsyncMock(side_effect=error)
-    ctx = MagicMock()
-    ctx.defer = AsyncMock()
-    ctx.followup.send = AsyncMock()
-    ctx.bot.content_filter = None
-    ctx.bot.config = None
+    ctx = await _dream_context()
 
     await commands["dream"](ctx, "prompt", image=image)
 
@@ -359,12 +1157,7 @@ async def test_mask_read_error_includes_traceback():
     image.read = AsyncMock(return_value=b"image")
     mask = MagicMock(filename="mask.png", content_type="image/png", size=1)
     mask.read = AsyncMock(side_effect=error)
-    ctx = MagicMock()
-    ctx.defer = AsyncMock()
-    ctx.followup.send = AsyncMock()
-    ctx.bot.content_filter = None
-    ctx.bot.config = None
-    ctx.bot.pipeline_manager.pipeline.supports_inpaint = True
+    ctx = await _dream_context()
 
     await commands["dream"](ctx, "prompt", image=image, mask=mask)
 
@@ -409,8 +1202,8 @@ class TestSlugify:
     [
         ("Krea 2", True),
         ("Krea-2", True),
-        ("Krea2", True),
-        ("Krea 2 Turbo", True),
+        ("Krea2", False),
+        ("Krea 2 Turbo", False),
         ("Flux.1 Krea", False),
         (None, False),
     ],
@@ -465,9 +1258,10 @@ def test_get_generation_defaults_handles_unloaded_pipeline():
         ("transport", False),
     ],
 )
+@pytest.mark.parametrize("krea2_variant", ["raw", "auto"])
 @respx.mock
 async def test_fetch_krea2_validates_header_before_writing_config(
-    checkpoint_kind, writes_config, tmp_path
+    checkpoint_kind, writes_config, krea2_variant, tmp_path
 ):
     """Fetch persists only validated Krea checkpoints and reports header precision."""
     commands = {}
@@ -671,7 +1465,7 @@ async def test_fetch_krea2_validates_header_before_writing_config(
             ctx,
             "https://civitai.com/models/1",
             precision="bf16" if checkpoint_kind == "precision_mismatch" else "auto",
-            krea2_variant="raw",
+            krea2_variant=krea2_variant,
         )
     if header_client:
         await header_client.close()
@@ -696,17 +1490,32 @@ async def test_fetch_krea2_validates_header_before_writing_config(
             selected = ctx.bot.civitai_client.download_model_version.call_args.kwargs["model_file"]
             assert selected.id == 4
         checkpoint_config = ctx.bot.config.set.call_args.kwargs["value"]
-        assert checkpoint_config["krea2_component_repo"] == "krea/Krea-2-Raw"
-        assert checkpoint_config["steps"] == 28
-        assert checkpoint_config["guidance_scale"] == 4.5
+        expected_repo, expected_variant, expected_steps, expected_guidance = (
+            ("krea/Krea-2-Raw", "raw", 28, 4.5)
+            if krea2_variant == "raw"
+            else ("krea/Krea-2-Turbo", "turbo", 8, 0.0)
+        )
+        assert checkpoint_config["krea2_component_repo"] == expected_repo
+        assert checkpoint_config["component_repo"] == expected_repo
+        assert checkpoint_config["family"] == "krea2"
+        assert checkpoint_config["variant"] == expected_variant
+        assert checkpoint_config["civitai_model_id"] == 1
+        assert checkpoint_config["civitai_version_id"] == 2
+        assert not {"pipeline_class", "sequential_cpu_offload"} & checkpoint_config.keys()
+        assert checkpoint_config["steps"] == expected_steps
+        assert checkpoint_config["guidance_scale"] == expected_guidance
         embed = status.edit.call_args.kwargs["embed"]
         assert next(field.value for field in embed.fields if field.name == "Precision") == "`bf16`"
         recipe = next(field.value for field in embed.fields if field.name == "Krea 2 Recipe")
-        assert "krea/Krea-2-Raw" in recipe
-        assert "28 steps" in recipe
-        assert "guidance 4.5" in recipe
+        assert expected_repo in recipe
+        assert f"{expected_steps} steps" in recipe
+        assert f"guidance {expected_guidance:g}" in recipe
 
-        ctx.bot.pipeline_manager = MagicMock(current_model="fetched-krea")
+        manager = PipelineManager(ctx.bot.config)
+        manager.pipeline = CivitaiCheckpointPipeline()
+        await manager.pipeline.resolve_config(checkpoint_config, None)
+        manager.current_model = "fetched-krea"
+        ctx.bot.pipeline_manager = manager
         ctx.bot.content_filter = None
         ctx.bot.config.get.side_effect = lambda *keys, default=None: (
             checkpoint_config if keys == ("models", "fetched-krea") else {}
@@ -729,16 +1538,13 @@ async def test_fetch_krea2_validates_header_before_writing_config(
             await commands["dream"](ctx, "test prompt")
 
         request = ctx.bot.generation_queue.add.call_args.kwargs["request"]
-        assert request["steps"] == 28
-        assert request["guidance_scale"] == 4.5
+        assert "steps" not in request and "guidance_scale" not in request
 
         operator_config = {
             key: value
             for key, value in checkpoint_config.items()
             if key not in {"steps", "guidance_scale"}
         }
-        ctx.bot.pipeline_manager.pipeline.pipeline_config.default_steps = 28
-        ctx.bot.pipeline_manager.pipeline.pipeline_config.default_guidance_scale = 4.5
         ctx.bot.config.get.side_effect = lambda *keys, default=None: (
             operator_config if keys == ("models", "fetched-krea") else {}
         )
@@ -755,8 +1561,7 @@ async def test_fetch_krea2_validates_header_before_writing_config(
         ):
             await commands["dream"](ctx, "test prompt")
         operator_request = ctx.bot.generation_queue.add.call_args.kwargs["request"]
-        assert operator_request["steps"] == 28
-        assert operator_request["guidance_scale"] == 4.5
+        assert "steps" not in operator_request and "guidance_scale" not in operator_request
     elif checkpoint_kind == "cached_io_error":
         ctx.bot.civitai_client.download_model_version.assert_not_awaited()
         ctx.bot.civitai_client.get_safetensor_header.assert_not_awaited()

@@ -1,6 +1,6 @@
 """Slash command definitions for Oneiro Discord bot."""
 
-import inspect
+import math
 import re
 from contextlib import suppress
 from pathlib import Path
@@ -24,14 +24,17 @@ from oneiro.discord.handlers import (
     format_exception_response,
 )
 from oneiro.pipelines import SCHEDULER_CHOICES
+from oneiro.pipelines.base import get_generation_defaults
 from oneiro.pipelines.civitai_checkpoint import (
     DEFAULT_KREA2_COMPONENT_REPO,
     DEFAULT_KREA2_RAW_COMPONENT_REPO,
     CivitaiCheckpointPipeline,
-    get_krea2_checkpoint_precision,
-    get_krea2_checkpoint_precision_from_header,
     get_krea2_generation_defaults,
     get_pipeline_config_for_base_model,
+)
+from oneiro.pipelines.krea2_checkpoint import (
+    get_krea2_checkpoint_precision,
+    get_krea2_checkpoint_precision_from_header,
 )
 from oneiro.pipelines.lora import is_resource_compatible
 from oneiro.queue import QueueStatus
@@ -79,7 +82,7 @@ def is_krea2_base_model(base_model: str | None) -> bool:
     if base_model is None:
         return False
     try:
-        return get_pipeline_config_for_base_model(base_model).pipeline_class == "Krea2Pipeline"
+        return get_pipeline_config_for_base_model(base_model).family == "krea2"
     except ValueError:
         return False
 
@@ -114,27 +117,6 @@ def _discard_invalid_civitai_download(
             client.cache.remove(model_file.sha256)
     with suppress(OSError):
         path.unlink(missing_ok=True)
-
-
-def get_generation_defaults(pipeline: Any) -> tuple[int, float]:
-    """Return configured or declared generation defaults for a loaded pipeline."""
-    if pipeline is None:
-        return 9, 0.0
-    pipeline_config = getattr(pipeline, "pipeline_config", None)
-    steps = getattr(pipeline_config, "default_steps", None)
-    guidance = getattr(pipeline_config, "default_guidance_scale", None)
-    try:
-        parameters = inspect.signature(pipeline.generate).parameters
-    except (TypeError, ValueError):
-        parameters = {}
-    if not isinstance(steps, int):
-        steps = getattr(parameters.get("steps"), "default", 9)
-    if not isinstance(guidance, int | float):
-        guidance = getattr(parameters.get("guidance_scale"), "default", 0.0)
-    return (
-        steps if isinstance(steps, int) else 9,
-        float(guidance) if isinstance(guidance, int | float) else 0.0,
-    )
 
 
 def validate_image_attachment(attachment: discord.Attachment, label: str) -> str | None:
@@ -223,7 +205,13 @@ def register_commands(bot: "OneiroBot") -> None:
     @option(
         "image",
         discord.Attachment,
-        description="Reference image for img2img",
+        description="Initial image for img2img, or conditioning for image-conditioned models",
+        required=False,
+    )
+    @option(
+        "reference_image",
+        discord.Attachment,
+        description="Reference conditioning image (no denoising strength)",
         required=False,
     )
     @option(
@@ -235,9 +223,9 @@ def register_commands(bot: "OneiroBot") -> None:
     @option(
         "strength",
         float,
-        description="img2img strength (0.0-1.0, higher = more change)",
+        description="Denoising img2img/inpaint only (0 < strength <= 1; higher = more change)",
         required=False,
-        min_value=0.0,
+        min_value=math.nextafter(0.0, 1.0),
         max_value=1.0,
     )
     @option(
@@ -299,7 +287,8 @@ def register_commands(bot: "OneiroBot") -> None:
         negative_prompt: str | None = None,
         image: discord.Attachment | None = None,
         mask: discord.Attachment | None = None,
-        strength: float = 0.75,
+        reference_image: discord.Attachment | None = None,
+        strength: float | None = None,
         width: int = 1024,
         height: int = 1024,
         seed: int = -1,
@@ -326,15 +315,34 @@ def register_commands(bot: "OneiroBot") -> None:
         # Defer immediately to avoid 3-second timeout
         await ctx.defer()
 
-        # Get model-specific defaults from config
-        current_model = ctx.bot.pipeline_manager.current_model or "zimage-turbo"
-        model_config = (
-            ctx.bot.config.get("models", current_model, default={}) if ctx.bot.config else {}
-        )
-        pipeline_type = model_config.get("type") if model_config else None
+        # Capability checks precede attachment reads and all resource/queue work.
+        try:
+            workflow, family = await ctx.bot.pipeline_manager.preflight_request(
+                has_image=image is not None,
+                has_mask=mask is not None,
+                has_reference=reference_image is not None,
+                strength=strength,
+                negative_prompt=negative_prompt,
+                steps=steps,
+                guidance_scale=guidance_scale,
+                width=width,
+                height=height,
+                **({"scheduler": scheduler} if scheduler is not None else {}),
+            )
+        except ValueError as e:
+            await ctx.followup.send(f"❌ {e}", ephemeral=True)
+            return
+        except Exception as e:
+            await ctx.followup.send(
+                **format_exception_response("❌ Failed to validate request", e), ephemeral=True
+            )
+            return
+
+        current_model = ctx.bot.pipeline_manager.current_model or "pending"
 
         # Validate image attachments before reading them into memory
-        for label, attachment in (("image", image), ("mask", mask)):
+        attachments = (("image", image), ("mask image", mask), ("reference image", reference_image))
+        for label, attachment in attachments:
             if attachment is None:
                 continue
             validation_error = validate_image_attachment(attachment, label)
@@ -342,69 +350,21 @@ def register_commands(bot: "OneiroBot") -> None:
                 await ctx.followup.send(validation_error, ephemeral=True)
                 return
 
-        if mask is not None and not getattr(
-            ctx.bot.pipeline_manager.pipeline, "supports_inpaint", False
+        # Keep bytes in the existing queue contract; execution owns decoding/pixel limits.
+        image_inputs: dict[str, bytes] = {}
+        for (label, attachment), key in zip(
+            attachments, ("init_image", "mask_image", "reference_image"), strict=True
         ):
-            await ctx.followup.send(
-                "❌ The active model does not support inpainting masks.",
-                ephemeral=True,
-            )
-            return
-
-        # Download image if provided for img2img
-        init_image_bytes: bytes | None = None
-        if image is not None:
+            if attachment is None:
+                continue
             try:
-                init_image_bytes = await image.read()
+                image_inputs[key] = await attachment.read()
             except Exception as e:
                 await ctx.followup.send(
-                    **format_exception_response("❌ Failed to read image", e), ephemeral=True
-                )
-                return
-
-        mask_image_bytes: bytes | None = None
-        if mask is not None:
-            if init_image_bytes is None:
-                await ctx.followup.send(
-                    "❌ Inpainting requires both `image` and `mask` attachments.",
+                    **format_exception_response(f"❌ Failed to read {label}", e),
                     ephemeral=True,
                 )
                 return
-            try:
-                mask_image_bytes = await mask.read()
-            except Exception as e:
-                await ctx.followup.send(
-                    **format_exception_response("❌ Failed to read mask image", e),
-                    ephemeral=True,
-                )
-                return
-
-        # Get model config defaults
-        pipeline_steps, pipeline_guidance = get_generation_defaults(
-            ctx.bot.pipeline_manager.pipeline
-        )
-        model_steps = model_config.get("steps", pipeline_steps)
-        model_guidance = model_config.get("guidance_scale", pipeline_guidance)
-
-        # Handle Qwen's true_cfg_scale
-        if model_config.get("true_cfg_scale"):
-            model_guidance = model_config["true_cfg_scale"]
-
-        # Check for model-specific overrides set via /model command
-        model_overrides = (
-            ctx.bot.config.get("model_overrides", current_model, default={})
-            if ctx.bot.config
-            else {}
-        )
-        if model_overrides:
-            if "steps" in model_overrides:
-                model_steps = model_overrides["steps"]
-            if "guidance_scale" in model_overrides:
-                model_guidance = model_overrides["guidance_scale"]
-
-        # User-provided values take priority over model defaults
-        actual_steps = steps if steps is not None else model_steps
-        actual_guidance = guidance_scale if guidance_scale is not None else model_guidance
 
         # Resolve LoRAs: explicit param OR auto-detect (not both)
         try:
@@ -414,7 +374,7 @@ def register_commands(bot: "OneiroBot") -> None:
                 config=ctx.bot.config,
                 civitai_client=ctx.bot.civitai_client,
                 lora_detector=ctx.bot.lora_detector,
-                pipeline_type=pipeline_type,
+                pipeline_type=family,
             )
         except LoraNotFoundError as e:
             await ctx.followup.send(
@@ -436,9 +396,12 @@ def register_commands(bot: "OneiroBot") -> None:
             "width": width,
             "height": height,
             "seed": seed,
-            "steps": actual_steps,
-            "guidance_scale": actual_guidance,
         }
+        # Omitted controls are resolved from the executing owner, not an admission snapshot.
+        if steps is not None:
+            request["steps"] = steps
+        if guidance_scale is not None:
+            request["guidance_scale"] = guidance_scale
 
         if scheduler:
             request["scheduler"] = scheduler
@@ -446,12 +409,10 @@ def register_commands(bot: "OneiroBot") -> None:
         if lora_configs:
             request["loras"] = lora_configs
 
-        # Add img2img parameters if image provided
-        if init_image_bytes is not None:
-            request["init_image"] = init_image_bytes
+        request.update(image_inputs)
+        # Resolve the omitted denoising default only at execution, after model switching.
+        if strength is not None:
             request["strength"] = strength
-            if mask_image_bytes is not None:
-                request["mask_image"] = mask_image_bytes
 
         dream_context = DreamContext(
             ctx=ctx,
@@ -461,8 +422,8 @@ def register_commands(bot: "OneiroBot") -> None:
             scheduler=scheduler,
             lora_configs=lora_configs,
             auto_detected_loras=auto_detected_loras,
-            is_img2img=init_image_bytes is not None,
-            is_inpaint=mask_image_bytes is not None,
+            is_img2img=workflow in {"image2image", "inpainting"},
+            is_inpaint=workflow == "inpainting",
             strength=strength,
             pipeline_manager=ctx.bot.pipeline_manager,  # type: ignore[arg-type]
         )
@@ -577,17 +538,17 @@ def register_commands(bot: "OneiroBot") -> None:
             # Model is already active - handle overrides only
             overrides_applied = []
 
-            if scheduler and ctx.bot.pipeline_manager.pipeline is not None:
-                if isinstance(ctx.bot.pipeline_manager.pipeline, CivitaiCheckpointPipeline):
-                    ctx.bot.pipeline_manager.pipeline.configure_scheduler(scheduler)
-                    overrides_applied.append(f"scheduler=`{scheduler}`")
-                else:
-                    await ctx.respond(
-                        f"✅ Model `{model}` is already active.\n"
-                        f"⚠️ Scheduler override is not supported for this pipeline type.",
-                        ephemeral=True,
-                    )
-                    return
+            await ctx.defer()
+            try:
+                await ctx.bot.pipeline_manager.load_model(
+                    model, scheduler=scheduler, steps=steps, guidance_scale=guidance_scale
+                )
+            except ValueError as error:
+                await ctx.followup.send(f"❌ Failed to configure model: {error}", ephemeral=True)
+                return
+            if scheduler:
+                overrides_applied.append(f"scheduler=`{scheduler}`")
+            send = ctx.followup.send
 
             # Save steps/guidance_scale overrides to state
             if ctx.bot.config.state_path:
@@ -601,12 +562,12 @@ def register_commands(bot: "OneiroBot") -> None:
                     overrides_applied.append(f"guidance_scale={guidance_scale}")
 
             if overrides_applied:
-                await ctx.respond(
+                await send(
                     f"✅ Model `{model}` already active. Set: {', '.join(overrides_applied)}",
                     ephemeral=True,
                 )
             else:
-                await ctx.respond(
+                await send(
                     f"✅ Model `{model}` is already active.",
                     ephemeral=True,
                 )
@@ -618,7 +579,9 @@ def register_commands(bot: "OneiroBot") -> None:
         try:
             loading_msg = await ctx.followup.send(f"⏳ Loading model `{model}`...")
             try:
-                await ctx.bot.pipeline_manager.load_model(model)
+                await ctx.bot.pipeline_manager.load_model(
+                    model, scheduler=scheduler, steps=steps, guidance_scale=guidance_scale
+                )
             except CivitaiError as e:
                 await ctx.followup.send(
                     **format_exception_response("❌ Failed to load model", e), ephemeral=True
@@ -627,10 +590,6 @@ def register_commands(bot: "OneiroBot") -> None:
             except ValueError as e:
                 await ctx.followup.send(f"❌ Failed to load model: {e}", ephemeral=True)
                 return
-
-            if scheduler and ctx.bot.pipeline_manager.pipeline is not None:
-                if isinstance(ctx.bot.pipeline_manager.pipeline, CivitaiCheckpointPipeline):
-                    ctx.bot.pipeline_manager.pipeline.configure_scheduler(scheduler)
 
             if ctx.bot.config.state_path:
                 ctx.bot.config.set("defaults", "model", value=model)
@@ -802,6 +761,12 @@ def register_commands(bot: "OneiroBot") -> None:
 
             # Determine resource type and configure accordingly
             model_type = model.type.upper() if model.type else "UNKNOWN"
+            if model_type == "CHECKPOINT":
+                try:
+                    get_pipeline_config_for_base_model(version.base_model)
+                except ValueError as e:
+                    await ctx.followup.send(f"❌ Cannot fetch checkpoint: {e}", ephemeral=True)
+                    return
 
             await status_msg.edit(
                 content=f"⏳ Downloading {model_type}: {model.name} ({version.name})..."
@@ -905,20 +870,16 @@ def register_commands(bot: "OneiroBot") -> None:
             else:
                 downloaded_path = await ctx.bot.civitai_client.download_model_version(version)
 
-            # Get current pipeline type for compatibility info
-            pipeline_type = None
-            if ctx.bot.pipeline_manager and ctx.bot.pipeline_manager.current_model:
-                model_config = ctx.bot.config.get("models", ctx.bot.pipeline_manager.current_model)
-                if model_config:
-                    pipeline_type = model_config.get("type")
+            # Check actual architecture, not the generic CivitAI checkpoint source type.
+            family = ctx.bot.pipeline_manager.family if ctx.bot.pipeline_manager else None
 
             # Check compatibility and prepare warning
             compatibility_warning = ""
-            if model_type == "LORA" and pipeline_type and version.base_model:
-                if not is_resource_compatible(pipeline_type, version.base_model):
+            if model_type == "LORA" and family and version.base_model:
+                if not is_resource_compatible(family, version.base_model):
                     compatibility_warning = (
                         f"\n⚠️ **Note**: This LoRA (base: {version.base_model}) may not be "
-                        f"compatible with the current model ({pipeline_type})"
+                        f"compatible with the current model ({family})"
                     )
 
             # Save to config based on type
@@ -964,21 +925,18 @@ def register_commands(bot: "OneiroBot") -> None:
                 # For checkpoints, we need to add to models section
                 checkpoint_config = {
                     "type": "civitai",
-                    "civitai_id": model_id,
-                    "civitai_version": version.id,
+                    "civitai_model_id": model_id,
+                    "civitai_version_id": version.id,
                     "name": model.name,
                     "base_model": version.base_model,
                     "checkpoint_path": str(downloaded_path),
                 }
                 if component_repo:
-                    default_steps, default_guidance = get_krea2_generation_defaults(component_repo)
-                    checkpoint_config.update(
-                        {
-                            "krea2_component_repo": component_repo,
-                            "steps": default_steps,
-                            "guidance_scale": default_guidance,
-                        }
-                    )
+                    checkpoint_config["krea2_component_repo"] = component_repo
+                recipe = CivitaiCheckpointPipeline()
+                checkpoint_config = await recipe.resolve_config(checkpoint_config, None)
+                default_steps, default_guidance = get_generation_defaults(recipe)
+                checkpoint_config.update(steps=default_steps, guidance_scale=default_guidance)
                 ctx.bot.config.set(
                     "models",
                     resource_name,

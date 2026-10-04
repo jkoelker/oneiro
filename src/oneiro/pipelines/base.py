@@ -1,7 +1,9 @@
 """Base classes and types for pipeline implementations."""
 
 import gc
+import inspect
 import io
+import math
 import os
 import random
 from abc import ABC, abstractmethod
@@ -14,6 +16,70 @@ from PIL import Image, UnidentifiedImageError
 from oneiro.device import DevicePolicy, OffloadType
 
 MAX_INPUT_IMAGE_PIXELS = 4096 * 4096
+MAX_INPUT_IMAGE_BYTES = 25 * 1024 * 1024
+
+
+def get_generation_defaults(pipeline: Any) -> tuple[int, float]:
+    """Return configured or declared sampling defaults without loading model assets."""
+    if pipeline is None:
+        return 9, 0.0
+    pipeline_config = getattr(pipeline, "pipeline_config", None)
+    steps = getattr(pipeline_config, "default_steps", None)
+    guidance = getattr(pipeline_config, "default_guidance_scale", None)
+    if not isinstance(steps, int):
+        steps = getattr(pipeline, "default_steps", None)
+    if not isinstance(guidance, int | float):
+        guidance = getattr(pipeline, "default_guidance_scale", None)
+    try:
+        parameters = inspect.signature(pipeline.generate).parameters
+    except (TypeError, ValueError):
+        parameters = {}
+    if not isinstance(steps, int):
+        steps = getattr(parameters.get("steps"), "default", 9)
+    if not isinstance(guidance, int | float):
+        guidance = getattr(parameters.get("guidance_scale"), "default", 0.0)
+    return (
+        steps if isinstance(steps, int) else 9,
+        float(guidance) if isinstance(guidance, int | float) else 0.0,
+    )
+
+
+def validate_request_inputs(
+    *,
+    has_image: bool = False,
+    has_mask: bool = False,
+    has_reference: bool = False,
+    strength: float | None = None,
+    steps: int | None = None,
+    guidance_scale: float | None = None,
+    width: int = 1024,
+    height: int = 1024,
+    **kwargs: Any,
+) -> str:
+    """Validate model-independent controls even when lazy recovery has no loaded owner."""
+    if has_mask and (not has_image or has_reference):
+        raise ValueError("Inpainting requires an image and mask, without reference images")
+    if has_reference and has_image:
+        raise ValueError("Reference and initial images cannot be combined")
+    workflow = (
+        "inpainting"
+        if has_mask
+        else "reference"
+        if has_reference
+        else "image2image"
+        if has_image
+        else "text2image"
+    )
+    if strength is not None:
+        if workflow not in {"image2image", "inpainting"}:
+            raise ValueError(f"Denoising strength is not supported for {workflow}")
+        if not math.isfinite(strength) or not 0.0 < strength <= 1.0:
+            raise ValueError("Strength must be finite, greater than 0, and at most 1")
+    if width <= 0 or height <= 0 or (steps is not None and steps <= 0):
+        raise ValueError("Dimensions and steps must be positive")
+    if guidance_scale is not None and not math.isfinite(guidance_scale):
+        raise ValueError("Guidance must be finite")
+    return workflow
 
 
 @dataclass
@@ -28,6 +94,9 @@ class GenerationResult:
     height: int
     steps: int
     guidance_scale: float
+    workflow: str = "text2image"
+    strength: float | None = None
+    model_name: str | None = None
 
 
 class BasePipeline(ABC):
@@ -49,6 +118,11 @@ class BasePipeline(ABC):
             full_config: Full configuration dict (for accessing global sections like embeddings)
         """
 
+    def validate_config(  # noqa: B027
+        self, model_config: dict[str, Any], full_config: dict[str, Any] | None = None
+    ) -> None:
+        """Preflight deterministic loader controls without loading model assets."""
+
     def generate(
         self,
         prompt: str,
@@ -67,16 +141,38 @@ class BasePipeline(ABC):
         not this method.
         """
         self.validate_pipeline()
-        self.pre_generate(**kwargs)
+        init_bytes = kwargs.pop("init_image", None)
+        mask_bytes = kwargs.pop("mask_image", None)
+        reference_bytes = kwargs.pop("reference_image", None)
+        strength = kwargs.pop("strength", None)
+        workflow = self.validate_request(
+            has_image=init_bytes is not None,
+            has_mask=mask_bytes is not None,
+            has_reference=reference_bytes is not None,
+            strength=strength,
+        )
+        init_image = self._load_init_image(init_bytes)
+        mask_image = self._load_init_image(mask_bytes)
+        if reference_bytes is not None:
+            if isinstance(reference_bytes, list):
+                if not reference_bytes:
+                    raise ValueError("Reference image list must not be empty")
+                if any(not isinstance(image, bytes) for image in reference_bytes):
+                    raise ValueError("Reference image attachments must be bytes")
+                reference_image = [self._load_init_image(image) for image in reference_bytes]
+            else:
+                reference_image = self._load_init_image(reference_bytes)
+            kwargs["reference_image"] = reference_image
+        if strength is None and workflow in {"image2image", "inpainting"}:
+            strength = 0.75
+        controls = {
+            name: kwargs.pop(name)
+            for name in ("loras", "embeddings", "scheduler")
+            if name in kwargs
+        }
+        actual_seed, generator = self._prepare_seed(seed)
         try:
-            actual_seed, generator = self._prepare_seed(seed)
-            # Pop image inputs and strength from kwargs to avoid passing twice
-            init_image = self._load_init_image(kwargs.pop("init_image", None))
-            mask_image_bytes = kwargs.pop("mask_image", None)
-            if mask_image_bytes is not None and not self.supports_inpaint:
-                raise ValueError("This pipeline does not support inpainting masks")
-            mask_image = self._load_init_image(mask_image_bytes)
-            strength = kwargs.pop("strength", 0.75)
+            self.pre_generate(**controls)
 
             gen_kwargs = self.build_generation_kwargs(
                 prompt=prompt,
@@ -95,7 +191,7 @@ class BasePipeline(ABC):
             result = self.run_inference(gen_kwargs, is_img2img)
 
             DevicePolicy.clear_cache()
-            return self.build_result(
+            generation_result = self.build_result(
                 result=result,
                 seed=actual_seed,
                 prompt=prompt,
@@ -103,8 +199,27 @@ class BasePipeline(ABC):
                 steps=steps,
                 guidance_scale=guidance_scale,
             )
+            generation_result.workflow = workflow
+            generation_result.strength = (
+                strength if workflow in {"image2image", "inpainting"} else None
+            )
+            return generation_result
         finally:
-            self.post_generate(**kwargs)
+            self.post_generate(**controls)
+
+    def validate_request(
+        self,
+        *,
+        has_image: bool = False,
+        has_mask: bool = False,
+        has_reference: bool = False,
+        strength: float | None = None,
+        **kwargs: Any,
+    ) -> str:
+        """Keep classic capabilities while allowing native wrappers to validate workflows."""
+        if has_mask and not self.supports_inpaint:
+            raise ValueError("This pipeline does not support inpainting masks")
+        return "inpainting" if has_mask else "image2image" if has_image else "text2image"
 
     def validate_pipeline(self) -> None:
         """Validate pipeline is ready for generation.
@@ -122,9 +237,9 @@ class BasePipeline(ABC):
         This is an optional hook with a no-op default; it is intentionally
         not abstract so subclasses can choose whether to implement it.
 
-        Note: This method may pop keys from kwargs to consume them before
-        build_generation_kwargs() is called. The modified kwargs are then
-        passed through to build_generation_kwargs() and post_generate().
+        Request-only controls are consumed by generate() and passed to this hook
+        and post_generate(), never to the inference kwargs builder. Mutating this
+        hook's kwargs does not mutate generate()'s dictionary.
         """
         pass
 
@@ -139,7 +254,7 @@ class BasePipeline(ABC):
         guidance_scale: float,
         generator: torch.Generator,
         init_image: Image.Image | None,
-        strength: float,
+        strength: float | None,
         **kwargs: Any,
     ) -> dict[str, Any]:
         """Build pipeline-specific generation kwargs.
@@ -199,9 +314,8 @@ class BasePipeline(ABC):
         Subclasses should call super().post_generate(**kwargs) first, then perform
         any additional cleanup (e.g., LoRA restore).
 
-        Note: The kwargs passed here have already had 'init_image', 'mask_image',
-        and 'strength' removed by generate(). If a subclass needs access to these values,
-        it should save them in pre_generate() before they are consumed.
+        Only request-time resource controls are passed here. This hook also runs
+        when pre_generate() raises, but not when input validation fails.
         """
         self._reset_model_state()
 
@@ -244,15 +358,21 @@ class BasePipeline(ABC):
         """Load init_image from bytes if provided."""
         if init_image is None:
             return None
+        if not isinstance(init_image, bytes):
+            raise ValueError("Image attachment must be bytes")
+        if len(init_image) > MAX_INPUT_IMAGE_BYTES:
+            raise ValueError("Image attachment exceeds the 25 MiB limit")
         try:
-            image = Image.open(io.BytesIO(init_image))
-            width, height = image.size
-            if width * height > MAX_INPUT_IMAGE_PIXELS:
-                raise ValueError(
-                    f"Input image is too large ({width}×{height}); "
-                    "maximum supported size is 4096×4096"
-                )
-            return image.convert("RGB")
+            with Image.open(io.BytesIO(init_image)) as image:
+                if image.format not in {"PNG", "JPEG", "WEBP"}:
+                    raise ValueError("Image attachment must be PNG, JPEG, or WebP")
+                width, height = image.size
+                if width * height > MAX_INPUT_IMAGE_PIXELS:
+                    raise ValueError(
+                        f"Input image is too large ({width}×{height}); "
+                        "maximum supported size is 4096×4096"
+                    )
+                return image.convert("RGB")
         except (Image.DecompressionBombError, UnidentifiedImageError, OSError) as e:
             raise ValueError("Invalid image attachment; upload a valid image file") from e
 

@@ -187,18 +187,20 @@ def parse_embedding_config(
 def parse_embeddings_from_config(
     full_config: dict[str, Any],
     model_config: dict[str, Any],
+    *,
+    include_auto_load: bool = True,
 ) -> list[EmbeddingConfig]:
     """Parse all embedding configurations for a model from full config.
 
     Handles three types of embedding sources:
-    1. Global auto_load: Embeddings loaded for ALL models
+    1. Global auto_load: Optional embeddings for compatible models
     2. Named references: Model references embeddings defined in [embeddings.name]
     3. Inline definitions: Model-specific embeddings defined directly in model config
 
     Config structure:
     ```toml
     [embeddings]
-    auto_load = ["easynegative"]  # Loaded for every model
+    auto_load = ["easynegative"]  # Attempted for compatible models
 
     [embeddings.easynegative]
     source = "civitai"
@@ -222,6 +224,7 @@ def parse_embeddings_from_config(
     Args:
         full_config: The complete config dict (for accessing [embeddings] section)
         model_config: Model-specific config section
+        include_auto_load: Include optional global references, not just required model entries.
 
     Returns:
         List of EmbeddingConfig instances (auto_load + named refs + inline)
@@ -233,7 +236,7 @@ def parse_embeddings_from_config(
     loaded_names: set[str] = set()
 
     # 1. Global auto_load embeddings
-    auto_load = embeddings_section.get("auto_load", [])
+    auto_load = embeddings_section.get("auto_load", []) if include_auto_load else []
     if isinstance(auto_load, list):
         for ref_name in auto_load:
             if ref_name in loaded_names:
@@ -260,7 +263,7 @@ def parse_embeddings_from_config(
                     embeddings.append(parse_embedding_config(emb_config, name=ref))
                     loaded_names.add(ref)
                 else:
-                    print(f"Warning: embedding '{ref}' not found in [embeddings] section")
+                    raise ValueError(f"Embedding '{ref}' not found in [embeddings] section")
             elif isinstance(ref, dict):
                 # Inline dict definition in the embeddings array
                 emb_name = ref.get("name", f"inline_{len(embeddings)}")
@@ -406,6 +409,8 @@ class EmbeddingLoaderMixin:
             )
         if self.pipe is None:
             raise RuntimeError("Pipeline not loaded")
+        if not callable(getattr(self.pipe, "load_textual_inversion", None)):
+            raise ValueError("This pipeline does not support textual inversion embeddings")
 
         # Determine token - use configured token, or auto-detect
         token = embedding.token or embedding.name
@@ -482,6 +487,8 @@ class EmbeddingLoaderMixin:
     def unload_single_embedding(self, token: str) -> None:
         """Unload a single embedding by token.
 
+        Native removal errors propagate without clearing resource tracking.
+
         Args:
             token: The token to unload
 
@@ -496,10 +503,7 @@ class EmbeddingLoaderMixin:
             raise ValueError(f"Embedding token '{token}' not found in loaded embeddings")
 
         print(f"Unloading embedding: {token}")
-        try:
-            self.pipe.unload_textual_inversion(token)
-        except Exception as e:
-            print(f"Warning: Error unloading embedding '{token}': {e}")
+        self.pipe.unload_textual_inversion(token)
 
         self._loaded_tokens.remove(token)
         self._embedding_configs = [
@@ -507,15 +511,12 @@ class EmbeddingLoaderMixin:
         ]
 
     def unload_embeddings(self) -> None:
-        """Unload all embeddings and free memory."""
+        """Unload all embeddings, clearing tracking only after native removal succeeds."""
         if self.pipe is None or not self._loaded_tokens:
             return
 
         print(f"Unloading {len(self._loaded_tokens)} embedding(s)")
-        try:
-            self.pipe.unload_textual_inversion()
-        except Exception as e:
-            print(f"Warning: Error unloading embeddings: {e}")
+        self.pipe.unload_textual_inversion()
 
         self._loaded_tokens.clear()
         self._embedding_configs.clear()

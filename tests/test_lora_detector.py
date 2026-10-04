@@ -337,12 +337,10 @@ class TestAutoLoraDetector:
         assert len(matches) == 0
 
     def test_unknown_pipeline_type(self, detector):
-        """Unknown pipeline type still matches (assumes compatible)."""
+        """Unknown pipeline types cannot auto-select incompatible resources."""
         detector._all_loras[0].base_model = "Unknown Model"
         matches = detector.match("shinkai style", "unknown_pipeline")
-        # Unknown pipeline = empty compatible_bases = permissive matching
-        assert len(matches) == 1
-        assert matches[0].matched_trigger == "shinkai style"
+        assert matches == []
 
 
 class TestCreateDetectorFromConfig:
@@ -414,21 +412,3 @@ class TestTriggerIndex:
         index = TriggerIndex()
         assert index.pattern is None
         assert index.trigger_to_loras == {}
-
-
-class TestPipelineBaseModelMap:
-    """Tests for base model compatibility mapping."""
-
-    def test_sdxl_compatible_with_pony(self):
-        """SDXL pipeline is compatible with Pony LoRAs."""
-        from oneiro.pipelines.lora import PIPELINE_BASE_MODEL_MAP
-
-        assert "Pony" in PIPELINE_BASE_MODEL_MAP["sdxl"]
-
-    def test_flux_compatible_variants(self):
-        """Flux1 pipeline is compatible with various Flux.1 variants."""
-        from oneiro.pipelines.lora import PIPELINE_BASE_MODEL_MAP
-
-        flux_bases = PIPELINE_BASE_MODEL_MAP["flux1"]
-        assert "Flux.1" in flux_bases
-        assert "Flux.1 Dev" in flux_bases

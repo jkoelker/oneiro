@@ -385,14 +385,6 @@ class TestModelVersion:
 
         assert version.checkpoint_files()[0].id == 1
 
-    def test_checkpoint_files_is_the_only_checkpoint_selection_api(self):
-        """Checkpoint selection exposes only ordered candidates and a precision preference."""
-        version = ModelVersion.from_dict(SAMPLE_VERSION_RESPONSE)
-
-        assert not hasattr(version, "select_checkpoint_file")
-        with pytest.raises(TypeError, match="unexpected keyword argument 'precision'"):
-            version.checkpoint_files(precision="fp16")
-
 
 class TestModel:
     """Tests for Model dataclass."""

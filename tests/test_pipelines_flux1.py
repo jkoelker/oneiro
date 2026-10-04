@@ -1,306 +1,100 @@
-"""Tests for pipelines.flux1 module."""
+"""Offline FLUX.1 recipe and native input contracts."""
 
-from unittest.mock import MagicMock, patch
+from typing import Any
 
 import pytest
-import torch
-from PIL import Image
 
-from oneiro.device import DevicePolicy, OffloadMode
 from oneiro.pipelines.flux1 import Flux1PipelineWrapper
+from tests.test_pipelines_modular import capture_generation, image_bytes, load_hosted
+from tests.test_pipelines_modular import offline as offline
 
 
-class TestFlux1PipelineWrapperInit:
-    """Tests for Flux1PipelineWrapper initialization."""
+@pytest.mark.parametrize(
+    "repo,steps,guidance",
+    [
+        ("black-forest-labs/FLUX.1-dev", 28, 3.5),
+        ("black-forest-labs/FLUX.1-schnell", 4, 0.0),
+    ],
+)
+def test_recipe_defaults(
+    monkeypatch: pytest.MonkeyPatch, repo: str, steps: int, guidance: float
+) -> None:
+    """Schnell must not inherit dev sampling defaults."""
+    wrapper, _ = load_hosted(Flux1PipelineWrapper, monkeypatch, {"repo": repo})
+    calls = capture_generation(wrapper, monkeypatch)
+    result = wrapper.generate("test", seed=42)
+    assert result.steps == steps
+    assert calls[0].get("guidance_scale", 0.0) == guidance
+    assert wrapper.pipe.vae.use_tiling and wrapper.pipe.vae.use_slicing
 
-    def test_init_creates_instance(self):
-        """Flux1PipelineWrapper can be instantiated."""
-        mock_policy = DevicePolicy(device="cpu", dtype=torch.float32, offload=OffloadMode.NEVER)
-        with patch.object(DevicePolicy, "auto_detect", return_value=mock_policy):
-            pipeline = Flux1PipelineWrapper()
-        assert pipeline.pipe is None
-        assert pipeline.policy.device == "cpu"
+
+def test_custom_generation_and_img2img(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Real native declarations receive seeded, sized img2img controls."""
+    wrapper, _ = load_hosted(Flux1PipelineWrapper, monkeypatch)
+    calls = capture_generation(wrapper, monkeypatch)
+    result = wrapper.generate(
+        "test",
+        width=64,
+        height=32,
+        seed=123,
+        steps=4,
+        guidance_scale=2.0,
+        init_image=image_bytes(),
+        strength=0.5,
+        max_sequence_length=256,
+    )
+    assert result.image.size == (64, 32)
+    assert result.workflow == "image2image" and result.strength == 0.5
+    assert calls[0]["max_sequence_length"] == 256
+    assert calls[0]["generator"].initial_seed() == 123
 
 
-class TestFlux1PipelineWrapperLoad:
-    """Tests for Flux1PipelineWrapper.load()."""
+@pytest.mark.parametrize("config", [{"repo": "custom/dev-ish"}, {"variant": "bad"}])
+def test_ambiguous_variant_rejected(
+    monkeypatch: pytest.MonkeyPatch, config: dict[str, Any]
+) -> None:
+    """An arbitrary repo name is not dev/schnell metadata."""
+    with pytest.raises(ValueError, match="variant"):
+        load_hosted(Flux1PipelineWrapper, monkeypatch, config)
 
-    @patch("oneiro.pipelines.base.torch.set_num_interop_threads")
-    @patch("oneiro.pipelines.base.torch.set_num_threads")
-    @patch("diffusers.FluxPipeline")
-    def test_load_with_default_repo(self, mock_flux_pipeline, mock_threads, mock_interop):
-        """Load uses default repo when not specified."""
-        mock_pipe = MagicMock()
-        mock_flux_pipeline.from_pretrained.return_value = mock_pipe
 
-        pipeline = Flux1PipelineWrapper()
-        pipeline.load({})
+def test_custom_source_with_explicit_variant(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Explicit metadata selects the recipe for a custom source."""
+    wrapper, _ = load_hosted(
+        Flux1PipelineWrapper,
+        monkeypatch,
+        {"repo": "custom/model", "variant": "schnell", "cpu_offload": False},
+    )
+    calls = capture_generation(wrapper, monkeypatch)
+    assert wrapper.generate("test").steps == 4
+    assert "guidance_scale" not in calls[0]
 
-        mock_flux_pipeline.from_pretrained.assert_called_once()
-        call_args = mock_flux_pipeline.from_pretrained.call_args
-        assert call_args[0][0] == "black-forest-labs/FLUX.1-dev"
 
-    @patch("oneiro.pipelines.base.torch.set_num_interop_threads")
-    @patch("oneiro.pipelines.base.torch.set_num_threads")
-    @patch("diffusers.FluxPipeline")
-    def test_load_with_custom_repo(self, mock_flux_pipeline, mock_threads, mock_interop):
-        """Load uses custom repo from config."""
-        mock_pipe = MagicMock()
-        mock_flux_pipeline.from_pretrained.return_value = mock_pipe
-
-        pipeline = Flux1PipelineWrapper()
-        pipeline.load({"repo": "black-forest-labs/FLUX.1-schnell"})
-
-        call_args = mock_flux_pipeline.from_pretrained.call_args
-        assert call_args[0][0] == "black-forest-labs/FLUX.1-schnell"
-
-    @patch("oneiro.pipelines.base.torch.set_num_interop_threads")
-    @patch("oneiro.pipelines.base.torch.set_num_threads")
-    @patch("diffusers.FluxPipeline")
-    def test_load_enables_group_offload_on_cuda(
-        self, mock_flux_pipeline, mock_threads, mock_interop
+def test_unsupported_controls(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Controls that classic FLUX silently dropped now fail explicitly."""
+    wrapper, _ = load_hosted(Flux1PipelineWrapper, monkeypatch)
+    for request in (
+        {"negative_prompt": "bad"},
+        {"mask_image": image_bytes()},
+        {"control_image": image_bytes()},
+        {"embeddings": ["style"]},
     ):
-        """Load enables group offload on CUDA by default."""
-        mock_pipe = MagicMock()
-        mock_flux_pipeline.from_pretrained.return_value = mock_pipe
-
-        # Mock CUDA being available
-        mock_policy = DevicePolicy(device="cuda", dtype=torch.float16, offload=OffloadMode.AUTO)
-        with patch.object(DevicePolicy, "auto_detect", return_value=mock_policy):
-            pipeline = Flux1PipelineWrapper()
-            pipeline.load({})
-
-        mock_pipe.enable_group_offload.assert_called_once()
-
-    @patch("oneiro.pipelines.base.torch.set_num_interop_threads")
-    @patch("oneiro.pipelines.base.torch.set_num_threads")
-    @patch("diffusers.FluxPipeline")
-    def test_load_disables_cpu_offload_when_configured(
-        self, mock_flux_pipeline, mock_threads, mock_interop
-    ):
-        """Load respects cpu_offload=False config."""
-        mock_pipe = MagicMock()
-        mock_flux_pipeline.from_pretrained.return_value = mock_pipe
-
-        pipeline = Flux1PipelineWrapper()
-        pipeline.load({"cpu_offload": False})
-
-        mock_pipe.enable_group_offload.assert_not_called()
-        mock_pipe.enable_model_cpu_offload.assert_not_called()
-
-    @patch("oneiro.pipelines.base.torch.set_num_interop_threads")
-    @patch("oneiro.pipelines.base.torch.set_num_threads")
-    @patch("diffusers.FluxPipeline")
-    def test_load_enables_vae_optimizations(self, mock_flux_pipeline, mock_threads, mock_interop):
-        """Load enables VAE tiling and slicing for memory optimization."""
-        mock_pipe = MagicMock()
-        mock_flux_pipeline.from_pretrained.return_value = mock_pipe
-
-        pipeline = Flux1PipelineWrapper()
-        pipeline.load({})
-
-        mock_pipe.vae.enable_tiling.assert_called_once()
-        mock_pipe.vae.enable_slicing.assert_called_once()
-
-    @patch("oneiro.pipelines.base.torch.set_num_interop_threads")
-    @patch("oneiro.pipelines.base.torch.set_num_threads")
-    @patch("diffusers.FluxPipeline")
-    def test_load_with_lora(self, mock_flux_pipeline, mock_threads, mock_interop):
-        """Load applies LoRA weights when lora and lora_weights are specified."""
-        mock_pipe = MagicMock()
-        mock_flux_pipeline.from_pretrained.return_value = mock_pipe
-
-        pipeline = Flux1PipelineWrapper()
-        pipeline.load(
-            {
-                "lora": "example/flux-lora-repo",
-                "lora_weights": "flux_lora.safetensors",
-            }
-        )
-
-        mock_pipe.load_lora_weights.assert_called_once_with(
-            "example/flux-lora-repo", weight_name="flux_lora.safetensors"
-        )
-
-    @patch("oneiro.pipelines.base.torch.set_num_interop_threads")
-    @patch("oneiro.pipelines.base.torch.set_num_threads")
-    @patch("diffusers.FluxPipeline")
-    def test_load_without_lora(self, mock_flux_pipeline, mock_threads, mock_interop):
-        """Load does not call load_lora_weights when lora config is not specified."""
-        mock_pipe = MagicMock()
-        mock_flux_pipeline.from_pretrained.return_value = mock_pipe
-
-        pipeline = Flux1PipelineWrapper()
-        pipeline.load({})
-
-        mock_pipe.load_lora_weights.assert_not_called()
-
-    @patch("oneiro.pipelines.base.torch.set_num_interop_threads")
-    @patch("oneiro.pipelines.base.torch.set_num_threads")
-    @patch("diffusers.FluxPipeline")
-    def test_load_with_lora_repo_only_no_weights(
-        self, mock_flux_pipeline, mock_threads, mock_interop
-    ):
-        """Load does not call load_lora_weights when only lora repo is specified (no weights)."""
-        mock_pipe = MagicMock()
-        mock_flux_pipeline.from_pretrained.return_value = mock_pipe
-
-        pipeline = Flux1PipelineWrapper()
-        pipeline.load({"lora": "example/flux-lora-repo"})
-
-        mock_pipe.load_lora_weights.assert_not_called()
+        with pytest.raises(ValueError):
+            wrapper.generate("test", **request)
 
 
-class TestFlux1PipelineWrapperGenerate:
-    """Tests for Flux1PipelineWrapper.generate()."""
-
-    def test_generate_raises_when_not_loaded(self):
-        """Generate raises RuntimeError when pipeline not loaded."""
-        mock_policy = DevicePolicy(device="cpu", dtype=torch.float32, offload=OffloadMode.NEVER)
-        with patch.object(DevicePolicy, "auto_detect", return_value=mock_policy):
-            pipeline = Flux1PipelineWrapper()
-            with pytest.raises(RuntimeError, match="Pipeline not loaded"):
-                pipeline.generate("test prompt")
-
-    def test_generate_returns_result(self):
-        """Generate returns GenerationResult with correct fields."""
-        mock_policy = DevicePolicy(device="cpu", dtype=torch.float32, offload=OffloadMode.NEVER)
-        with patch.object(DevicePolicy, "auto_detect", return_value=mock_policy):
-            pipeline = Flux1PipelineWrapper()
-            mock_pipe = MagicMock()
-            mock_image = Image.new("RGB", (1024, 1024), color="blue")
-            mock_pipe.return_value.images = [mock_image]
-            pipeline.pipe = mock_pipe
-
-            result = pipeline.generate("a beautiful landscape", seed=42)
-
-            assert result.image is mock_image
-            assert result.seed == 42
-            assert result.prompt == "a beautiful landscape"
-            assert result.width == 1024
-            assert result.height == 1024
-
-    def test_generate_uses_default_parameters(self):
-        """Generate uses correct default parameters for FLUX.1-dev."""
-        mock_policy = DevicePolicy(device="cpu", dtype=torch.float32, offload=OffloadMode.NEVER)
-        with patch.object(DevicePolicy, "auto_detect", return_value=mock_policy):
-            pipeline = Flux1PipelineWrapper()
-            mock_pipe = MagicMock()
-            mock_image = Image.new("RGB", (1024, 1024))
-            mock_pipe.return_value.images = [mock_image]
-            pipeline.pipe = mock_pipe
-
-            pipeline.generate("test prompt", seed=42)
-
-            call_kwargs = mock_pipe.call_args[1]
-            assert call_kwargs["num_inference_steps"] == 28
-            assert call_kwargs["guidance_scale"] == 3.5
-            assert call_kwargs["max_sequence_length"] == 512
-
-    def test_generate_with_custom_parameters(self):
-        """Generate respects custom parameters."""
-        mock_policy = DevicePolicy(device="cpu", dtype=torch.float32, offload=OffloadMode.NEVER)
-        with patch.object(DevicePolicy, "auto_detect", return_value=mock_policy):
-            pipeline = Flux1PipelineWrapper()
-            mock_pipe = MagicMock()
-            mock_image = Image.new("RGB", (512, 512))
-            mock_pipe.return_value.images = [mock_image]
-            pipeline.pipe = mock_pipe
-
-            result = pipeline.generate(
-                "test prompt",
-                width=512,
-                height=512,
-                seed=123,
-                steps=4,
-                guidance_scale=0.0,
-            )
-
-            call_kwargs = mock_pipe.call_args[1]
-            assert call_kwargs["width"] == 512
-            assert call_kwargs["height"] == 512
-            assert call_kwargs["num_inference_steps"] == 4
-            assert call_kwargs["guidance_scale"] == 0.0
-            assert result.steps == 4
-
-    def test_generate_accepts_negative_prompt_for_api_compatibility(self):
-        """Generate accepts negative_prompt even though FLUX.1 doesn't use it."""
-        mock_policy = DevicePolicy(device="cpu", dtype=torch.float32, offload=OffloadMode.NEVER)
-        with patch.object(DevicePolicy, "auto_detect", return_value=mock_policy):
-            pipeline = Flux1PipelineWrapper()
-            mock_pipe = MagicMock()
-            mock_image = Image.new("RGB", (1024, 1024))
-            mock_pipe.return_value.images = [mock_image]
-            pipeline.pipe = mock_pipe
-
-            result = pipeline.generate("test prompt", negative_prompt="blurry", seed=42)
-
-            # negative_prompt is stored in result for compatibility
-            assert result.negative_prompt == "blurry"
-
-    def test_generate_random_seed_when_negative(self):
-        """Generate uses random seed when seed < 0."""
-        mock_policy = DevicePolicy(device="cpu", dtype=torch.float32, offload=OffloadMode.NEVER)
-        with patch.object(DevicePolicy, "auto_detect", return_value=mock_policy):
-            pipeline = Flux1PipelineWrapper()
-            mock_pipe = MagicMock()
-            mock_image = Image.new("RGB", (1024, 1024))
-            mock_pipe.return_value.images = [mock_image]
-            pipeline.pipe = mock_pipe
-
-            result = pipeline.generate("test prompt", seed=-1)
-
-            assert result.seed >= 0
-            assert result.seed < 2**32
+def test_unloaded_generation_rejected() -> None:
+    """Loading is still required."""
+    with pytest.raises(RuntimeError, match="not loaded"):
+        Flux1PipelineWrapper().generate("test")
 
 
-class TestFlux1PipelineWrapperImg2Img:
-    """Tests for Flux1PipelineWrapper img2img functionality."""
-
-    def test_generate_with_init_image(self):
-        """Generate supports img2img with init_image."""
-        import io
-
-        mock_policy = DevicePolicy(device="cpu", dtype=torch.float32, offload=OffloadMode.NEVER)
-        with patch.object(DevicePolicy, "auto_detect", return_value=mock_policy):
-            pipeline = Flux1PipelineWrapper()
-            mock_pipe = MagicMock()
-            mock_output = Image.new("RGB", (1024, 1024))
-            mock_pipe.return_value.images = [mock_output]
-            pipeline.pipe = mock_pipe
-
-            # Create init image bytes
-            init_img = Image.new("RGB", (512, 512), color="red")
-            buffer = io.BytesIO()
-            init_img.save(buffer, format="PNG")
-            init_bytes = buffer.getvalue()
-
-            result = pipeline.generate("test prompt", seed=42, init_image=init_bytes)
-
-            call_kwargs = mock_pipe.call_args[1]
-            assert "image" in call_kwargs
-            assert call_kwargs["strength"] == 0.75  # default strength
-            assert result.prompt == "test prompt"
-
-    def test_generate_with_custom_strength(self):
-        """Generate respects custom strength for img2img."""
-        import io
-
-        mock_policy = DevicePolicy(device="cpu", dtype=torch.float32, offload=OffloadMode.NEVER)
-        with patch.object(DevicePolicy, "auto_detect", return_value=mock_policy):
-            pipeline = Flux1PipelineWrapper()
-            mock_pipe = MagicMock()
-            mock_output = Image.new("RGB", (1024, 1024))
-            mock_pipe.return_value.images = [mock_output]
-            pipeline.pipe = mock_pipe
-
-            # Create init image bytes
-            init_img = Image.new("RGB", (512, 512), color="red")
-            buffer = io.BytesIO()
-            init_img.save(buffer, format="PNG")
-            init_bytes = buffer.getvalue()
-
-            pipeline.generate("test prompt", seed=42, init_image=init_bytes, strength=0.5)
-
-            call_kwargs = mock_pipe.call_args[1]
-            assert call_kwargs["strength"] == 0.5
+def test_schnell_guidance_is_recipe_controlled(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Schnell's transformer has no guidance embedding, so nonzero controls must fail."""
+    wrapper, _ = load_hosted(
+        Flux1PipelineWrapper, monkeypatch, {"repo": "black-forest-labs/FLUX.1-schnell"}
+    )
+    calls = capture_generation(wrapper, monkeypatch)
+    with pytest.raises(ValueError, match="recipe"):
+        wrapper.generate("test", guidance_scale=7.0)
+    assert calls == []

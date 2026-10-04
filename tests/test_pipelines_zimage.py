@@ -1,537 +1,414 @@
-"""Tests for pipelines.zimage module."""
+"""Offline Z-Image modular workflows and retained native mask exception."""
 
-from unittest.mock import MagicMock, patch
+import io
+from functools import wraps
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import torch
+from diffusers import ZImageInpaintPipeline
 from PIL import Image
 
-from oneiro.device import DevicePolicy, OffloadMode
+from oneiro.device import DevicePolicy, OffloadType
 from oneiro.pipelines.zimage import ZImagePipelineWrapper
+from tests.test_pipelines_modular import (
+    capture_generation,
+    image_bytes,
+    load_hosted,
+    place_embedding_wrapper,
+)
+from tests.test_pipelines_modular import offline as offline
 
 
-def make_image_bytes(color: str = "red") -> bytes:
-    """Create PNG image bytes for generation tests."""
-    import io
+@pytest.mark.parametrize("scale,encoded", [(0.0, ["positive"]), (5.0, ["positive", "negative"])])
+def test_native_negative_encoding_uses_actual_cfg_boundary(
+    monkeypatch: pytest.MonkeyPatch, scale: float, encoded: list[str]
+) -> None:
+    """Native Turbo guidance 0 encodes no negative text; the native CFG path still does."""
+    from tests.test_krea2_backport import TinyTextEncoder, TinyTokenizer
 
-    image = Image.new("RGB", (512, 512), color=color)
+    observed = []
+
+    class Tokenizer(TinyTokenizer):
+        def apply_chat_template(self, messages: list[dict[str, str]], **kwargs: Any) -> str:
+            text = messages[0]["content"]
+            observed.append(text)
+            return text
+
+    wrapper, _ = load_hosted(
+        ZImagePipelineWrapper,
+        monkeypatch,
+        assets={"tokenizer": Tokenizer(), "text_encoder": TinyTextEncoder()},
+    )
+    native = wrapper.inpaint_pipe
+    native.transformer.in_channels = 4
+    monkeypatch.setattr(
+        ZImageInpaintPipeline, "_execution_device", property(lambda self: torch.device("cpu"))
+    )
+
+    def stop(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("native model computation boundary")
+
+    monkeypatch.setattr(native, "prepare_latents", stop)
+    with pytest.raises(RuntimeError, match="native model computation boundary"):
+        native(
+            "positive",
+            negative_prompt="negative",
+            guidance_scale=scale,
+            image=Image.new("RGB", (32, 32)),
+            mask_image=Image.new("L", (32, 32)),
+            num_inference_steps=2,
+            strength=1.0,
+        )
+    assert native.do_classifier_free_guidance is (scale > 0)
+    assert observed == encoded
+    wrapper.unload()
+
+
+@pytest.mark.parametrize("source", ["hosted", "checkpoint"])
+@pytest.mark.parametrize("workflow", ["text2image", "image2image", "inpainting"])
+def test_turbo_rejects_ineffective_negative_before_resources(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source: str, workflow: str
+) -> None:
+    """A native input slot must not let Turbo report negative conditioning it never applies."""
+    from unittest.mock import Mock
+
+    from tests.test_civitai_checkpoint import checkpoint_wrapper
+
+    if source == "hosted":
+        wrapper, _ = load_hosted(ZImagePipelineWrapper, monkeypatch)
+    else:
+        wrapper, config, components = checkpoint_wrapper(
+            tmp_path, monkeypatch, "Z-Image Turbo", "turbo"
+        )
+        components["vae"].config = SimpleNamespace(block_out_channels=[8, 8])
+        wrapper.load(config)
+    controls = {} if workflow == "text2image" else {"init_image": image_bytes()}
+    if workflow == "inpainting":
+        controls["mask_image"] = image_bytes()
+    capture_generation(wrapper, monkeypatch)
+    decode, setup = Mock(wraps=wrapper._load_init_image), Mock(wraps=wrapper.pre_generate)
+    monkeypatch.setattr(wrapper, "_load_init_image", decode)
+    monkeypatch.setattr(wrapper, "pre_generate", setup)
+    with pytest.raises(ValueError, match="Negative prompts"):
+        wrapper.generate("positive", negative_prompt="negative", **controls)
+    decode.assert_not_called()
+    setup.assert_not_called()
+    wrapper.unload()
+
+
+def test_native_inpaint_sees_real_adapters(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The native exception observes real PEFT changes applied by the modular owner."""
+    from diffusers import ZImageModularPipeline, ZImageTransformer2DModel
+    from peft import LoraConfig as PeftLoraConfig
+    from peft.utils import get_peft_model_state_dict
+
+    from oneiro.pipelines.lora import LoraConfig, LoraSource
+
+    transformer = ZImageTransformer2DModel(
+        in_channels=4,
+        dim=16,
+        n_layers=1,
+        n_refiner_layers=1,
+        n_heads=2,
+        n_kv_heads=2,
+        cap_feat_dim=8,
+        axes_dims=[4, 2, 2],
+        axes_lens=[32, 32, 32],
+    )
+    transformer.add_adapter(PeftLoraConfig(r=2, target_modules=["to_q"]))
+    ZImageModularPipeline.save_lora_weights(
+        tmp_path / "adapter", transformer_lora_layers=get_peft_model_state_dict(transformer)
+    )
+    transformer.delete_adapters("default")
+    wrapper, _ = load_hosted(
+        ZImagePipelineWrapper, monkeypatch, assets={"transformer": transformer}
+    )
+    lora = LoraConfig(name="style", source=LoraSource.LOCAL, path="unused", weight=0.6)
+    lora._resolved_path = tmp_path / "adapter" / "pytorch_lora_weights.safetensors"
+    wrapper.load_loras_sync([lora])
+    assert wrapper.inpaint_pipe.transformer is wrapper.pipe.transformer is transformer
+    assert set(wrapper.inpaint_pipe.transformer.peft_config) == {"style"}
+    assert transformer.layers[0].attention.to_q.scaling["style"] == 0.6
+    wrapper.unload_loras()
+    assert not getattr(wrapper.inpaint_pipe.transformer, "peft_config", {})
+
+
+def test_zimage_native_inpaint_shares_components(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The exception is built before the one shared placement, using only native args."""
+    original = DevicePolicy.apply_to_modular_pipeline
+    placed = []
+    wrappers = []
+    original_init = ZImagePipelineWrapper.__init__
+
+    def init(wrapper: Any) -> None:
+        original_init(wrapper)
+        wrappers.append(wrapper)
+
+    def place(policy: DevicePolicy, pipe: Any, manager: Any) -> None:
+        wrapper = wrappers[-1]
+        assert isinstance(wrapper.inpaint_pipe, ZImageInpaintPipeline)
+        assert set(wrapper.inpaint_pipe.components) == {
+            "transformer",
+            "vae",
+            "text_encoder",
+            "tokenizer",
+            "scheduler",
+        }
+        assert all(
+            value is pipe.components[name]
+            for name, value in wrapper.inpaint_pipe.components.items()
+        )
+        placed.append(pipe)
+        original(policy, pipe, manager)
+
+    monkeypatch.setattr(ZImagePipelineWrapper, "__init__", init)
+    monkeypatch.setattr(DevicePolicy, "apply_to_modular_pipeline", place)
+    wrapper, _ = load_hosted(ZImagePipelineWrapper, monkeypatch)
+    assert placed == [wrapper.pipe]
+    assert "inpainting" not in wrapper.blocks.available_workflows
+    assert "mask_image" not in wrapper.blocks.get_workflow("text2image").input_names
+    assert "mask_image" in wrapper.workflow_inputs("inpainting")
+    manager = wrapper.components_manager
+    wrapper.unload()
+    assert wrapper.inpaint_pipe is None and manager.components == {}
+
+
+def test_native_constructor_failure_releases_shared_owner(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Failure before placement cannot retain loaded components or a second native view."""
+    from oneiro.pipelines import modular
+
+    managers = []
+    original = modular.ComponentsManager
+
+    def manager() -> Any:
+        instance = original()
+        managers.append(instance)
+        return instance
+
+    def fail(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("native constructor failed")
+
+    monkeypatch.setattr(modular, "ComponentsManager", manager)
+    monkeypatch.setattr(ZImageInpaintPipeline, "__init__", fail)
+    with pytest.raises(RuntimeError, match="native constructor failed"):
+        load_hosted(ZImagePipelineWrapper, monkeypatch)
+    assert managers[0].components == {} and managers[0].model_hooks is None
+
+
+def test_native_mask_routing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Only masks use the native exception, with decoded image and sized output."""
+    wrapper, _ = load_hosted(ZImagePipelineWrapper, monkeypatch)
+    calls = []
+
+    @wraps(ZImageInpaintPipeline.__call__)
+    def native(pipe: Any, **kwargs: Any) -> Any:
+        from types import SimpleNamespace
+
+        assert pipe.transformer is wrapper.pipe.transformer
+        calls.append(kwargs)
+        return SimpleNamespace(images=[Image.new("RGB", (kwargs["width"], kwargs["height"]))])
+
+    monkeypatch.setattr(ZImageInpaintPipeline, "__call__", native)
+    result = wrapper.generate(
+        "test",
+        init_image=image_bytes(),
+        mask_image=image_bytes(),
+        strength=0.4,
+        width=64,
+        height=32,
+        seed=42,
+    )
+    assert result.workflow == "inpainting" and result.strength == 0.4
+    assert result.image.size == (64, 32) and result.guidance_scale == 0.0
+    assert calls[0]["guidance_scale"] == 0.0
+    assert isinstance(calls[0]["mask_image"], Image.Image)
+    assert calls[0]["generator"].initial_seed() == 42
+    modular_calls = capture_generation(wrapper, monkeypatch)
+    wrapper.generate("test", init_image=image_bytes(), strength=0.5)
+    assert modular_calls[0]["strength"] == 0.5
+
+
+@pytest.mark.parametrize("offload_type", list(OffloadType))
+def test_native_exception_owns_no_extra_hooks(
+    monkeypatch: pytest.MonkeyPatch, offload_type: OffloadType
+) -> None:
+    """All native views observe the same hooked modules, and unload releases them once."""
+    wrapper, _ = load_hosted(ZImagePipelineWrapper, monkeypatch)
+    place_embedding_wrapper(wrapper, offload_type, monkeypatch)
+    model = wrapper.pipe.transformer
+    assert wrapper.inpaint_pipe.transformer is model
+    if offload_type == OffloadType.GROUP:
+        owned_hook = model._diffusers_hook.get_hook("group_offloading")
+        assert owned_hook is not None
+    else:
+        owned_hook = model._hf_hook
+    wrapper.inpaint_pipe.maybe_free_model_hooks()
+    wrapper.post_generate()
+    if offload_type == OffloadType.GROUP:
+        assert model._diffusers_hook.get_hook("group_offloading") is owned_hook
+    else:
+        assert model._hf_hook is owned_hook
+    manager = wrapper.components_manager
+    wrapper.unload()
+    assert not hasattr(model, "_hf_hook") and manager.components == {}
+    if hasattr(model, "_diffusers_hook"):
+        assert model._diffusers_hook.hooks == {}
+
+
+@pytest.mark.parametrize(
+    "controls",
+    [
+        {"mask_image": image_bytes()},
+        {"guidance_scale": 7.5},
+        {"init_image": image_bytes(), "strength": float("nan")},
+        {"control_image": image_bytes()},
+    ],
+)
+def test_invalid_native_controls(monkeypatch: pytest.MonkeyPatch, controls: dict[str, Any]) -> None:
+    """Missing image, unsupported CFG, and invalid controls fail before inference."""
+    wrapper, _ = load_hosted(ZImagePipelineWrapper, monkeypatch)
+    with pytest.raises(ValueError):
+        wrapper.generate("test", **controls)
+
+
+def test_custom_source_needs_variant(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Unknown sources must explicitly declare Turbo."""
+    with pytest.raises(ValueError, match="variant"):
+        load_hosted(ZImagePipelineWrapper, monkeypatch, {"repo": "custom/turbo"})
+
+
+@pytest.mark.parametrize(
+    "size,region",
+    [
+        ((32, 32), (8, 4, 24, 20)),
+        ((64, 32), (16, 4, 48, 20)),
+        ((32, 64), (8, 8, 24, 40)),
+        ((64, 64), (16, 8, 48, 40)),
+    ],
+    ids=["same-size", "wider", "taller", "larger-square"],
+)
+def test_native_inpaint_resizes_source_and_aligned_mask(
+    monkeypatch: pytest.MonkeyPatch,
+    size: tuple[int, int],
+    region: tuple[int, int, int, int],
+) -> None:
+    """Real native VAE/denoising must use requested, mutually aligned image coordinates."""
+    from diffusers import AutoencoderKL, ZImageTransformer2DModel
+
+    from tests.test_krea2_backport import TinyTextEncoder
+
+    transformer = ZImageTransformer2DModel(
+        in_channels=4,
+        dim=16,
+        n_layers=1,
+        n_refiner_layers=1,
+        n_heads=2,
+        n_kv_heads=2,
+        cap_feat_dim=8,
+        axes_dims=[4, 2, 2],
+        axes_lens=[128, 128, 128],
+    ).eval()
+    vae = AutoencoderKL(
+        down_block_types=("DownEncoderBlock2D",) * 4,
+        up_block_types=("UpDecoderBlock2D",) * 4,
+        block_out_channels=(8,) * 4,
+        norm_num_groups=4,
+        latent_channels=4,
+        shift_factor=0.0,
+    ).eval()
+    wrapper, _ = load_hosted(
+        ZImagePipelineWrapper,
+        monkeypatch,
+        assets={"transformer": transformer, "vae": vae, "text_encoder": TinyTextEncoder()},
+    )
+    native = wrapper.inpaint_pipe
+    native.set_progress_bar_config(disable=True)
+    resources = dict(native.components)
+    seen = {}
+
+    def prompt(**kwargs: Any) -> tuple[list[torch.Tensor], None]:
+        return [torch.zeros(4, 8)], None
+
+    monkeypatch.setattr(native, "encode_prompt", prompt)
+    original_latents = native.prepare_latents
+    original_mask_latents = native.prepare_mask_latents
+
+    def record_latents(image: torch.Tensor, *args: Any, **kwargs: Any) -> Any:
+        seen["source"] = image.detach().clone()
+        return original_latents(image, *args, **kwargs)
+
+    def record_mask_latents(
+        mask: torch.Tensor, masked_image: torch.Tensor, *args: Any, **kwargs: Any
+    ) -> Any:
+        seen["mask"] = mask.detach().clone()
+        seen["masked_source"] = masked_image.detach().clone()
+        return original_mask_latents(mask, masked_image, *args, **kwargs)
+
+    # Observation only: all latent preparation, VAE encode/decode and denoising stay native.
+    monkeypatch.setattr(native, "prepare_latents", record_latents)
+    monkeypatch.setattr(native, "prepare_mask_latents", record_mask_latents)
+    source = Image.new("RGB", (32, 32), "black")
+    source.paste("white", (8, 4, 24, 20))
     buffer = io.BytesIO()
-    image.save(buffer, format="PNG")
-    return buffer.getvalue()
-
-
-def make_zimage_components() -> dict[str, MagicMock]:
-    """Create mock Z-Image components shared across pipeline variants."""
-    return {
-        "scheduler": MagicMock(),
-        "vae": MagicMock(),
-        "text_encoder": MagicMock(),
-        "tokenizer": MagicMock(),
-        "transformer": MagicMock(),
-    }
-
-
-class TestZImagePipelineWrapperInit:
-    """Tests for ZImagePipelineWrapper initialization."""
-
-    def test_init_creates_instance(self):
-        """ZImagePipelineWrapper can be instantiated."""
-        mock_policy = DevicePolicy(device="cpu", dtype=torch.float32, offload=OffloadMode.NEVER)
-        with patch.object(DevicePolicy, "auto_detect", return_value=mock_policy):
-            pipeline = ZImagePipelineWrapper()
-        assert pipeline.pipe is None
-        assert pipeline.policy.device == "cpu"
-
-
-class TestZImagePipelineWrapperLoad:
-    """Tests for ZImagePipelineWrapper.load()."""
-
-    @patch("diffusers.ZImageInpaintPipeline")
-    @patch("diffusers.ZImageImg2ImgPipeline")
-    @patch("diffusers.ZImagePipeline")
-    def test_load_with_default_repo(
-        self, mock_zimage_pipeline, mock_img2img_pipeline, mock_inpaint_pipeline
-    ):
-        """Load uses default repo when not specified."""
-        mock_pipe = MagicMock()
-        mock_pipe.components = make_zimage_components()
-        mock_zimage_pipeline.from_pretrained.return_value = mock_pipe
-
-        pipeline = ZImagePipelineWrapper()
-        pipeline.load({})
-
-        mock_zimage_pipeline.from_pretrained.assert_called_once()
-        call_args = mock_zimage_pipeline.from_pretrained.call_args
-        assert call_args[0][0] == "Tongyi-MAI/Z-Image-Turbo"
-        mock_img2img_pipeline.assert_called_once_with(**mock_pipe.components)
-        mock_inpaint_pipeline.assert_called_once_with(**mock_pipe.components)
-
-    @patch("diffusers.ZImageInpaintPipeline")
-    @patch("diffusers.ZImageImg2ImgPipeline")
-    @patch("diffusers.ZImagePipeline")
-    def test_load_with_custom_repo(
-        self, mock_zimage_pipeline, mock_img2img_pipeline, mock_inpaint_pipeline
-    ):
-        """Load uses custom repo from config."""
-        mock_pipe = MagicMock()
-        mock_pipe.components = make_zimage_components()
-        mock_zimage_pipeline.from_pretrained.return_value = mock_pipe
-
-        pipeline = ZImagePipelineWrapper()
-        pipeline.load({"repo": "custom/z-image"})
-
-        call_args = mock_zimage_pipeline.from_pretrained.call_args
-        assert call_args[0][0] == "custom/z-image"
-        mock_img2img_pipeline.assert_called_once_with(**mock_pipe.components)
-        mock_inpaint_pipeline.assert_called_once_with(**mock_pipe.components)
-
-    @patch("diffusers.ZImageInpaintPipeline")
-    @patch("diffusers.ZImageImg2ImgPipeline")
-    @patch("diffusers.ZImagePipeline")
-    def test_load_enables_group_offload_on_cuda(
-        self, mock_zimage_pipeline, mock_img2img_pipeline, mock_inpaint_pipeline
-    ):
-        """Load enables group offload on CUDA by default."""
-        mock_pipe = MagicMock()
-        mock_pipe.components = make_zimage_components()
-        mock_zimage_pipeline.from_pretrained.return_value = mock_pipe
-
-        # Mock CUDA being available
-        mock_policy = DevicePolicy(device="cuda", dtype=torch.float16, offload=OffloadMode.AUTO)
-        with patch.object(DevicePolicy, "auto_detect", return_value=mock_policy):
-            pipeline = ZImagePipelineWrapper()
-            pipeline.load({})
-
-        mock_pipe.enable_group_offload.assert_called_once()
-        mock_img2img_pipeline.assert_called_once_with(**mock_pipe.components)
-        mock_inpaint_pipeline.assert_called_once_with(**mock_pipe.components)
-
-    @patch("diffusers.ZImageInpaintPipeline")
-    @patch("diffusers.ZImageImg2ImgPipeline")
-    @patch("diffusers.ZImagePipeline")
-    def test_load_disables_cpu_offload_when_configured(
-        self, mock_zimage_pipeline, mock_img2img_pipeline, mock_inpaint_pipeline
-    ):
-        """Load respects cpu_offload=False config."""
-        mock_pipe = MagicMock()
-        mock_pipe.components = make_zimage_components()
-        mock_zimage_pipeline.from_pretrained.return_value = mock_pipe
-
-        pipeline = ZImagePipelineWrapper()
-        pipeline.load({"cpu_offload": False})
-
-        mock_pipe.enable_group_offload.assert_not_called()
-        mock_pipe.enable_model_cpu_offload.assert_not_called()
-        mock_img2img_pipeline.assert_called_once_with(**mock_pipe.components)
-        mock_inpaint_pipeline.assert_called_once_with(**mock_pipe.components)
-
-
-class TestZImagePipelineWrapperGenerate:
-    """Tests for ZImagePipelineWrapper.generate()."""
-
-    def test_generate_raises_when_not_loaded(self):
-        """Generate raises RuntimeError when pipeline not loaded."""
-        mock_policy = DevicePolicy(device="cpu", dtype=torch.float32, offload=OffloadMode.NEVER)
-        with patch.object(DevicePolicy, "auto_detect", return_value=mock_policy):
-            pipeline = ZImagePipelineWrapper()
-            with pytest.raises(RuntimeError, match="Pipeline not loaded"):
-                pipeline.generate("test prompt")
-
-    def test_generate_returns_result(self):
-        """Generate returns GenerationResult with correct fields."""
-        mock_policy = DevicePolicy(device="cpu", dtype=torch.float32, offload=OffloadMode.NEVER)
-        with patch.object(DevicePolicy, "auto_detect", return_value=mock_policy):
-            pipeline = ZImagePipelineWrapper()
-            mock_pipe = MagicMock()
-            mock_image = Image.new("RGB", (1024, 1024), color="blue")
-            mock_pipe.return_value.images = [mock_image]
-            pipeline.pipe = mock_pipe
-
-            result = pipeline.generate("a beautiful landscape", seed=42)
-
-            assert result.image is mock_image
-            assert result.seed == 42
-            assert result.prompt == "a beautiful landscape"
-            assert result.width == 1024
-            assert result.height == 1024
-
-    def test_generate_forces_guidance_scale_zero(self):
-        """Generate always uses guidance_scale=0.0 for Turbo model."""
-        mock_policy = DevicePolicy(device="cpu", dtype=torch.float32, offload=OffloadMode.NEVER)
-        with patch.object(DevicePolicy, "auto_detect", return_value=mock_policy):
-            pipeline = ZImagePipelineWrapper()
-            mock_pipe = MagicMock()
-            mock_image = Image.new("RGB", (1024, 1024))
-            mock_pipe.return_value.images = [mock_image]
-            pipeline.pipe = mock_pipe
-
-            # Try to pass guidance_scale=7.5, it should be forced to 0.0
-            result = pipeline.generate("test prompt", seed=42, guidance_scale=7.5)
-
-            call_kwargs = mock_pipe.call_args[1]
-            assert call_kwargs["guidance_scale"] == 0.0
-            assert result.guidance_scale == 0.0
-
-    def test_generate_uses_default_parameters(self):
-        """Generate uses correct default parameters for Z-Image-Turbo."""
-        mock_policy = DevicePolicy(device="cpu", dtype=torch.float32, offload=OffloadMode.NEVER)
-        with patch.object(DevicePolicy, "auto_detect", return_value=mock_policy):
-            pipeline = ZImagePipelineWrapper()
-            mock_pipe = MagicMock()
-            mock_image = Image.new("RGB", (1024, 1024))
-            mock_pipe.return_value.images = [mock_image]
-            pipeline.pipe = mock_pipe
-
-            pipeline.generate("test prompt", seed=42)
-
-            call_kwargs = mock_pipe.call_args[1]
-            assert call_kwargs["num_inference_steps"] == 9
-            assert call_kwargs["guidance_scale"] == 0.0
-
-    def test_generate_with_custom_parameters(self):
-        """Generate respects custom parameters (except guidance_scale)."""
-        mock_policy = DevicePolicy(device="cpu", dtype=torch.float32, offload=OffloadMode.NEVER)
-        with patch.object(DevicePolicy, "auto_detect", return_value=mock_policy):
-            pipeline = ZImagePipelineWrapper()
-            mock_pipe = MagicMock()
-            mock_image = Image.new("RGB", (512, 512))
-            mock_pipe.return_value.images = [mock_image]
-            pipeline.pipe = mock_pipe
-
-            result = pipeline.generate(
-                "test prompt",
-                width=512,
-                height=512,
-                seed=123,
-                steps=4,
-            )
-
-            call_kwargs = mock_pipe.call_args[1]
-            assert call_kwargs["width"] == 512
-            assert call_kwargs["height"] == 512
-            assert call_kwargs["num_inference_steps"] == 4
-            assert result.steps == 4
-
-    def test_generate_accepts_negative_prompt(self):
-        """Generate accepts and passes negative_prompt."""
-        mock_policy = DevicePolicy(device="cpu", dtype=torch.float32, offload=OffloadMode.NEVER)
-        with patch.object(DevicePolicy, "auto_detect", return_value=mock_policy):
-            pipeline = ZImagePipelineWrapper()
-            mock_pipe = MagicMock()
-            mock_image = Image.new("RGB", (1024, 1024))
-            mock_pipe.return_value.images = [mock_image]
-            pipeline.pipe = mock_pipe
-
-            result = pipeline.generate("test prompt", negative_prompt="blurry", seed=42)
-
-            call_kwargs = mock_pipe.call_args[1]
-            assert call_kwargs["negative_prompt"] == "blurry"
-            assert result.negative_prompt == "blurry"
-
-    def test_generate_random_seed_when_negative(self):
-        """Generate uses random seed when seed < 0."""
-        mock_policy = DevicePolicy(device="cpu", dtype=torch.float32, offload=OffloadMode.NEVER)
-        with patch.object(DevicePolicy, "auto_detect", return_value=mock_policy):
-            pipeline = ZImagePipelineWrapper()
-            mock_pipe = MagicMock()
-            mock_image = Image.new("RGB", (1024, 1024))
-            mock_pipe.return_value.images = [mock_image]
-            pipeline.pipe = mock_pipe
-
-            result = pipeline.generate("test prompt", seed=-1)
-
-            assert result.seed >= 0
-            assert result.seed < 2**32
-
-
-class TestZImagePipelineWrapperImg2Img:
-    """Tests for ZImagePipelineWrapper img2img functionality."""
-
-    def test_generate_with_init_image(self):
-        """Generate supports img2img with init_image."""
-        mock_policy = DevicePolicy(device="cpu", dtype=torch.float32, offload=OffloadMode.NEVER)
-        with patch.object(DevicePolicy, "auto_detect", return_value=mock_policy):
-            pipeline = ZImagePipelineWrapper()
-            mock_pipe = MagicMock()
-            mock_img2img_pipe = MagicMock()
-            mock_output = Image.new("RGB", (1024, 1024))
-            mock_img2img_pipe.return_value.images = [mock_output]
-            pipeline.pipe = mock_pipe
-            pipeline.img2img_pipe = mock_img2img_pipe
-            init_bytes = make_image_bytes()
-
-            result = pipeline.generate("test prompt", seed=42, init_image=init_bytes)
-
-            mock_pipe.assert_not_called()
-            mock_img2img_pipe.assert_called_once()
-            call_kwargs = mock_img2img_pipe.call_args[1]
-            assert "image" in call_kwargs
-            assert call_kwargs["strength"] == 0.75  # default strength
-            assert call_kwargs["guidance_scale"] == 0.0  # still forced to 0.0
-            assert result.prompt == "test prompt"
-
-    def test_generate_with_custom_strength(self):
-        """Generate respects custom strength for img2img."""
-        mock_policy = DevicePolicy(device="cpu", dtype=torch.float32, offload=OffloadMode.NEVER)
-        with patch.object(DevicePolicy, "auto_detect", return_value=mock_policy):
-            pipeline = ZImagePipelineWrapper()
-            mock_pipe = MagicMock()
-            mock_img2img_pipe = MagicMock()
-            mock_output = Image.new("RGB", (1024, 1024))
-            mock_img2img_pipe.return_value.images = [mock_output]
-            pipeline.pipe = mock_pipe
-            pipeline.img2img_pipe = mock_img2img_pipe
-            init_bytes = make_image_bytes()
-
-            pipeline.generate("test prompt", seed=42, init_image=init_bytes, strength=0.5)
-
-            mock_pipe.assert_not_called()
-            call_kwargs = mock_img2img_pipe.call_args[1]
-            assert call_kwargs["strength"] == 0.5
-
-    def test_generate_with_mask_uses_inpaint_pipeline(self):
-        """Generate supports inpainting with init_image and mask_image."""
-        mock_policy = DevicePolicy(device="cpu", dtype=torch.float32, offload=OffloadMode.NEVER)
-        with patch.object(DevicePolicy, "auto_detect", return_value=mock_policy):
-            pipeline = ZImagePipelineWrapper()
-            mock_pipe = MagicMock()
-            mock_img2img_pipe = MagicMock()
-            mock_inpaint_pipe = MagicMock()
-            mock_output = Image.new("RGB", (1024, 1024))
-            mock_inpaint_pipe.return_value.images = [mock_output]
-            pipeline.pipe = mock_pipe
-            pipeline.img2img_pipe = mock_img2img_pipe
-            pipeline.inpaint_pipe = mock_inpaint_pipe
-
-            result = pipeline.generate(
-                "test prompt",
-                seed=42,
-                init_image=make_image_bytes("red"),
-                mask_image=make_image_bytes("white"),
-                strength=0.4,
-            )
-
-            mock_pipe.assert_not_called()
-            mock_img2img_pipe.assert_not_called()
-            mock_inpaint_pipe.assert_called_once()
-            call_kwargs = mock_inpaint_pipe.call_args[1]
-            assert "image" in call_kwargs
-            assert "mask_image" in call_kwargs
-            assert call_kwargs["strength"] == 0.4
-            assert call_kwargs["guidance_scale"] == 0.0
-            assert result.prompt == "test prompt"
-
-    def test_generate_with_mask_without_init_image_raises(self):
-        """Inpainting requires both init_image and mask_image."""
-        mock_policy = DevicePolicy(device="cpu", dtype=torch.float32, offload=OffloadMode.NEVER)
-        with patch.object(DevicePolicy, "auto_detect", return_value=mock_policy):
-            pipeline = ZImagePipelineWrapper()
-            pipeline.pipe = MagicMock()
-            pipeline.inpaint_pipe = MagicMock()
-
-            with pytest.raises(ValueError, match="requires both image and mask_image"):
-                pipeline.generate("test prompt", seed=42, mask_image=make_image_bytes("white"))
-
-
-class TestZImagePipelineWrapperPostGenerate:
-    """Tests for ZImagePipelineWrapper.post_generate() LoRA state reset."""
-
-    def test_post_generate_no_loras_loaded_does_nothing(self):
-        """post_generate with no loaded adapters returns early."""
-        mock_policy = DevicePolicy(device="cpu", dtype=torch.float32, offload=OffloadMode.NEVER)
-        with patch.object(DevicePolicy, "auto_detect", return_value=mock_policy):
-            pipeline = ZImagePipelineWrapper()
-            pipeline.pipe = MagicMock()
-            pipeline._loaded_adapters = []
-            pipeline._static_lora_configs = []
-
-            # Should not raise and not call any pipe methods
-            pipeline.post_generate()
-
-            pipeline.pipe.unload_lora_weights.assert_not_called()
-            pipeline.pipe.set_adapters.assert_not_called()
-
-    def test_post_generate_static_only_resets_weights(self):
-        """post_generate with only static LoRAs resets adapter weights."""
-        from oneiro.pipelines.lora import LoraConfig, LoraSource
-
-        mock_policy = DevicePolicy(device="cpu", dtype=torch.float32, offload=OffloadMode.NEVER)
-        with patch.object(DevicePolicy, "auto_detect", return_value=mock_policy):
-            pipeline = ZImagePipelineWrapper()
-            pipeline.pipe = MagicMock()
-
-            static_lora = LoraConfig(
-                name="static-lora",
-                source=LoraSource.LOCAL,
-                path="/fake/path.safetensors",
-                adapter_name="static-adapter",
-                weight=0.8,
-            )
-            pipeline._loaded_adapters = ["static-adapter"]
-            pipeline._lora_configs = [static_lora]
-            pipeline._static_lora_configs = [static_lora]
-
-            pipeline.post_generate()
-
-            # Should reset weights without unloading
-            pipeline.pipe.unload_lora_weights.assert_not_called()
-            pipeline.pipe.set_adapters.assert_called_once_with(
-                ["static-adapter"], adapter_weights=[0.8]
-            )
-
-    def test_post_generate_dynamic_loras_unloads_and_restores_static(self):
-        """post_generate unloads dynamic LoRAs and restores static ones."""
-        from oneiro.pipelines.lora import LoraConfig, LoraSource
-
-        mock_policy = DevicePolicy(device="cpu", dtype=torch.float32, offload=OffloadMode.NEVER)
-        with patch.object(DevicePolicy, "auto_detect", return_value=mock_policy):
-            pipeline = ZImagePipelineWrapper()
-            pipeline.pipe = MagicMock()
-
-            static_lora = LoraConfig(
-                name="static-lora",
-                source=LoraSource.LOCAL,
-                path="/fake/static.safetensors",
-                adapter_name="static-adapter",
-                weight=0.7,
-            )
-            static_lora._resolved_path = "/fake/static.safetensors"
-
-            # Simulate dynamic LoRA was added (2 loaded but only 1 static)
-            pipeline._loaded_adapters = ["static-adapter", "dynamic-adapter"]
-            pipeline._lora_configs = [static_lora, MagicMock()]
-            pipeline._static_lora_configs = [static_lora]
-
-            pipeline.post_generate()
-
-            # Should unload all LoRAs
-            pipeline.pipe.unload_lora_weights.assert_called_once()
-            # Should reload static LoRAs
-            pipeline.pipe.load_lora_weights.assert_called()
-
-    def test_post_generate_dynamic_loras_no_static_just_unloads(self):
-        """post_generate with dynamic LoRAs but no static ones just unloads."""
-        mock_policy = DevicePolicy(device="cpu", dtype=torch.float32, offload=OffloadMode.NEVER)
-        with patch.object(DevicePolicy, "auto_detect", return_value=mock_policy):
-            pipeline = ZImagePipelineWrapper()
-            pipeline.pipe = MagicMock()
-
-            # Dynamic LoRA loaded but no static LoRAs
-            pipeline._loaded_adapters = ["dynamic-adapter"]
-            pipeline._lora_configs = [MagicMock()]
-            pipeline._static_lora_configs = []
-
-            pipeline.post_generate()
-
-            # Should unload
-            pipeline.pipe.unload_lora_weights.assert_called_once()
-            # Should NOT try to reload (no static LoRAs)
-            pipeline.pipe.load_lora_weights.assert_not_called()
-
-    def test_post_generate_multiple_static_loras_all_restored(self):
-        """post_generate restores all static LoRAs with correct weights."""
-        from oneiro.pipelines.lora import LoraConfig, LoraSource
-
-        mock_policy = DevicePolicy(device="cpu", dtype=torch.float32, offload=OffloadMode.NEVER)
-        with patch.object(DevicePolicy, "auto_detect", return_value=mock_policy):
-            pipeline = ZImagePipelineWrapper()
-            pipeline.pipe = MagicMock()
-
-            static_lora1 = LoraConfig(
-                name="static-1",
-                source=LoraSource.LOCAL,
-                path="/fake/lora1.safetensors",
-                adapter_name="adapter-1",
-                weight=0.5,
-            )
-            static_lora2 = LoraConfig(
-                name="static-2",
-                source=LoraSource.LOCAL,
-                path="/fake/lora2.safetensors",
-                adapter_name="adapter-2",
-                weight=0.9,
-            )
-
-            # Only static adapters loaded, should reset weights
-            pipeline._loaded_adapters = ["adapter-1", "adapter-2"]
-            pipeline._lora_configs = [static_lora1, static_lora2]
-            pipeline._static_lora_configs = [static_lora1, static_lora2]
-
-            pipeline.post_generate()
-
-            # Should reset weights for both
-            pipeline.pipe.set_adapters.assert_called_once_with(
-                ["adapter-1", "adapter-2"], adapter_weights=[0.5, 0.9]
-            )
-
-    def test_post_generate_prevents_state_leakage_between_generations(self):
-        """post_generate called after each generation prevents state leakage."""
-        from oneiro.pipelines.lora import LoraConfig, LoraSource
-
-        mock_policy = DevicePolicy(device="cpu", dtype=torch.float32, offload=OffloadMode.NEVER)
-        with patch.object(DevicePolicy, "auto_detect", return_value=mock_policy):
-            pipeline = ZImagePipelineWrapper()
-            mock_pipe = MagicMock()
-            mock_image = Image.new("RGB", (1024, 1024))
-            mock_pipe.return_value.images = [mock_image]
-            pipeline.pipe = mock_pipe
-
-            static_lora = LoraConfig(
-                name="static-lora",
-                source=LoraSource.LOCAL,
-                path="/fake/static.safetensors",
-                adapter_name="static-adapter",
-                weight=0.8,
-            )
-            pipeline._loaded_adapters = ["static-adapter"]
-            pipeline._lora_configs = [static_lora]
-            pipeline._static_lora_configs = [static_lora]
-
-            # First generation
-            pipeline.generate("prompt 1", seed=42)
-
-            # post_generate should have been called and reset weights
-            pipeline.pipe.set_adapters.assert_called()
-
-            # Reset mock to track second generation
-            pipeline.pipe.reset_mock()
-
-            # Second generation - weights should be reset again
-            pipeline.generate("prompt 2", seed=43)
-            pipeline.pipe.set_adapters.assert_called()
-
-    def test_post_generate_uses_adapter_name_over_name(self):
-        """post_generate uses adapter_name when set, falls back to name."""
-        from oneiro.pipelines.lora import LoraConfig, LoraSource
-
-        mock_policy = DevicePolicy(device="cpu", dtype=torch.float32, offload=OffloadMode.NEVER)
-        with patch.object(DevicePolicy, "auto_detect", return_value=mock_policy):
-            pipeline = ZImagePipelineWrapper()
-            pipeline.pipe = MagicMock()
-
-            # LoRA with explicit adapter_name different from name
-            lora_with_adapter_name = LoraConfig(
-                name="lora-display-name",
-                source=LoraSource.LOCAL,
-                path="/fake/path.safetensors",
-                adapter_name="actual-adapter-name",
-                weight=0.6,
-            )
-            # LoRA without adapter_name (should use name)
-            lora_without_adapter_name = LoraConfig(
-                name="fallback-name",
-                source=LoraSource.LOCAL,
-                path="/fake/path2.safetensors",
-                weight=0.4,
-            )
-
-            pipeline._loaded_adapters = ["actual-adapter-name", "fallback-name"]
-            pipeline._lora_configs = [lora_with_adapter_name, lora_without_adapter_name]
-            pipeline._static_lora_configs = [lora_with_adapter_name, lora_without_adapter_name]
-
-            pipeline.post_generate()
-
-            # Should use adapter_name when available, name as fallback
-            pipeline.pipe.set_adapters.assert_called_once_with(
-                ["actual-adapter-name", "fallback-name"], adapter_weights=[0.6, 0.4]
-            )
+    source.save(buffer, format="PNG")
+    result = wrapper.generate(
+        "test",
+        init_image=buffer.getvalue(),
+        mask_image=buffer.getvalue(),
+        width=size[0],
+        height=size[1],
+        steps=2,
+        strength=1.0,
+        seed=42,
+    )
+    assert result.image.size == size
+    assert (result.width, result.height) == size
+    assert result.workflow == "inpainting" and result.guidance_scale == 0.0
+    assert seen["source"].shape == (1, 3, size[1], size[0])
+    assert seen["mask"].shape == (1, 1, size[1], size[0])
+    expected_mask = torch.zeros(size[1], size[0])
+    left, top, right, bottom = region
+    expected_mask[top:bottom, left:right] = 1
+    torch.testing.assert_close(seen["mask"][0, 0], expected_mask)
+    assert torch.equal(seen["source"][0, 0] > 0, expected_mask.bool())
+    assert seen["masked_source"][0, :, expected_mask.bool()].count_nonzero() == 0
+    assert all(
+        wrapper.pipe.components[name] is native.components[name] is resource
+        for name, resource in resources.items()
+    )
+    wrapper.unload()
+
+
+@pytest.mark.parametrize("image_only", [False, True], ids=["default-text", "image-only"])
+def test_non_mask_routing_keeps_source_coordinates(
+    monkeypatch: pytest.MonkeyPatch, image_only: bool
+) -> None:
+    """Native-mask normalization must not resize inputs to the shared modular paths."""
+    from oneiro.pipelines.base import BasePipeline
+
+    wrapper, _ = load_hosted(ZImagePipelineWrapper, monkeypatch)
+    seen = []
+
+    def modular_boundary(owner: Any, gen_kwargs: dict[str, Any], is_img2img: bool) -> Any:
+        seen.append(gen_kwargs)
+        assert is_img2img is image_only
+        raise RuntimeError("modular boundary reached")
+
+    monkeypatch.setattr(BasePipeline, "run_inference", modular_boundary)
+    controls = {"init_image": image_bytes(), "width": 64, "height": 32} if image_only else {}
+    with pytest.raises(RuntimeError, match="modular boundary reached"):
+        wrapper.generate("test", **controls)
+    assert seen[0]["num_inference_steps"] == 9
+    assert "guidance_scale" not in seen[0]
+    assert wrapper.pipe.guider.config.enabled is False
+    assert (seen[0]["width"], seen[0]["height"]) == ((64, 32) if image_only else (1024, 1024))
+    if image_only:
+        assert seen[0]["image"].size == (32, 32)
+        assert seen[0]["strength"] == 0.75
+    else:
+        assert "image" not in seen[0] and "strength" not in seen[0]
+    assert "mask_image" not in seen[0]
+    wrapper.unload()

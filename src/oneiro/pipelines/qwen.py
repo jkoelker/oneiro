@@ -1,23 +1,20 @@
-"""Qwen-Image pipeline wrapper with LoRA, GGUF, and embedding support."""
+"""Hosted Qwen-Image native recipe with single-file/GGUF transformer injection."""
 
 import math
 import os
 from typing import Any
 
-import torch
-from PIL import Image
+from diffusers import FlowMatchEulerDiscreteScheduler, QwenImageAutoBlocks
 
-from oneiro.device import DevicePolicy
-from oneiro.pipelines.base import BasePipeline, GenerationResult
-from oneiro.pipelines.embedding import EmbeddingLoaderMixin, parse_embeddings_from_config
-from oneiro.pipelines.lora import LoraLoaderMixin
+from oneiro.pipelines.modular import ModularPipelineWrapper
 
 
-class QwenPipelineWrapper(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipeline):
-    """Wrapper for Qwen-Image with multi-LoRA, GGUF, and embedding support."""
+class QwenPipelineWrapper(ModularPipelineWrapper):
+    """Use native Qwen CFG, with optional single-file/GGUF transformer injection."""
 
-    def __init__(self) -> None:
-        super().__init__()
+    family = "qwen"
+    default_steps = 8
+    default_guidance_scale = 4.0
 
     def _parse_transformer_path(self, transformer: str) -> tuple[str, bool]:
         """Parse transformer path, returning (resolved_path, is_gguf).
@@ -84,8 +81,22 @@ class QwenPipelineWrapper(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipeline):
             subfolder="transformer",
         )
 
+    def validate_config(
+        self, model_config: dict[str, Any], full_config: dict[str, Any] | None = None
+    ) -> None:
+        """Resolve Qwen Image and placement without loading checkpoint or hosted assets."""
+        repo = model_config.get("repo", "Qwen/Qwen-Image")
+        known = {"Qwen/Qwen-Image", "Qwen/Qwen-Image-2512"}
+        variant = model_config.get("variant", "image" if repo in known else None)
+        if variant != "image":
+            raise ValueError("Qwen requires variant='image' for custom model sources")
+        if model_config.get("embeddings") or model_config.get("inline_embeddings"):
+            raise ValueError("Qwen does not support textual inversion embeddings")
+        self._component_repo, self.blocks = repo, QwenImageAutoBlocks()
+        super().validate_config(model_config, full_config)
+
     def load(self, model_config: dict[str, Any], full_config: dict[str, Any] | None = None) -> None:
-        """Load Qwen-Image model with optional LoRA, GGUF, and embedding support.
+        """Load native Qwen blocks and preserve the single-file transformer API.
 
         Config options:
             repo: Base model repository (default: Qwen/Qwen-Image)
@@ -93,28 +104,13 @@ class QwenPipelineWrapper(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipeline):
                 - Local path: /path/to/model.gguf
                 - HF Hub: repo_id:filename (e.g., unsloth/Qwen-Image-GGUF:qwen-image-Q4_K_S.gguf)
                 GGUF quantization is auto-detected from .gguf extension.
-            lora: LoRA repository
-            lora_weights: LoRA weights filename
+            variant: Explicit 'image' metadata for custom model sources.
             cpu_offload: Enable CPU offload (default: True)
             offload_type: Offload implementation: group, model, or sequential
         """
-        from diffusers import DiffusionPipeline, FlowMatchEulerDiscreteScheduler
-
-        repo = model_config.get("repo", "Qwen/Qwen-Image")
+        self.validate_config(model_config, full_config)
+        repo = self._component_repo
         transformer_path = model_config.get("transformer")
-        cpu_offload = model_config.get("cpu_offload", True)
-        offload_type = model_config.get("offload_type", "group")
-        group_offload_type = model_config.get("group_offload_type", "leaf_level")
-        group_offload_use_stream = model_config.get("group_offload_use_stream", True)
-        group_offload_num_blocks_per_group = model_config.get("group_offload_num_blocks_per_group")
-
-        self.policy = DevicePolicy.auto_detect(
-            cpu_offload=cpu_offload,
-            offload_type=offload_type,
-            group_offload_type=group_offload_type,
-            group_offload_use_stream=group_offload_use_stream,
-            group_offload_num_blocks_per_group=group_offload_num_blocks_per_group,
-        )
 
         print(f"Loading Qwen-Image from {repo}")
 
@@ -142,119 +138,7 @@ class QwenPipelineWrapper(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipeline):
         if transformer_path:
             transformer = self._load_transformer(transformer_path, repo)
 
-        pipeline_kwargs: dict[str, Any] = {
-            "scheduler": scheduler,
-            "torch_dtype": self.policy.dtype,
-        }
+        components: dict[str, Any] = {"scheduler": scheduler}
         if transformer is not None:
-            pipeline_kwargs["transformer"] = transformer
-
-        self.pipe = DiffusionPipeline.from_pretrained(repo, **pipeline_kwargs)
-
-        if full_config:
-            embeddings = parse_embeddings_from_config(full_config, model_config)
-            if embeddings:
-                print(f"  Loading {len(embeddings)} embedding(s)...")
-                self.load_embeddings_sync(embeddings)
-
-        self.policy.apply_to_pipeline(self.pipe)
-
-        print(f"Qwen-Image loaded from {repo}")
-
-    def generate(
-        self,
-        prompt: str,
-        negative_prompt: str | None = None,
-        width: int = 1024,
-        height: int = 1024,
-        seed: int = -1,
-        steps: int = 8,
-        guidance_scale: float = 4.0,
-        **kwargs: Any,
-    ) -> GenerationResult:
-        """Generate image with Qwen-Image.
-
-        Note: Qwen uses true_cfg_scale instead of guidance_scale,
-        and requires a negative_prompt (even empty string).
-        """
-        return super().generate(
-            prompt=prompt,
-            negative_prompt=negative_prompt,
-            width=width,
-            height=height,
-            seed=seed,
-            steps=steps,
-            guidance_scale=guidance_scale,
-            **kwargs,
-        )
-
-    def build_generation_kwargs(
-        self,
-        prompt: str,
-        negative_prompt: str | None,
-        width: int,
-        height: int,
-        steps: int,
-        guidance_scale: float,
-        generator: torch.Generator,
-        init_image: Image.Image | None,
-        strength: float,
-        **kwargs: Any,
-    ) -> dict[str, Any]:
-        """Build Qwen generation kwargs. Uses true_cfg_scale, requires neg_prompt."""
-        # Qwen requires negative_prompt, default to single space
-        neg_prompt = negative_prompt if negative_prompt else " "
-        # Use true_cfg_scale for Qwen (from kwargs or use guidance_scale)
-        true_cfg_scale = kwargs.get("true_cfg_scale", guidance_scale)
-
-        if init_image:
-            print(f"Qwen img2img: '{prompt[:50]}...' strength={strength}")
-            return {
-                "prompt": prompt,
-                "negative_prompt": neg_prompt,
-                "image": init_image,
-                "strength": strength,
-                "num_inference_steps": steps,
-                "true_cfg_scale": true_cfg_scale,
-                "generator": generator,
-                "num_images_per_prompt": 1,
-            }
-        else:
-            print(f"Qwen-Image generating: '{prompt[:50]}...'")
-            return {
-                "prompt": prompt,
-                "negative_prompt": neg_prompt,
-                "height": height,
-                "width": width,
-                "num_inference_steps": steps,
-                "true_cfg_scale": true_cfg_scale,
-                "generator": generator,
-                "num_images_per_prompt": 1,
-            }
-
-    def build_result(
-        self,
-        result: Any,
-        seed: int,
-        prompt: str,
-        negative_prompt: str | None,
-        steps: int,
-        guidance_scale: float,
-    ) -> GenerationResult:
-        """Build result with true_cfg_scale as guidance_scale."""
-        output_image = result.images[0]
-        return GenerationResult(
-            image=output_image,
-            seed=seed,
-            prompt=prompt,
-            negative_prompt=negative_prompt,
-            width=output_image.width,
-            height=output_image.height,
-            steps=steps,
-            guidance_scale=guidance_scale,
-        )
-
-    def post_generate(self, **kwargs: Any) -> None:
-        """Reset LoRA state after generation to prevent state leakage."""
-        super().post_generate(**kwargs)
-        self.restore_static_loras()
+            components["transformer"] = transformer
+        self.initialize_pipeline(repo, self.blocks, components)

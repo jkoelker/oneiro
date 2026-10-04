@@ -1,172 +1,98 @@
-"""Z-Image-Turbo pipeline wrapper with LoRA and embedding support."""
+"""Z-Image Turbo native modular workflows, retaining classic native inpainting."""
 
+import inspect
 from typing import Any
 
-import torch
+from diffusers import ZImageAutoBlocks, ZImageInpaintPipeline
 from PIL import Image
 
-from oneiro.device import DevicePolicy, OffloadType
-from oneiro.pipelines.base import BasePipeline, GenerationResult
-from oneiro.pipelines.embedding import EmbeddingLoaderMixin, parse_embeddings_from_config
-from oneiro.pipelines.lora import LoraLoaderMixin
+from oneiro.pipelines.modular import ModularPipelineWrapper
 
 
-class ZImagePipelineWrapper(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipeline):
-    """Wrapper for Z-Image-Turbo pipeline with multi-LoRA and embedding support."""
+class ZImagePipelineWrapper(ModularPipelineWrapper):
+    """Share every loaded resource and placement hook with the native mask exception."""
 
+    family = "zimage"
+    default_steps = 9
+    default_guidance_scale = 0.0
     supports_inpaint = True
 
     def __init__(self) -> None:
         super().__init__()
-        self.img2img_pipe: Any = None
         self.inpaint_pipe: Any = None
-        self._active_pipe: Any = None
+
+    def validate_config(
+        self, model_config: dict[str, Any], full_config: dict[str, Any] | None = None
+    ) -> None:
+        """Validate Turbo variant and placement without loading components."""
+        repo = model_config.get("repo", "Tongyi-MAI/Z-Image-Turbo")
+        variant = model_config.get(
+            "variant", "turbo" if repo == "Tongyi-MAI/Z-Image-Turbo" else None
+        )
+        if variant != "turbo":
+            raise ValueError("Z-Image requires variant='turbo' for custom model sources")
+        if model_config.get("embeddings") or model_config.get("inline_embeddings"):
+            raise ValueError("Z-Image does not support textual inversion embeddings")
+        self._component_repo, self.blocks = repo, ZImageAutoBlocks()
+        super().validate_config(model_config, full_config)
 
     def load(self, model_config: dict[str, Any], full_config: dict[str, Any] | None = None) -> None:
-        """Load Z-Image-Turbo model."""
-        from diffusers import ZImageImg2ImgPipeline, ZImageInpaintPipeline, ZImagePipeline
+        """Load Turbo components once and construct native inpaint before shared placement."""
+        self.validate_config(model_config, full_config)
+        self.initialize_pipeline(self._component_repo, self.blocks)
 
-        repo = model_config.get("repo", "Tongyi-MAI/Z-Image-Turbo")
-        cpu_offload = model_config.get("cpu_offload", True)
-        offload_type = model_config.get("offload_type", "group")
-        group_offload_type = model_config.get("group_offload_type", "leaf_level")
-        group_offload_use_stream = model_config.get("group_offload_use_stream", True)
-        group_offload_num_blocks_per_group = model_config.get("group_offload_num_blocks_per_group")
-
-        self.policy = DevicePolicy.auto_detect(
-            cpu_offload=cpu_offload,
-            offload_type=offload_type,
-            group_offload_type=group_offload_type,
-            group_offload_use_stream=group_offload_use_stream,
-            group_offload_num_blocks_per_group=group_offload_num_blocks_per_group,
+    def _initialize_native_inpaint(self) -> None:
+        """Pass only classic constructor components, never modular processors or guiders."""
+        self.inpaint_pipe = ZImageInpaintPipeline(
+            **{
+                name: self.pipe.components[name]
+                for name in ("transformer", "vae", "text_encoder", "tokenizer", "scheduler")
+            }
         )
 
-        print(f"Loading Z-Image from {repo}")
+    def workflow_inputs(self, workflow: str) -> set[str]:
+        """Declare mask inputs only for the actual native exception, not modular blocks."""
+        if workflow == "inpainting":
+            return set(inspect.signature(ZImageInpaintPipeline.__call__).parameters) - {
+                "self",
+                "return_dict",
+            }
+        return super().workflow_inputs(workflow)
 
-        self.pipe = ZImagePipeline.from_pretrained(
-            repo,
-            torch_dtype=self.policy.dtype,
-        )
-        self.img2img_pipe = ZImageImg2ImgPipeline(**self.pipe.components)
-        self.inpaint_pipe = ZImageInpaintPipeline(**self.pipe.components)
-        self._active_pipe = self.pipe
-
-        # Load embeddings if full_config provided
-        if full_config:
-            embeddings = parse_embeddings_from_config(full_config, model_config)
-            if embeddings:
-                print(f"  Loading {len(embeddings)} embedding(s)...")
-                self.load_embeddings_sync(embeddings)
-
-        self.policy.apply_to_pipeline(self.pipe)
-
-        print(f"Z-Image loaded from {repo}")
-
-    def build_generation_kwargs(
+    def validate_request(
         self,
-        prompt: str,
-        negative_prompt: str | None,
-        width: int,
-        height: int,
-        steps: int,
-        guidance_scale: float,  # Ignored - always 0.0 for Turbo
-        generator: torch.Generator,
-        init_image: Image.Image | None,
-        strength: float,
+        *,
+        has_image: bool = False,
+        has_mask: bool = False,
+        has_reference: bool = False,
+        strength: float | None = None,
         **kwargs: Any,
-    ) -> dict[str, Any]:
-        """Build Z-Image generation kwargs. Forces guidance_scale=0.0 for Turbo."""
-        mask_image = kwargs.pop("mask_image", None)
-        if mask_image is not None and init_image is None:
-            raise ValueError("Z-Image inpainting requires both image and mask_image")
-
-        if init_image:
-            if mask_image is not None:
-                print(f"Z-Image inpaint: '{prompt[:50]}...' strength={strength}")
-            else:
-                print(f"Z-Image img2img: '{prompt[:50]}...' strength={strength}")
-
-            gen_kwargs = {
-                "prompt": prompt,
-                "negative_prompt": negative_prompt,
-                "image": init_image,
-                "strength": strength,
-                "num_inference_steps": steps,
-                "guidance_scale": 0.0,  # Always 0.0 for Turbo
-                "generator": generator,
-            }
-            if mask_image is not None:
-                gen_kwargs["mask_image"] = mask_image
-            return gen_kwargs
-        else:
-            print(f"Z-Image generating: '{prompt[:50]}...'")
-            return {
-                "prompt": prompt,
-                "negative_prompt": negative_prompt,
-                "height": height,
-                "width": width,
-                "num_inference_steps": steps,
-                "guidance_scale": 0.0,  # Always 0.0 for Turbo
-                "generator": generator,
-            }
+    ) -> str:
+        """Add only the retained native mask workflow to shared capability validation."""
+        if has_mask:
+            if not has_image or has_reference:
+                raise ValueError("Inpainting requires an image and mask, without reference images")
+            super().validate_request(has_image=True, strength=strength, **kwargs)
+            return "inpainting"
+        return super().validate_request(
+            has_image=has_image, has_reference=has_reference, strength=strength, **kwargs
+        )
 
     def run_inference(self, gen_kwargs: dict[str, Any], is_img2img: bool) -> Any:
-        """Run the correct Z-Image pipeline for text, image, or inpaint generation."""
+        """Normalize the native mask output into the shared image-result lifecycle."""
         if "mask_image" in gen_kwargs:
             if self.inpaint_pipe is None:
-                raise RuntimeError("Z-Image inpaint pipeline not loaded")
-            self._active_pipe = self.inpaint_pipe
-            return self._active_pipe(**gen_kwargs)
-
-        if is_img2img:
-            if self.img2img_pipe is None:
-                raise RuntimeError("Z-Image img2img pipeline not loaded")
-            self._active_pipe = self.img2img_pipe
-            return self._active_pipe(**gen_kwargs)
-
-        self._active_pipe = self.pipe
+                raise RuntimeError("Z-Image native inpaint pipeline not loaded")
+            # Native inpaint preprocesses the source without the requested dimensions.
+            size = (gen_kwargs["width"], gen_kwargs["height"])
+            gen_kwargs["image"] = gen_kwargs["image"].resize(size, Image.Resampling.LANCZOS)
+            gen_kwargs["mask_image"] = gen_kwargs["mask_image"].resize(
+                size, Image.Resampling.NEAREST
+            )
+            return {"images": self.inpaint_pipe(**gen_kwargs).images}
         return super().run_inference(gen_kwargs, is_img2img)
 
-    def build_result(
-        self,
-        result: Any,
-        seed: int,
-        prompt: str,
-        negative_prompt: str | None,
-        steps: int,
-        guidance_scale: float,  # Ignored - always 0.0 for Turbo
-    ) -> GenerationResult:
-        """Build result with forced guidance_scale=0.0."""
-        output_image = result.images[0]
-        return GenerationResult(
-            image=output_image,
-            seed=seed,
-            prompt=prompt,
-            negative_prompt=negative_prompt,
-            width=output_image.width,
-            height=output_image.height,
-            steps=steps,
-            guidance_scale=0.0,  # Always 0.0 for Turbo
-        )
-
-    def post_generate(self, **kwargs: Any) -> None:
-        """Reset LoRA state after generation to prevent state leakage."""
-        super().post_generate(**kwargs)
-        self.restore_static_loras()
-
-    def _reset_model_state(self) -> None:
-        """Reset hooks on the Z-Image pipeline variant used for this generation."""
-        if self.pipe is not None and getattr(self.pipe, "_oneiro_offload_type", None) == (
-            OffloadType.GROUP.value
-        ):
-            return
-        if self._active_pipe is None:
-            return
-        self._active_pipe.maybe_free_model_hooks()
-
     def unload(self) -> None:
-        """Free all Z-Image pipeline wrappers and shared components."""
-        self._active_pipe = None
-        self.img2img_pipe = None
+        """Drop the native view before releasing its shared resources and hooks once."""
         self.inpaint_pipe = None
         super().unload()

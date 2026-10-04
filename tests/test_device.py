@@ -1,7 +1,11 @@
 """Tests for DevicePolicy."""
 
+from types import SimpleNamespace
+from typing import Any
+
 import pytest
 import torch
+from diffusers.modular_pipelines.components_manager import ComponentsManager
 
 from oneiro.device import DevicePolicy, OffloadMode, OffloadType
 
@@ -36,6 +40,23 @@ class TestOffloadType:
 
 class TestDevicePolicyAutoDetect:
     """Tests for DevicePolicy.auto_detect()."""
+
+    @pytest.mark.parametrize(
+        "controls",
+        [
+            {"offload_type": "invalid"},
+            {"group_offload_type": "invalid"},
+            {"group_offload_num_blocks_per_group": 0},
+            {"group_offload_num_blocks_per_group": -1},
+            {"group_offload_num_blocks_per_group": 1.5},
+        ],
+    )
+    def test_invalid_placement_controls_fail_without_components(
+        self, controls: dict[str, Any]
+    ) -> None:
+        """Reject deterministic placement errors before the loader can unload or fetch assets."""
+        with pytest.raises(ValueError):
+            DevicePolicy.auto_detect(**controls)
 
     def test_returns_device_policy(self):
         policy = DevicePolicy.auto_detect()
@@ -331,3 +352,113 @@ class TestDevicePolicyEquality:
         # Can be used in sets
         s = {p}
         assert p in s
+
+
+class TestModularDevicePolicy:
+    """Component-level placement must not duplicate shared-module hooks."""
+
+    @pytest.mark.parametrize("offload_type", list(OffloadType))
+    def test_shared_components_placed_once(
+        self, monkeypatch: pytest.MonkeyPatch, offload_type: OffloadType
+    ) -> None:
+        module = torch.nn.Linear(2, 2)
+        pipe = SimpleNamespace(components={"transformer": module, "text_encoder": module})
+        manager = ComponentsManager()
+        manager.add("transformer", module)
+        manager.add("text_encoder", module)
+        placed = []
+
+        def group(module: torch.nn.Module, **kwargs: Any) -> None:
+            placed.append(module)
+            assert kwargs["onload_device"] == torch.device("cuda")
+
+        def sequential(module: torch.nn.Module, **kwargs: Any) -> None:
+            placed.append(module)
+            assert kwargs["execution_device"] == torch.device("cuda")
+
+        monkeypatch.setattr("diffusers.hooks.apply_group_offloading", group)
+        monkeypatch.setattr("accelerate.cpu_offload", sequential)
+        policy = DevicePolicy(device="cuda", dtype=torch.float16, offload_type=offload_type)
+        policy.apply_to_modular_pipeline(pipe, manager)
+        assert pipe.components["transformer"] is pipe.components["text_encoder"]
+        if offload_type == OffloadType.MODEL:
+            assert len(manager.model_hooks) == 1
+            assert manager.model_hooks[0].model is module
+            assert module._hf_hook.execution_device == torch.device("cuda:0")
+            manager.disable_auto_cpu_offload()
+        else:
+            assert placed == [module]
+            assert not manager._auto_offload_enabled
+
+    def test_fp8_does_not_enable_stream_or_cast(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        module = torch.nn.Linear(2, 2).to(dtype=torch.float8_e4m3fn)
+        pipe = SimpleNamespace(components={"transformer": module})
+        calls = []
+        monkeypatch.setattr(
+            "diffusers.hooks.apply_group_offloading", lambda module, **kwargs: calls.append(kwargs)
+        )
+        DevicePolicy(device="cuda", dtype=torch.float16).apply_to_modular_pipeline(
+            pipe, ComponentsManager()
+        )
+        assert calls[0]["use_stream"] is False
+        assert module.weight.dtype == torch.float8_e4m3fn
+
+    @pytest.mark.parametrize("device", ["cpu", "mps", "cuda"])
+    def test_nonoffload_moves_only_distinct_modules(
+        self, monkeypatch: pytest.MonkeyPatch, device: str
+    ) -> None:
+        module = torch.nn.Linear(2, 2)
+        calls = []
+        monkeypatch.setattr(module, "to", lambda destination: calls.append(destination))
+        pipe = SimpleNamespace(components={"vae": module, "other": module})
+        policy = DevicePolicy(device=device, dtype=torch.float32, offload=OffloadMode.NEVER)
+        policy.apply_to_modular_pipeline(pipe, ComponentsManager())
+        assert calls == ([] if device == "cpu" else [device])
+
+    def test_always_offload_requires_cuda(self) -> None:
+        with pytest.raises(ValueError, match="requires CUDA"):
+            DevicePolicy(
+                device="cpu", dtype=torch.float32, offload=OffloadMode.ALWAYS
+            ).apply_to_modular_pipeline(SimpleNamespace(components={}), ComponentsManager())
+
+    def test_existing_accelerate_hooks_reject_competing_strategy(self) -> None:
+        from accelerate import cpu_offload
+
+        module = torch.nn.Linear(2, 2)
+        cpu_offload(module, execution_device=torch.device("cpu"))
+        with pytest.raises(ValueError, match="offload"):
+            DevicePolicy(device="cuda", dtype=torch.float32).apply_to_modular_pipeline(
+                SimpleNamespace(components={"vae": module}), ComponentsManager()
+            )
+
+    def test_native_group_offloading_accepts_transformers(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from diffusers.hooks import apply_group_offloading
+        from transformers import CLIPTextConfig, CLIPTextModel
+
+        model = CLIPTextModel(
+            CLIPTextConfig(
+                vocab_size=2,
+                hidden_size=8,
+                intermediate_size=16,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+            )
+        )
+        placed = []
+
+        def cpu_group(module: torch.nn.Module, **kwargs: Any) -> None:
+            assert kwargs["onload_device"] == torch.device("cuda")
+            placed.append(module)
+            # Exercise actual native hooks, replacing only the accelerator boundary.
+            apply_group_offloading(module, **{**kwargs, "onload_device": torch.device("cpu")})
+
+        monkeypatch.setattr(torch.accelerator, "current_accelerator", lambda: torch.device("cuda"))
+        monkeypatch.setattr("diffusers.hooks.apply_group_offloading", cpu_group)
+        pipe = SimpleNamespace(components={"text_encoder": model, "shared_encoder": model})
+        DevicePolicy(
+            device="cuda", dtype=torch.float32, group_offload_use_stream=False
+        ).apply_to_modular_pipeline(pipe, ComponentsManager())
+        assert placed == [model]
+        assert model(torch.tensor([[0, 1, 0]])).last_hidden_state.shape == (1, 3, 8)
