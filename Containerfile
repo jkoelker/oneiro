@@ -1,42 +1,30 @@
 # Oneiro - Discord bot with embedded Diffusers image generation
-FROM ghcr.io/astral-sh/uv:0.12.1@sha256:cf4eedcaa81655197f625739489effcbe71b61ceb1506f332c3facae5deceded AS uv
-FROM docker.io/pytorch/pytorch:2.11.0-cuda12.8-cudnn9-runtime@sha256:eee11b3b3872a8c838e35ef48f08b2d5def2080902c7f666831310ca1a0ef2be
+FROM ghcr.io/astral-sh/uv:0.12.23@sha256:61d393e44e249f2e4b526b6c7ddcecce245946826e608e11c93ad4f5bba55b21 AS uv
+FROM docker.io/pytorch/pytorch:2.14.1-cuda13.2-cudnn9-runtime@sha256:c4ab67f95221a342dff0e8ca4543a7b8885f79f7a0029c0e2e39685d5eaf1722
 
 WORKDIR /app
 
 # Install uv from the official container image
 COPY --from=uv /uv /uvx /bin/
 
-# Install git for diffusers from source
-# hadolint ignore=DL3008
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends git \
-    && rm -rf /var/lib/apt/lists/* \
-    && apt-get clean
-
-# Create a virtual environment for isolation from the system Python
-RUN uv venv /opt/venv
-ENV VIRTUAL_ENV=/opt/venv
-ENV PATH="/opt/venv/bin:$PATH"
-
 # Install dependencies first for caching (only rebuilds when pyproject.toml changes)
-COPY pyproject.toml .
-RUN mkdir -p src/oneiro \
+COPY pyproject.toml README.md LICENSE ./
+RUN python -c 'from importlib.metadata import version; print("torch==" + version("torch"))' > /app/torch-constraints.txt \
+    && mkdir -p src/oneiro \
     && touch src/oneiro/__init__.py \
-    && uv pip install --no-cache .
+    && uv pip install --system --no-cache --constraint /app/torch-constraints.txt .
 
 # Copy source and reinstall without deps (fast rebuild on source changes)
 COPY config.toml .
 COPY src/ src/
 
-RUN uv pip install --no-cache --no-deps .
+RUN uv pip install --system --no-cache --no-deps .
 
 # Environment configuration
 ENV HF_HOME=/data/huggingface
 ENV PYTHONUNBUFFERED=1
 ENV CONFIG_PATH=/config/base.toml
 ENV CONFIG_OVERLAY_PATH=/data/config.toml
-# Set DIFFUSERS_GGUF_CUDA_KERNELS=true at runtime for ~10% speedup (requires PyTorch 2.7)
 
 # Run the bot
 CMD ["python", "-m", "oneiro"]
