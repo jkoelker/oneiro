@@ -363,6 +363,7 @@ def test_mask_preservation(tiny_pipeline: Krea2ModularPipeline) -> None:
     """Catch inverted masks, lost source latents, or omitted crop compositing."""
     from PIL import Image
 
+    from oneiro.pipelines.backports.krea2.before_denoise import Krea2PrepareMaskLatentsStep
     from oneiro.pipelines.backports.krea2.denoise import Krea2LoopAfterDenoiserInpaint
 
     pipe = tiny_pipeline
@@ -377,6 +378,38 @@ def test_mask_preservation(tiny_pipeline: Krea2ModularPipeline) -> None:
     assert not torch.allclose(repainted.latents, repainted.image_latents)
     assert torch.count_nonzero(low.mask) == 0
     assert torch.all(repainted.mask == 1)
+    # Independently enumerate six rectangular 2x2 tokens, each with two mask channels.
+    mask_state = PipelineState(
+        values={
+            "processed_mask_image": torch.arange(24).reshape(1, 1, 4, 6).float() / 23,
+            "height": 4,
+            "width": 6,
+            "dtype": torch.float32,
+        }
+    )
+    mask_components = SimpleNamespace(
+        patch_size=2,
+        vae_scale_factor=1,
+        _execution_device=torch.device("cpu"),
+        transformer=SimpleNamespace(config=SimpleNamespace(in_channels=8)),
+    )
+    Krea2PrepareMaskLatentsStep()(mask_components, mask_state)
+    expected_mask = (
+        torch.tensor(
+            [
+                [
+                    [0, 1, 6, 7, 0, 1, 6, 7],
+                    [2, 3, 8, 9, 2, 3, 8, 9],
+                    [4, 5, 10, 11, 4, 5, 10, 11],
+                    [12, 13, 18, 19, 12, 13, 18, 19],
+                    [14, 15, 20, 21, 14, 15, 20, 21],
+                    [16, 17, 22, 23, 16, 17, 22, 23],
+                ]
+            ]
+        ).float()
+        / 23
+    )
+    torch.testing.assert_close(mask_state.mask, expected_mask, atol=0, rtol=0)
     assert repainted.images.shape == (1, 3, 32, 32)
     # At intermediate noise levels, a black mask preserves the appropriately noised source.
     pipe.scheduler.set_timesteps(3, mu=0.5)
