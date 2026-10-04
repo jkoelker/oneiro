@@ -756,6 +756,51 @@ class TestCheckpointGeneration:
     """Native input declarations and shared rollback govern every request."""
 
     @pytest.mark.parametrize(
+        "controls",
+        [
+            {"init_image": image_bytes(), "strength": 0.0},
+            {"unsupported_control": True},
+            {"init_image": b"malformed attachment"},
+        ],
+        ids=["zero-strength", "unsupported-control", "malformed-attachment"],
+    )
+    def test_invalid_direct_request_never_updates_components(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, controls: dict[str, Any]
+    ) -> None:
+        """Public scheduler overrides must not mutate resources on rejected requests."""
+        pipeline, config, _ = checkpoint_wrapper(tmp_path, monkeypatch)
+        pipeline.load(config)
+        original = pipeline.pipe.scheduler
+        with patch.object(
+            pipeline.pipe, "update_components", wraps=pipeline.pipe.update_components
+        ) as update:
+            with pytest.raises(ValueError):
+                pipeline.generate("positive", scheduler="euler", **controls)
+        assert update.call_count == 0
+        assert pipeline.pipe.scheduler is original
+        pipeline.unload()
+
+    def test_scheduler_restores_after_resource_setup_failure(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Scheduler installation belongs to the same rollback as partially applied adapters."""
+        pipeline, config, _ = checkpoint_wrapper(tmp_path, monkeypatch)
+        pipeline.load(config)
+        original = pipeline.pipe.scheduler
+        seen = []
+
+        def fail(*args: Any, **kwargs: Any) -> None:
+            seen.append(pipeline.pipe.scheduler)
+            raise RuntimeError("adapter setup failed")
+
+        monkeypatch.setattr(ModularPipelineWrapper, "pre_generate", fail)
+        with pytest.raises(RuntimeError, match="adapter setup failed"):
+            pipeline.generate("positive", scheduler="euler")
+        assert seen[0] is not original
+        assert pipeline.pipe.scheduler is original
+        pipeline.unload()
+
+    @pytest.mark.parametrize(
         "base,variant", [("Pony", None), ("SD 3.5", None), ("Flux.1 D", "dev")]
     )
     def test_native_state_preserves_weighted_embeddings(

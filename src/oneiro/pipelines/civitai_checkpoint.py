@@ -295,6 +295,8 @@ class _CheckpointEmbeddingsStep(ModularPipelineBlocks):
 class CivitaiCheckpointPipeline(ModularPipelineWrapper):
     """Resolve metadata first, then inject converted components into native family graphs."""
 
+    _resource_controls = {"loras", "scheduler"}
+
     def __init__(self) -> None:
         """Initialize shared resource state and metadata-only checkpoint ownership."""
         super().__init__()
@@ -303,6 +305,7 @@ class CivitaiCheckpointPipeline(ModularPipelineWrapper):
         self._resolved_version: ModelVersion | None = None
         self.inpaint_pipe: Any = None
         self.variant: str | None = None
+        self._original_scheduler: Any = None
 
     async def resolve_config(
         self,
@@ -794,24 +797,33 @@ class CivitaiCheckpointPipeline(ModularPipelineWrapper):
     ) -> GenerationResult:
         """Use the shared resource/generation lifecycle with a request-local scheduler."""
         self.validate_pipeline()
-        scheduler_name = kwargs.pop("scheduler", None)
-        self._validate_scheduler(scheduler_name)
-        original = self.pipe.components["scheduler"]
+        self._validate_scheduler(kwargs.get("scheduler"))
+        return super().generate(
+            prompt,
+            negative_prompt,
+            self._pipeline_config.default_width if width is None else width,
+            self._pipeline_config.default_height if height is None else height,
+            seed,
+            steps,
+            guidance_scale,
+            **kwargs,
+        )
+
+    def pre_generate(self, **kwargs: Any) -> None:
+        """Install the scheduler only after shared controls and attachments validate."""
+        self._original_scheduler = self.pipe.components["scheduler"]
+        self.configure_scheduler(kwargs.get("scheduler"))
+        super().pre_generate(**kwargs)
+
+    def post_generate(self, **kwargs: Any) -> None:
+        """Restore scheduler ownership even when adapter setup or inference fails."""
         try:
-            self.configure_scheduler(scheduler_name)
-            return super().generate(
-                prompt,
-                negative_prompt,
-                self._pipeline_config.default_width if width is None else width,
-                self._pipeline_config.default_height if height is None else height,
-                seed,
-                steps,
-                guidance_scale,
-                **kwargs,
-            )
-        finally:
-            if self.pipe.components["scheduler"] is not original:
+            original = self._original_scheduler
+            if original is not None and self.pipe.components["scheduler"] is not original:
                 self.pipe.update_components(scheduler=original)
+        finally:
+            self._original_scheduler = None
+            super().post_generate(**kwargs)
 
     def build_generation_kwargs(
         self,

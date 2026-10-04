@@ -24,6 +24,7 @@ class ModularPipelineWrapper(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipeline
     default_steps: int = 9
     default_guidance_scale: float = 0.0
     blocks: Any = None
+    _resource_controls = {"loras"}
     _product_workflows = {
         "text2image",
         "image2image",
@@ -167,7 +168,8 @@ class ModularPipelineWrapper(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipeline
         unknown = (
             kwargs.keys()
             - allowed
-            - {"init_image", "mask_image", "reference_image", "strength", "loras"}
+            - {"init_image", "mask_image", "reference_image", "strength"}
+            - self._resource_controls
         )
         if unknown:
             raise ValueError(f"Unsupported generation controls: {sorted(unknown)}")
