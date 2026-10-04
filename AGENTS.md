@@ -147,20 +147,3 @@ select = ["E", "W", "F", "I", "B", "C4", "UP"]
 [tool.ruff.lint.isort]
 known-first-party = ["oneiro"]
 ```
-
-## Git Workflow
-
-- **Commits allowed** on atomic work units (single logical change)
-- **Never push** - leave pushing to the user
-- **Never `git add .`** - only stage specific files needed for the commit
-
-```bash
-# CORRECT: Stage specific files
-git add src/oneiro/config.py tests/test_config.py
-git commit -m "Add config hot reload support"
-
-# WRONG: Never do this
-git add .
-git add -A
-git push
-```
