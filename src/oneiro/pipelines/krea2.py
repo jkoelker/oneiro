@@ -33,11 +33,7 @@ class Krea2PipelineWrapper(ModularPipelineWrapper):
         variant = model_config.get("variant", known.get(repo))
         if variant not in {"turbo", "raw"} or (repo in known and variant != known[repo]):
             raise ValueError("Krea requires variant='raw' or 'turbo' matching the model")
-        if (
-            model_config.get("embeddings")
-            or model_config.get("inline_embeddings")
-            or (full_config or {}).get("embeddings", {}).get("auto_load")
-        ):
+        if model_config.get("embeddings") or model_config.get("inline_embeddings"):
             raise ValueError("Krea does not support textual inversion embeddings")
         self.default_steps, self.default_guidance_scale = (
             (8, 0.0) if variant == "turbo" else (28, 4.5)

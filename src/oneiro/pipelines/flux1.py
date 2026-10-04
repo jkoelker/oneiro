@@ -34,11 +34,7 @@ class Flux1PipelineWrapper(ModularPipelineWrapper):
         variant = model_config.get("variant", known.get(repo))
         if variant not in {"dev", "schnell"} or (repo in known and variant != known[repo]):
             raise ValueError("FLUX.1 requires variant='dev' or 'schnell' matching the model")
-        if (
-            model_config.get("embeddings")
-            or model_config.get("inline_embeddings")
-            or (full_config or {}).get("embeddings", {}).get("auto_load")
-        ):
+        if model_config.get("embeddings") or model_config.get("inline_embeddings"):
             raise ValueError("FLUX.1 does not support textual inversion embeddings")
         self.variant = variant
         self.default_steps, self.default_guidance_scale = (

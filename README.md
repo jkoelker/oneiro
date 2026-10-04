@@ -104,8 +104,9 @@ conversion preserves FP8 weights, scales, and quantized layer identities using
 `comfy-kitchen`; placement does not cast those weights to the activation dtype. Qwen
 checkpoint `qwen_transformer_dtype`/`transformer_dtype` remains an explicit conversion knob,
 not a promise that every FP8 file format is supported. Compatible LoRAs use the native loader;
-textual inversions are limited to supported SDXL and FLUX.1 checkpoint recipes. Do not set
-global embedding auto-load for incompatible hosted families.
+textual inversions are limited to supported SDXL and FLUX.1 checkpoint recipes. Incompatible
+global embedding auto-load entries warn and skip; model-specific embeddings remain required.
+Download and native loading errors still fail rather than risk partially loaded resources.
 
 ### Environment Variables
 

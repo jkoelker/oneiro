@@ -187,18 +187,20 @@ def parse_embedding_config(
 def parse_embeddings_from_config(
     full_config: dict[str, Any],
     model_config: dict[str, Any],
+    *,
+    include_auto_load: bool = True,
 ) -> list[EmbeddingConfig]:
     """Parse all embedding configurations for a model from full config.
 
     Handles three types of embedding sources:
-    1. Global auto_load: Embeddings loaded for ALL models
+    1. Global auto_load: Optional embeddings for compatible models
     2. Named references: Model references embeddings defined in [embeddings.name]
     3. Inline definitions: Model-specific embeddings defined directly in model config
 
     Config structure:
     ```toml
     [embeddings]
-    auto_load = ["easynegative"]  # Loaded for every model
+    auto_load = ["easynegative"]  # Attempted for compatible models
 
     [embeddings.easynegative]
     source = "civitai"
@@ -222,6 +224,7 @@ def parse_embeddings_from_config(
     Args:
         full_config: The complete config dict (for accessing [embeddings] section)
         model_config: Model-specific config section
+        include_auto_load: Include optional global references, not just required model entries.
 
     Returns:
         List of EmbeddingConfig instances (auto_load + named refs + inline)
@@ -233,7 +236,7 @@ def parse_embeddings_from_config(
     loaded_names: set[str] = set()
 
     # 1. Global auto_load embeddings
-    auto_load = embeddings_section.get("auto_load", [])
+    auto_load = embeddings_section.get("auto_load", []) if include_auto_load else []
     if isinstance(auto_load, list):
         for ref_name in auto_load:
             if ref_name in loaded_names:

@@ -90,11 +90,7 @@ class QwenPipelineWrapper(ModularPipelineWrapper):
         variant = model_config.get("variant", "image" if repo in known else None)
         if variant != "image":
             raise ValueError("Qwen requires variant='image' for custom model sources")
-        if (
-            model_config.get("embeddings")
-            or model_config.get("inline_embeddings")
-            or (full_config or {}).get("embeddings", {}).get("auto_load")
-        ):
+        if model_config.get("embeddings") or model_config.get("inline_embeddings"):
             raise ValueError("Qwen does not support textual inversion embeddings")
         self._component_repo, self.blocks = repo, QwenImageAutoBlocks()
         super().validate_config(model_config, full_config)

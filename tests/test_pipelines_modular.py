@@ -962,8 +962,8 @@ def test_unsupported_embedding_is_not_ignored(
         load_hosted(cls, monkeypatch, {"embeddings": ["missing"]})
     with pytest.raises(ValueError, match="embeddings"):
         load_hosted(cls, monkeypatch, {"inline_embeddings": [{"path": "unused"}]})
-    with pytest.raises(ValueError, match="embeddings"):
-        load_hosted(cls, monkeypatch, full_config={"embeddings": {"auto_load": ["style"]}})
+    wrapper, _ = load_hosted(cls, monkeypatch, full_config={"embeddings": {"auto_load": ["style"]}})
+    assert wrapper.active_embeddings == []
 
 
 @pytest.mark.parametrize(

@@ -118,7 +118,7 @@ allow_in_negative = true
 # =============================================================================
 
 [embeddings]
-# Global auto_load: these embeddings are loaded for ALL models automatically
+# Global auto_load: compatible checkpoints only; incompatible entries warn and skip
 # auto_load = ["easynegative"]
 
 # Example: Civitai embedding

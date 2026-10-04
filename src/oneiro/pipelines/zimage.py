@@ -31,11 +31,7 @@ class ZImagePipelineWrapper(ModularPipelineWrapper):
         )
         if variant != "turbo":
             raise ValueError("Z-Image requires variant='turbo' for custom model sources")
-        if (
-            model_config.get("embeddings")
-            or model_config.get("inline_embeddings")
-            or (full_config or {}).get("embeddings", {}).get("auto_load")
-        ):
+        if model_config.get("embeddings") or model_config.get("inline_embeddings"):
             raise ValueError("Z-Image does not support textual inversion embeddings")
         self._component_repo, self.blocks = repo, ZImageAutoBlocks()
         super().validate_config(model_config, full_config)

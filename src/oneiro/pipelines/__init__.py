@@ -21,7 +21,11 @@ from oneiro.pipelines.civitai_checkpoint import (
     PipelineConfig,
     get_pipeline_config_for_base_model,
 )
-from oneiro.pipelines.embedding import parse_embeddings_from_config, resolve_embedding_path
+from oneiro.pipelines.embedding import (
+    EmbeddingIncompatibleError,
+    parse_embeddings_from_config,
+    resolve_embedding_path,
+)
 from oneiro.pipelines.flux1 import Flux1PipelineWrapper
 from oneiro.pipelines.flux2 import Flux2PipelineWrapper
 from oneiro.pipelines.flux2_klein import Flux2KleinPipelineWrapper
@@ -267,21 +271,45 @@ class PipelineManager:
         new_pipeline.validate_request(**controls)
         family = new_pipeline.family
         full_config = self.config.data
-        embeddings = parse_embeddings_from_config(full_config, model_config)
-        if embeddings:
-            # Checkpoint SDXL/FLUX.1 retain their native textual-inversion loaders.
-            # Hosted recipes keep their reviewed explicit resource restrictions.
-            if family != "sdxl" and not (
-                isinstance(new_pipeline, CivitaiCheckpointPipeline) and family == "flux1"
-            ):
-                raise ValueError(f"{family} does not support textual inversion embeddings")
-            for embedding in embeddings:
+        embeddings = parse_embeddings_from_config(
+            full_config, model_config, include_auto_load=False
+        )
+        supports_embeddings = isinstance(new_pipeline, CivitaiCheckpointPipeline) and family in {
+            "sdxl",
+            "flux1",
+        }
+        if embeddings and not supports_embeddings:
+            raise ValueError(f"{family} does not support textual inversion embeddings")
+        for embedding in embeddings:
+            await resolve_embedding_path(
+                embedding,
+                civitai_client=self._civitai_client,
+                pipeline_type=family,
+                validate_compatibility=True,
+            )
+        required_names = {embedding.name for embedding in embeddings}
+        for embedding in parse_embeddings_from_config(full_config, {}):
+            if embedding.name in required_names:
+                continue
+            if not supports_embeddings:
+                print(
+                    f"Warning: Skipping auto-load embedding {embedding.name}: "
+                    f"{family} does not support textual inversion embeddings"
+                )
+                continue
+            try:
                 await resolve_embedding_path(
                     embedding,
                     civitai_client=self._civitai_client,
                     pipeline_type=family,
                     validate_compatibility=True,
                 )
+            except EmbeddingIncompatibleError as error:
+                print(f"Warning: Skipping auto-load embedding {embedding.name}: {error}")
+            else:
+                embeddings.append(embedding)
+        # An empty resolved list must suppress checkpoint fallback to unfiltered globals.
+        if isinstance(new_pipeline, CivitaiCheckpointPipeline):
             model_config = {**model_config, "_resolved_embeddings": embeddings}
 
         auto_loras: list[LoraConfig] = []

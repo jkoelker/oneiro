@@ -28,11 +28,7 @@ class Flux2KleinPipelineWrapper(ModularPipelineWrapper):
         variant = model_config.get("variant", known.get(repo))
         if variant not in {"distilled", "base"} or (repo in known and variant != known[repo]):
             raise ValueError("Klein requires variant='distilled' or 'base' matching the model")
-        if (
-            model_config.get("embeddings")
-            or model_config.get("inline_embeddings")
-            or (full_config or {}).get("embeddings", {}).get("auto_load")
-        ):
+        if model_config.get("embeddings") or model_config.get("inline_embeddings"):
             raise ValueError("Klein does not support textual inversion embeddings")
         distilled = variant == "distilled"
         self.variant = variant
