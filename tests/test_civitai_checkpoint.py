@@ -1,1574 +1,937 @@
-"""Tests for CivitAI checkpoint pipeline."""
+"""Bounded offline component, workflow, scheduler and Krea conversion gates."""
 
+import json
+import socket
+import threading
+import weakref
+from collections.abc import Iterator
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from types import SimpleNamespace
+from typing import Any
+from unittest.mock import AsyncMock, patch
 
 import pytest
 import torch
+from diffusers import DDIMScheduler, FlowMatchEulerDiscreteScheduler
+from diffusers.modular_pipelines.modular_pipeline_utils import ComponentSpec
+from PIL import Image
+from safetensors.torch import save_file
 
-from oneiro.device import DevicePolicy, OffloadMode, OffloadType
+from oneiro.device import DevicePolicy, OffloadMode
+from oneiro.pipelines.backports.krea2 import BackportedKrea2Transformer2DModel
+from oneiro.pipelines.base import BasePipeline
 from oneiro.pipelines.civitai_checkpoint import (
     CIVITAI_BASE_MODEL_PIPELINE_MAP,
-    DEFAULT_PIPELINE_CONFIG,
-    SCHEDULER_CHOICES,
-    SCHEDULER_MAP,
     CivitaiCheckpointPipeline,
     PipelineConfig,
-    get_diffusers_pipeline_class,
-    get_krea2_checkpoint_precision,
-    get_krea2_checkpoint_precision_from_header,
     get_pipeline_config_for_base_model,
 )
-from oneiro.pipelines.lora import LoraConfig, LoraSource
+from oneiro.pipelines.krea2_checkpoint import (
+    convert_krea2_checkpoint_tensor,
+    get_krea2_checkpoint_precision,
+    get_krea2_checkpoint_precision_from_header,
+    load_krea2_transformer,
+)
+from oneiro.pipelines.modular import ModularPipelineWrapper
+from tests.test_krea2_backport import TinyTokenizer
+from tests.test_pipelines_modular import image_bytes, local_embedding_wrapper, local_wrapper
 
 
-class TestPipelineConfig:
-    """Tests for PipelineConfig dataclass."""
+@pytest.fixture(autouse=True)
+def offline(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Make accidental model downloads fail immediately."""
 
-    def test_default_values(self):
-        """PipelineConfig has sensible defaults."""
-        config = PipelineConfig(pipeline_class="StableDiffusionPipeline")
-        assert config.supports_negative_prompt is True
-        assert config.default_steps == 20
-        assert config.default_guidance_scale == 7.5
-        assert config.default_width == 512
-        assert config.default_height == 512
+    def fail_network(*args: Any, **kwargs: Any) -> None:
+        """Fail any accidental external connection in these offline gates."""
+        raise AssertionError("No downloads allowed in checkpoint gates")
 
-    def test_custom_values(self):
-        """PipelineConfig accepts custom values."""
-        config = PipelineConfig(
-            pipeline_class="FluxPipeline",
-            supports_negative_prompt=False,
-            default_steps=28,
-            default_guidance_scale=3.5,
-            default_width=1024,
-            default_height=1024,
-        )
-        assert config.pipeline_class == "FluxPipeline"
-        assert config.supports_negative_prompt is False
-        assert config.default_steps == 28
+    monkeypatch.setattr(socket.socket, "connect", fail_network)
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    monkeypatch.setenv("TRANSFORMERS_OFFLINE", "1")
+    previous = torch.get_num_threads()
+    torch.set_num_threads(1)
+    yield
+    torch.set_num_threads(previous)
 
 
-class TestGetPipelineConfigForBaseModel:
-    """Tests for get_pipeline_config_for_base_model function."""
+class TestCheckpointPreflight:
+    """Only known family metadata and explicit source variants reach weight loaders."""
 
-    def test_exact_match_sd15(self):
-        """Exact match for SD 1.5."""
-        config = get_pipeline_config_for_base_model("SD 1.5")
-        assert config.pipeline_class == "StableDiffusionPipeline"
-        assert config.default_width == 512
-
-    def test_exact_match_sdxl(self):
-        """Exact match for SDXL 1.0."""
-        config = get_pipeline_config_for_base_model("SDXL 1.0")
-        assert config.pipeline_class == "StableDiffusionXLPipeline"
-        assert config.default_width == 1024
-
-    def test_exact_match_flux_dev(self):
-        """Exact match for Flux.1 Dev."""
-        config = get_pipeline_config_for_base_model("Flux.1 Dev")
-        assert config.pipeline_class == "FluxPipeline"
-        assert config.supports_negative_prompt is False
-        assert config.default_steps == 28
-
-    def test_exact_match_flux_schnell(self):
-        """Exact match for Flux.1 Schnell."""
-        config = get_pipeline_config_for_base_model("Flux.1 Schnell")
-        assert config.pipeline_class == "FluxPipeline"
-        assert config.default_steps == 4
-        assert config.default_guidance_scale == 0.0
-
-    def test_exact_match_qwen(self):
-        """Exact match for CivitAI Qwen checkpoints."""
-        config = get_pipeline_config_for_base_model("Qwen")
-        assert config.pipeline_class == "QwenImagePipeline"
-        assert config.default_steps == 8
-        assert config.default_guidance_scale == 4.0
-
-    def test_exact_match_flux2_klein(self):
-        """Exact match for CivitAI FLUX.2 Klein checkpoints."""
-        config = get_pipeline_config_for_base_model("Flux.2 Klein 9B")
-        assert config.pipeline_class == "Flux2KleinPipeline"
-        assert config.supports_negative_prompt is False
-        assert config.default_steps == 4
-        assert config.default_guidance_scale == 1.0
-
-    def test_exact_match_krea2(self):
-        """CivitAI Krea 2 checkpoints use the Krea pipeline."""
-        config = get_pipeline_config_for_base_model("Krea 2")
-
-        assert config.pipeline_class == "Krea2Pipeline"
-        assert config.supports_negative_prompt is True
-        assert config.default_steps == 8
-        assert config.default_guidance_scale == 0.0
-
-    @pytest.mark.parametrize("base_model", ["Krea-2", "Krea2", "Krea 2 Turbo"])
-    def test_partial_match_krea2(self, base_model):
-        """CivitAI Krea spelling variants use the Krea pipeline."""
-        config = get_pipeline_config_for_base_model(base_model)
-
-        assert config.pipeline_class == "Krea2Pipeline"
-
-    def test_partial_match_flux(self):
-        """Partial match for Flux variants."""
-        config = get_pipeline_config_for_base_model("Flux.1")
-        assert config.pipeline_class == "FluxPipeline"
-
-        config = get_pipeline_config_for_base_model("flux dev")
-        assert config.pipeline_class == "FluxPipeline"
-
-    def test_partial_match_qwen(self):
-        """Partial match for Qwen Image variants."""
-        for base_model in ["qwen", "Qwen Image", "Qwen-Image"]:
-            config = get_pipeline_config_for_base_model(base_model)
-            assert config.pipeline_class == "QwenImagePipeline"
-
-    def test_partial_match_flux2_before_flux1(self):
-        """FLUX.2 variants do not fall through to the FLUX.1 pipeline."""
-        for base_model in [
-            "Flux.2 Klein 9B",
-            "Flux.2 Klein 9B-base",
-            "Flux.2 Klein 4B",
-            "Flux.2 Klein 4B-base",
-        ]:
-            config = get_pipeline_config_for_base_model(base_model)
-            assert config.pipeline_class == "Flux2KleinPipeline"
-
-    def test_partial_match_sdxl_turbo(self):
-        """Partial match for SDXL Turbo."""
-        config = get_pipeline_config_for_base_model("SDXL Turbo")
-        assert config.pipeline_class == "StableDiffusionXLPipeline"
-        assert config.default_steps == 4
-        assert config.default_guidance_scale == 0.0
-
-    def test_partial_match_pony(self):
-        """Partial match for Pony models."""
-        config = get_pipeline_config_for_base_model("Pony V6 XL")
-        assert config.pipeline_class == "StableDiffusionXLPipeline"
-
-        config = get_pipeline_config_for_base_model("pony")
-        assert config.pipeline_class == "StableDiffusionXLPipeline"
-
-    def test_partial_match_illustrious(self):
-        """Partial match for Illustrious models."""
-        config = get_pipeline_config_for_base_model("Illustrious XL v1.0")
-        assert config.pipeline_class == "StableDiffusionXLPipeline"
-
-    def test_partial_match_sd3(self):
-        """Partial match for SD 3.x models."""
-        config = get_pipeline_config_for_base_model("SD 3.5 Large")
-        assert config.pipeline_class == "StableDiffusion3Pipeline"
-
-        config = get_pipeline_config_for_base_model("sd3")
-        assert config.pipeline_class == "StableDiffusion3Pipeline"
-
-    def test_partial_match_sd35_turbo(self):
-        """Partial match for SD 3.5 Turbo."""
-        config = get_pipeline_config_for_base_model("SD 3.5 Large Turbo")
-        assert config.pipeline_class == "StableDiffusion3Pipeline"
-        assert config.default_steps == 4
-        assert config.default_guidance_scale == 0.0
-
-    def test_partial_match_lcm_variants(self):
-        """Partial match for LCM variants."""
-        config = get_pipeline_config_for_base_model("SD 1.5 LCM")
-        assert config.pipeline_class == "StableDiffusionPipeline"
-        assert config.default_steps == 4
-
-        config = get_pipeline_config_for_base_model("SDXL 1.0 LCM")
-        assert config.pipeline_class == "StableDiffusionXLPipeline"
-        assert config.default_steps == 4
-
-    def test_none_returns_default(self):
-        """None base_model returns default config."""
-        config = get_pipeline_config_for_base_model(None)
-        assert config == DEFAULT_PIPELINE_CONFIG
-
-    def test_unknown_raises(self):
-        """Unknown base_model does not silently fall back to SDXL."""
-        with pytest.raises(ValueError, match="Unsupported CivitAI base model"):
-            get_pipeline_config_for_base_model("Some Unknown Model")
-
-    def test_pixart_variants(self):
-        """PixArt model variants."""
-        config = get_pipeline_config_for_base_model("PixArt a")
-        assert config.pipeline_class == "PixArtAlphaPipeline"
-
-        config = get_pipeline_config_for_base_model("pixart sigma")
-        assert config.pipeline_class == "PixArtSigmaPipeline"
-
-    def test_kolors(self):
-        """Kolors model."""
-        config = get_pipeline_config_for_base_model("Kolors")
-        assert config.pipeline_class == "KolorsPipeline"
-
-    def test_hunyuan(self):
-        """Hunyuan DiT model."""
-        config = get_pipeline_config_for_base_model("Hunyuan DiT")
-        assert config.pipeline_class == "HunyuanDiTPipeline"
-
-    def test_auraflow(self):
-        """AuraFlow model."""
-        config = get_pipeline_config_for_base_model("AuraFlow")
-        assert config.pipeline_class == "AuraFlowPipeline"
-
-        config = get_pipeline_config_for_base_model("aura flow")
-        assert config.pipeline_class == "AuraFlowPipeline"
-
-    def test_zimage_variants(self):
-        """Z-Image model variants use the ZImage pipeline."""
-        config = get_pipeline_config_for_base_model("Z-Image Turbo")
-        assert config.pipeline_class == "ZImagePipeline"
-        assert config.default_steps == 9
-        assert config.default_guidance_scale == 0.0
-        assert config.default_width == 1024
-        assert config.default_height == 1024
-        assert config.default_scheduler == "default"
-
-        for base_model in ["Z-Image", "ZImageTurbo", "z image turbo"]:
-            config = get_pipeline_config_for_base_model(base_model)
-            assert config.pipeline_class == "ZImagePipeline"
-
-
-class TestCivitaiBaseModelPipelineMap:
-    """Tests for the CIVITAI_BASE_MODEL_PIPELINE_MAP constant."""
-
-    def test_sd15_config(self):
-        """SD 1.5 has correct configuration."""
-        config = CIVITAI_BASE_MODEL_PIPELINE_MAP["SD 1.5"]
-        assert config.pipeline_class == "StableDiffusionPipeline"
-        assert config.default_width == 512
-        assert config.default_height == 512
-        assert config.supports_negative_prompt is True
-
-    def test_sdxl_config(self):
-        """SDXL 1.0 has correct configuration."""
-        config = CIVITAI_BASE_MODEL_PIPELINE_MAP["SDXL 1.0"]
-        assert config.pipeline_class == "StableDiffusionXLPipeline"
-        assert config.default_width == 1024
-        assert config.default_height == 1024
-
-    def test_flux_config(self):
-        """Flux.1 Dev has correct configuration."""
-        config = CIVITAI_BASE_MODEL_PIPELINE_MAP["Flux.1 Dev"]
-        assert config.pipeline_class == "FluxPipeline"
-        assert config.supports_negative_prompt is False
-        assert config.default_steps == 28
-        assert config.default_guidance_scale == 3.5
-
-    def test_all_entries_have_required_fields(self):
-        """All map entries have required PipelineConfig fields."""
-        for base_model, config in CIVITAI_BASE_MODEL_PIPELINE_MAP.items():
-            assert isinstance(config, PipelineConfig), f"Invalid config for {base_model}"
-            assert config.pipeline_class, f"Missing pipeline_class for {base_model}"
-            assert config.default_steps > 0, f"Invalid steps for {base_model}"
-            assert config.default_width > 0, f"Invalid width for {base_model}"
-            assert config.default_height > 0, f"Invalid height for {base_model}"
-
-
-class TestGetDiffusersPipelineClass:
-    """Tests for get_diffusers_pipeline_class function."""
-
-    def test_valid_class_import(self):
-        """Valid pipeline class can be imported."""
-        # Test with actual diffusers - it should import successfully
-        # We use a class that exists in diffusers
-        import diffusers
-
-        result = get_diffusers_pipeline_class("StableDiffusionPipeline")
-        assert result is diffusers.StableDiffusionPipeline
-
-    def test_invalid_class_raises(self):
-        """Invalid pipeline class raises ImportError."""
-        with pytest.raises(ImportError, match="not found in diffusers"):
-            get_diffusers_pipeline_class("NonExistentPipeline")
-
-
-class TestCivitaiCheckpointPipelineInit:
-    """Tests for CivitaiCheckpointPipeline initialization."""
-
-    def test_init(self):
-        """Pipeline initializes with correct state."""
+    @pytest.mark.parametrize("source", ["local", "remote"])
+    @pytest.mark.parametrize(
+        "label,family,variant",
+        [
+            ("ZImageTurbo", "zimage", "turbo"),
+            ("Flux.2 D", "flux2", None),
+            ("Flux.1 Krea", "flux1", "dev"),
+        ],
+    )
+    async def test_observed_civitai_labels_resolve_native_recipes(
+        self, source: str, label: str, family: str, variant: str | None
+    ) -> None:
+        """Actual API labels must reach their retained family, never a substring fallback."""
         pipeline = CivitaiCheckpointPipeline()
-        assert pipeline.pipe is None
-        assert pipeline._pipeline_config is None
-        assert pipeline._base_model is None
-        assert pipeline._lora_configs == []
-        assert pipeline._loaded_adapters == []
-
-    def test_pipeline_config_property(self):
-        """pipeline_config property returns stored config."""
-        pipeline = CivitaiCheckpointPipeline()
-        assert pipeline.pipeline_config is None
-
-        pipeline._pipeline_config = PipelineConfig(pipeline_class="Test")
-        assert pipeline.pipeline_config.pipeline_class == "Test"
-
-    def test_detected_base_model_property(self):
-        """detected_base_model property returns stored base model."""
-        pipeline = CivitaiCheckpointPipeline()
-        assert pipeline.detected_base_model is None
-
-        pipeline._base_model = "SDXL 1.0"
-        assert pipeline.detected_base_model == "SDXL 1.0"
-
-
-class TestCivitaiCheckpointPipelineLoad:
-    """Tests for CivitaiCheckpointPipeline.load method."""
-
-    def test_load_requires_checkpoint_path(self):
-        """load() requires checkpoint_path in config."""
-        pipeline = CivitaiCheckpointPipeline()
-        with pytest.raises(ValueError, match="checkpoint_path required"):
-            pipeline.load({})
-
-    def test_load_file_not_found(self, tmp_path):
-        """load() raises FileNotFoundError for missing file."""
-        pipeline = CivitaiCheckpointPipeline()
-        with pytest.raises(FileNotFoundError, match="Checkpoint not found"):
-            pipeline.load({"checkpoint_path": str(tmp_path / "nonexistent.safetensors")})
-
-    @patch.object(CivitaiCheckpointPipeline, "configure_scheduler")
-    @patch("oneiro.pipelines.civitai_checkpoint.get_diffusers_pipeline_class")
-    def test_load_with_base_model_override(self, mock_get_class, mock_config_sched, tmp_path):
-        """load() uses base_model override from config."""
-        # Create dummy checkpoint file
-        checkpoint = tmp_path / "model.safetensors"
-        checkpoint.write_bytes(b"dummy")
-
-        mock_pipeline_class = MagicMock()
-        mock_pipe = MagicMock()
-        mock_pipeline_class.from_single_file.return_value = mock_pipe
-        mock_get_class.return_value = mock_pipeline_class
-
-        pipeline = CivitaiCheckpointPipeline()
-        pipeline.load(
-            {
-                "checkpoint_path": str(checkpoint),
-                "base_model": "SD 1.5",
-            }
+        client = AsyncMock()
+        client.get_model.return_value = SimpleNamespace(
+            latest_version=SimpleNamespace(base_model=label)
         )
-
-        assert pipeline._pipeline_config.pipeline_class == "StableDiffusionPipeline"
-        mock_get_class.assert_called_once_with("StableDiffusionPipeline")
-
-    @patch("oneiro.pipelines.civitai_checkpoint.get_diffusers_pipeline_class")
-    def test_load_with_pipeline_class_override(self, mock_get_class, tmp_path):
-        """load() uses pipeline_class override from config."""
-        checkpoint = tmp_path / "model.safetensors"
-        checkpoint.write_bytes(b"dummy")
-
-        mock_pipeline_class = MagicMock()
-        mock_pipe = MagicMock()
-        mock_pipeline_class.from_single_file.return_value = mock_pipe
-        mock_get_class.return_value = mock_pipeline_class
-
-        pipeline = CivitaiCheckpointPipeline()
-        pipeline.load(
-            {
-                "checkpoint_path": str(checkpoint),
-                "pipeline_class": "CustomPipeline",
-                "steps": 10,
-                "guidance_scale": 5.0,
-            }
-        )
-
-        assert pipeline._pipeline_config.pipeline_class == "CustomPipeline"
-        assert pipeline._pipeline_config.default_steps == 10
-        assert pipeline._pipeline_config.default_guidance_scale == 5.0
-        mock_get_class.assert_called_once_with("CustomPipeline")
-
-    @patch.object(CivitaiCheckpointPipeline, "configure_scheduler")
-    @patch("oneiro.pipelines.civitai_checkpoint.get_diffusers_pipeline_class")
-    def test_load_enables_group_offload(self, mock_get_class, mock_config_sched, tmp_path):
-        """load() enables group offload when configured on CUDA."""
-        checkpoint = tmp_path / "model.safetensors"
-        checkpoint.write_bytes(b"dummy")
-
-        mock_pipeline_class = MagicMock()
-        mock_pipe = MagicMock()
-        mock_pipeline_class.from_single_file.return_value = mock_pipe
-        mock_get_class.return_value = mock_pipeline_class
-
-        pipeline = CivitaiCheckpointPipeline()
-        # Mock DevicePolicy.auto_detect to return CUDA with AUTO offload
-        mock_policy = DevicePolicy(device="cuda", dtype=torch.float16, offload=OffloadMode.AUTO)
-        with patch.object(DevicePolicy, "auto_detect", return_value=mock_policy):
-            pipeline.load(
-                {
-                    "checkpoint_path": str(checkpoint),
-                    "cpu_offload": True,
-                }
-            )
-
-        mock_pipe.enable_group_offload.assert_called_once()
-
-    @patch.object(CivitaiCheckpointPipeline, "configure_scheduler")
-    @patch("oneiro.pipelines.civitai_checkpoint.get_diffusers_pipeline_class")
-    def test_load_can_use_model_cpu_offload(self, mock_get_class, mock_config_sched, tmp_path):
-        """load() can use legacy model CPU offload when requested."""
-        checkpoint = tmp_path / "model.safetensors"
-        checkpoint.write_bytes(b"dummy")
-
-        mock_pipeline_class = MagicMock()
-        mock_pipe = MagicMock()
-        mock_pipeline_class.from_single_file.return_value = mock_pipe
-        mock_get_class.return_value = mock_pipeline_class
-
-        pipeline = CivitaiCheckpointPipeline()
-        mock_policy = DevicePolicy(
-            device="cuda",
-            dtype=torch.float16,
-            offload=OffloadMode.AUTO,
-            offload_type="model",
-        )
-        with patch.object(DevicePolicy, "auto_detect", return_value=mock_policy):
-            pipeline.load(
-                {
-                    "checkpoint_path": str(checkpoint),
-                    "cpu_offload": True,
-                    "offload_type": "model",
-                }
-            )
-
-        mock_pipe.enable_model_cpu_offload.assert_called_once()
-
-    @patch.object(CivitaiCheckpointPipeline, "configure_scheduler")
-    @patch("oneiro.pipelines.civitai_checkpoint.get_diffusers_pipeline_class")
-    def test_load_enables_vae_optimizations(self, mock_get_class, mock_config_sched, tmp_path):
-        """load() enables VAE tiling and slicing."""
-        checkpoint = tmp_path / "model.safetensors"
-        checkpoint.write_bytes(b"dummy")
-
-        mock_pipeline_class = MagicMock()
-        mock_pipe = MagicMock()
-        mock_vae = MagicMock()
-        mock_pipe.vae = mock_vae
-        mock_pipeline_class.from_single_file.return_value = mock_pipe
-        mock_get_class.return_value = mock_pipeline_class
-
-        pipeline = CivitaiCheckpointPipeline()
-        pipeline.load({"checkpoint_path": str(checkpoint)})
-
-        mock_vae.enable_tiling.assert_called_once()
-        mock_vae.enable_slicing.assert_called_once()
-
-    def test_load_zimage_single_file_injects_components(self, tmp_path):
-        """Z-Image single-file checkpoints receive preloaded base components."""
-        checkpoint = tmp_path / "model.safetensors"
-        checkpoint.write_bytes(b"dummy")
-
-        mock_pipeline_class = MagicMock()
-        mock_pipe = MagicMock()
-        mock_pipeline_class.from_single_file.return_value = mock_pipe
-        mock_text_encoder = MagicMock()
-        mock_tokenizer_instance = MagicMock()
-        mock_vae = MagicMock()
-        mock_policy = DevicePolicy(device="cpu", dtype=torch.bfloat16, offload=OffloadMode.NEVER)
-
-        with (
-            patch.object(CivitaiCheckpointPipeline, "configure_scheduler"),
-            patch.object(DevicePolicy, "auto_detect", return_value=mock_policy),
-            patch(
-                "oneiro.pipelines.civitai_checkpoint.get_diffusers_pipeline_class",
-                return_value=mock_pipeline_class,
-            ),
-            patch.object(
-                CivitaiCheckpointPipeline,
-                "_checkpoint_has_component",
-                return_value=False,
-            ) as mock_has_component,
-            patch("diffusers.AutoencoderKL") as mock_autoencoder_kl,
-            patch("transformers.Qwen3Model", create=True) as mock_qwen3_model,
-            patch("transformers.AutoTokenizer") as mock_auto_tokenizer,
-        ):
-            mock_qwen3_model.from_pretrained.return_value = mock_text_encoder
-            mock_auto_tokenizer.from_pretrained.return_value = mock_tokenizer_instance
-            mock_autoencoder_kl.from_pretrained.return_value = mock_vae
-
-            pipeline = CivitaiCheckpointPipeline()
-            pipeline.load(
-                {
-                    "checkpoint_path": str(checkpoint),
-                    "pipeline_class": "ZImagePipeline",
-                    "component_repo": "Tongyi-MAI/Z-Image-Turbo",
-                }
-            )
-
-        mock_qwen3_model.from_pretrained.assert_called_once_with(
-            "Tongyi-MAI/Z-Image-Turbo",
-            subfolder="text_encoder",
-            dtype=torch.bfloat16,
-        )
-        mock_auto_tokenizer.from_pretrained.assert_called_once_with(
-            "Tongyi-MAI/Z-Image-Turbo",
-            subfolder="tokenizer",
-        )
-        mock_autoencoder_kl.from_pretrained.assert_called_once_with(
-            "Tongyi-MAI/Z-Image-Turbo",
-            subfolder="vae",
-            torch_dtype=torch.bfloat16,
-        )
-        mock_has_component.assert_called_once_with(checkpoint, "vae")
-        mock_pipeline_class.from_single_file.assert_called_once()
-        call_kwargs = mock_pipeline_class.from_single_file.call_args.kwargs
-        assert call_kwargs["torch_dtype"] == torch.bfloat16
-        assert call_kwargs["text_encoder"] is mock_text_encoder
-        assert call_kwargs["tokenizer"] is mock_tokenizer_instance
-        assert call_kwargs["vae"] is mock_vae
-
-    def test_load_zimage_single_file_from_base_model_injects_components(self, tmp_path):
-        """Fetched Z-Image CivitAI checkpoints auto-detect and inject components."""
-        checkpoint = tmp_path / "model.safetensors"
-        checkpoint.write_bytes(b"dummy")
-
-        mock_pipeline_class = MagicMock()
-        mock_pipe = MagicMock()
-        mock_pipeline_class.from_single_file.return_value = mock_pipe
-        mock_text_encoder = MagicMock()
-        mock_tokenizer_instance = MagicMock()
-        mock_vae = MagicMock()
-        mock_policy = DevicePolicy(device="cpu", dtype=torch.bfloat16, offload=OffloadMode.NEVER)
-
-        with (
-            patch.object(CivitaiCheckpointPipeline, "configure_scheduler"),
-            patch.object(DevicePolicy, "auto_detect", return_value=mock_policy),
-            patch(
-                "oneiro.pipelines.civitai_checkpoint.get_diffusers_pipeline_class",
-                return_value=mock_pipeline_class,
-            ) as mock_get_class,
-            patch.object(
-                CivitaiCheckpointPipeline,
-                "_checkpoint_has_component",
-                return_value=False,
-            ) as mock_has_component,
-            patch("diffusers.AutoencoderKL") as mock_autoencoder_kl,
-            patch("transformers.Qwen3Model", create=True) as mock_qwen3_model,
-            patch("transformers.AutoTokenizer") as mock_auto_tokenizer,
-        ):
-            mock_qwen3_model.from_pretrained.return_value = mock_text_encoder
-            mock_auto_tokenizer.from_pretrained.return_value = mock_tokenizer_instance
-            mock_autoencoder_kl.from_pretrained.return_value = mock_vae
-
-            pipeline = CivitaiCheckpointPipeline()
-            pipeline.load(
-                {
-                    "checkpoint_path": str(checkpoint),
-                    "base_model": "Z-Image Turbo",
-                }
-            )
-
-        mock_get_class.assert_called_once_with("ZImagePipeline")
-        mock_qwen3_model.from_pretrained.assert_called_once_with(
-            "Tongyi-MAI/Z-Image-Turbo",
-            subfolder="text_encoder",
-            dtype=torch.bfloat16,
-        )
-        mock_auto_tokenizer.from_pretrained.assert_called_once_with(
-            "Tongyi-MAI/Z-Image-Turbo",
-            subfolder="tokenizer",
-        )
-        mock_autoencoder_kl.from_pretrained.assert_called_once_with(
-            "Tongyi-MAI/Z-Image-Turbo",
-            subfolder="vae",
-            torch_dtype=torch.bfloat16,
-        )
-        mock_has_component.assert_called_once_with(checkpoint, "vae")
-        call_kwargs = mock_pipeline_class.from_single_file.call_args.kwargs
-        assert call_kwargs["text_encoder"] is mock_text_encoder
-        assert call_kwargs["tokenizer"] is mock_tokenizer_instance
-        assert call_kwargs["vae"] is mock_vae
-
-    def test_load_zimage_single_file_injects_repo_vae_when_checkpoint_vae_present(self, tmp_path):
-        """Z-Image checkpoints with prefixed VAE keys still receive an explicit repo VAE."""
-        checkpoint = tmp_path / "model.safetensors"
-        checkpoint.write_bytes(b"dummy")
-
-        mock_pipeline_class = MagicMock()
-        mock_pipe = MagicMock()
-        mock_pipeline_class.from_single_file.return_value = mock_pipe
-        mock_text_encoder = MagicMock()
-        mock_tokenizer_instance = MagicMock()
-        mock_vae = MagicMock()
-        mock_policy = DevicePolicy(device="cpu", dtype=torch.bfloat16, offload=OffloadMode.NEVER)
-
-        with (
-            patch.object(CivitaiCheckpointPipeline, "configure_scheduler"),
-            patch.object(DevicePolicy, "auto_detect", return_value=mock_policy),
-            patch(
-                "oneiro.pipelines.civitai_checkpoint.get_diffusers_pipeline_class",
-                return_value=mock_pipeline_class,
-            ),
-            patch.object(
-                CivitaiCheckpointPipeline,
-                "_checkpoint_has_component",
-                return_value=True,
-            ) as mock_has_component,
-            patch("diffusers.AutoencoderKL") as mock_autoencoder_kl,
-            patch("transformers.Qwen3Model", create=True) as mock_qwen3_model,
-            patch("transformers.AutoTokenizer") as mock_auto_tokenizer,
-        ):
-            mock_qwen3_model.from_pretrained.return_value = mock_text_encoder
-            mock_auto_tokenizer.from_pretrained.return_value = mock_tokenizer_instance
-            mock_autoencoder_kl.from_pretrained.return_value = mock_vae
-
-            pipeline = CivitaiCheckpointPipeline()
-            pipeline.load(
-                {
-                    "checkpoint_path": str(checkpoint),
-                    "base_model": "ZImageTurbo",
-                }
-            )
-
-        mock_has_component.assert_called_once_with(checkpoint, "vae")
-        mock_autoencoder_kl.from_pretrained.assert_called_once_with(
-            "Tongyi-MAI/Z-Image-Turbo",
-            subfolder="vae",
-            torch_dtype=torch.bfloat16,
-        )
-        call_kwargs = mock_pipeline_class.from_single_file.call_args.kwargs
-        assert call_kwargs["text_encoder"] is mock_text_encoder
-        assert call_kwargs["tokenizer"] is mock_tokenizer_instance
-        assert call_kwargs["vae"] is mock_vae
-
-    def test_load_qwen_single_file_assembles_qwen_pipeline(self, tmp_path):
-        """CivitAI Qwen checkpoints load as Qwen transformer components, not SDXL."""
-        checkpoint = tmp_path / "qwen.safetensors"
-        checkpoint.write_bytes(b"dummy")
-
-        mock_pipeline_class = MagicMock()
-        mock_pipe = MagicMock()
-        mock_transformer = MagicMock()
-        mock_scheduler = MagicMock()
-        qwen_state_dict = {"img_in.weight": MagicMock()}
-        mock_policy = DevicePolicy(device="cpu", dtype=torch.bfloat16, offload=OffloadMode.NEVER)
-
-        with (
-            patch.object(CivitaiCheckpointPipeline, "configure_scheduler"),
-            patch.object(DevicePolicy, "auto_detect", return_value=mock_policy),
-            patch.object(
-                CivitaiCheckpointPipeline,
-                "_load_transformer_checkpoint",
-                return_value=qwen_state_dict,
-            ) as mock_load_checkpoint,
-            patch(
-                "oneiro.pipelines.civitai_checkpoint.get_diffusers_pipeline_class",
-                return_value=mock_pipeline_class,
-            ) as mock_get_class,
-            patch("diffusers.QwenImageTransformer2DModel") as mock_transformer_class,
-            patch("diffusers.FlowMatchEulerDiscreteScheduler") as mock_scheduler_class,
-            patch("diffusers.DiffusionPipeline") as mock_diffusion_pipeline,
-        ):
-            mock_transformer_class.from_single_file.return_value = mock_transformer
-            mock_scheduler_class.from_config.return_value = mock_scheduler
-            mock_diffusion_pipeline.from_pretrained.return_value = mock_pipe
-
-            pipeline = CivitaiCheckpointPipeline()
-            pipeline.load(
-                {
-                    "checkpoint_path": str(checkpoint),
-                    "base_model": "Qwen",
-                }
-            )
-
-        mock_get_class.assert_not_called()
-        mock_pipeline_class.from_single_file.assert_not_called()
-        mock_load_checkpoint.assert_called_once_with(checkpoint)
-        mock_transformer_class.from_single_file.assert_called_once_with(
-            qwen_state_dict,
-            torch_dtype=torch.bfloat16,
-            config="Qwen/Qwen-Image",
-            subfolder="transformer",
-        )
-        mock_scheduler_class.from_config.assert_called_once()
-        mock_diffusion_pipeline.from_pretrained.assert_called_once_with(
-            "Qwen/Qwen-Image",
-            transformer=mock_transformer,
-            scheduler=mock_scheduler,
-            torch_dtype=torch.bfloat16,
-        )
-
-    def test_load_qwen_fp8_single_file_uses_policy_dtype_by_default(self, tmp_path):
-        """Qwen FP8 checkpoints load in compute-safe policy dtype by default."""
-        fp8_dtype = getattr(torch, "float8_e5m2", None)
-        if fp8_dtype is None:
-            pytest.skip("torch build does not expose float8_e5m2")
-
-        checkpoint = tmp_path / "qwen-fp8.safetensors"
-        checkpoint.write_bytes(b"dummy")
-
-        mock_pipe = MagicMock()
-        mock_transformer = MagicMock()
-        mock_scheduler = MagicMock()
-        qwen_state_dict = {"img_in.weight": torch.empty((), dtype=fp8_dtype)}
-        mock_policy = DevicePolicy(device="cpu", dtype=torch.bfloat16, offload=OffloadMode.NEVER)
-
-        with (
-            patch.object(CivitaiCheckpointPipeline, "configure_scheduler"),
-            patch.object(DevicePolicy, "auto_detect", return_value=mock_policy),
-            patch.object(
-                CivitaiCheckpointPipeline,
-                "_load_transformer_checkpoint",
-                return_value=qwen_state_dict,
-            ),
-            patch("diffusers.QwenImageTransformer2DModel") as mock_transformer_class,
-            patch("diffusers.FlowMatchEulerDiscreteScheduler") as mock_scheduler_class,
-            patch("diffusers.DiffusionPipeline") as mock_diffusion_pipeline,
-        ):
-            mock_transformer_class.from_single_file.return_value = mock_transformer
-            mock_scheduler_class.from_config.return_value = mock_scheduler
-            mock_diffusion_pipeline.from_pretrained.return_value = mock_pipe
-
-            pipeline = CivitaiCheckpointPipeline()
-            pipeline.load(
-                {
-                    "checkpoint_path": str(checkpoint),
-                    "base_model": "Qwen",
-                }
-            )
-
-        mock_transformer_class.from_single_file.assert_called_once_with(
-            qwen_state_dict,
-            torch_dtype=torch.bfloat16,
-            config="Qwen/Qwen-Image",
-            subfolder="transformer",
-        )
-        mock_diffusion_pipeline.from_pretrained.assert_called_once_with(
-            "Qwen/Qwen-Image",
-            transformer=mock_transformer,
-            scheduler=mock_scheduler,
-            torch_dtype=torch.bfloat16,
-        )
-
-    def test_load_qwen_single_file_accepts_explicit_transformer_dtype(self, tmp_path):
-        """Operators can explicitly override Qwen transformer dtype when supported."""
-        fp8_dtype = getattr(torch, "float8_e5m2", None)
-        if fp8_dtype is None:
-            pytest.skip("torch build does not expose float8_e5m2")
-
-        checkpoint = tmp_path / "qwen-fp8.safetensors"
-        checkpoint.write_bytes(b"dummy")
-
-        mock_pipe = MagicMock()
-        mock_transformer = MagicMock()
-        mock_scheduler = MagicMock()
-        qwen_state_dict = {"img_in.weight": torch.empty((), dtype=fp8_dtype)}
-        mock_policy = DevicePolicy(device="cpu", dtype=torch.bfloat16, offload=OffloadMode.NEVER)
-
-        with (
-            patch.object(CivitaiCheckpointPipeline, "configure_scheduler"),
-            patch.object(DevicePolicy, "auto_detect", return_value=mock_policy),
-            patch.object(
-                CivitaiCheckpointPipeline,
-                "_load_transformer_checkpoint",
-                return_value=qwen_state_dict,
-            ),
-            patch("diffusers.QwenImageTransformer2DModel") as mock_transformer_class,
-            patch("diffusers.FlowMatchEulerDiscreteScheduler") as mock_scheduler_class,
-            patch("diffusers.DiffusionPipeline") as mock_diffusion_pipeline,
-        ):
-            mock_transformer_class.from_single_file.return_value = mock_transformer
-            mock_scheduler_class.from_config.return_value = mock_scheduler
-            mock_diffusion_pipeline.from_pretrained.return_value = mock_pipe
-
-            pipeline = CivitaiCheckpointPipeline()
-            pipeline.load(
-                {
-                    "checkpoint_path": str(checkpoint),
-                    "base_model": "Qwen",
-                    "qwen_transformer_dtype": "float8_e5m2",
-                }
-            )
-
-        mock_transformer_class.from_single_file.assert_called_once_with(
-            qwen_state_dict,
-            torch_dtype=fp8_dtype,
-            config="Qwen/Qwen-Image",
-            subfolder="transformer",
-        )
-
-    def test_load_qwen_uses_sequential_cpu_offload_on_cuda(self, tmp_path):
-        """Qwen CivitAI checkpoints use lower-memory sequential offload by default."""
-        checkpoint = tmp_path / "qwen.safetensors"
-        checkpoint.write_bytes(b"dummy")
-
-        mock_pipe = MagicMock()
-        mock_transformer = MagicMock()
-        mock_scheduler = MagicMock()
-        qwen_state_dict = {"img_in.weight": MagicMock()}
-        mock_policy = DevicePolicy(device="cuda", dtype=torch.float16, offload=OffloadMode.AUTO)
-
-        with (
-            patch.object(CivitaiCheckpointPipeline, "configure_scheduler"),
-            patch.object(DevicePolicy, "auto_detect", return_value=mock_policy),
-            patch.object(DevicePolicy, "apply_to_pipeline") as mock_apply_to_pipeline,
-            patch.object(
-                CivitaiCheckpointPipeline,
-                "_load_transformer_checkpoint",
-                return_value=qwen_state_dict,
-            ),
-            patch("diffusers.QwenImageTransformer2DModel") as mock_transformer_class,
-            patch("diffusers.FlowMatchEulerDiscreteScheduler") as mock_scheduler_class,
-            patch("diffusers.DiffusionPipeline") as mock_diffusion_pipeline,
-        ):
-            mock_transformer_class.from_single_file.return_value = mock_transformer
-            mock_scheduler_class.from_config.return_value = mock_scheduler
-            mock_diffusion_pipeline.from_pretrained.return_value = mock_pipe
-
-            pipeline = CivitaiCheckpointPipeline()
-            pipeline.load(
-                {
-                    "checkpoint_path": str(checkpoint),
-                    "base_model": "Qwen",
-                }
-            )
-
-        mock_pipe.enable_sequential_cpu_offload.assert_called_once_with()
-        assert mock_pipe._oneiro_offload_type == "sequential"
-        mock_apply_to_pipeline.assert_not_called()
-
-    def test_load_qwen_can_use_explicit_group_offload_on_cuda(self, tmp_path):
-        """Qwen CivitAI checkpoints can opt into group offload explicitly."""
-        checkpoint = tmp_path / "qwen.safetensors"
-        checkpoint.write_bytes(b"dummy")
-
-        mock_pipe = MagicMock()
-        mock_transformer = MagicMock()
-        mock_scheduler = MagicMock()
-        qwen_state_dict = {"img_in.weight": MagicMock()}
-        mock_policy = DevicePolicy(device="cuda", dtype=torch.float16, offload=OffloadMode.AUTO)
-
-        with (
-            patch.object(CivitaiCheckpointPipeline, "configure_scheduler"),
-            patch.object(DevicePolicy, "auto_detect", return_value=mock_policy),
-            patch.object(DevicePolicy, "apply_to_pipeline") as mock_apply_to_pipeline,
-            patch.object(
-                CivitaiCheckpointPipeline,
-                "_load_transformer_checkpoint",
-                return_value=qwen_state_dict,
-            ),
-            patch("diffusers.QwenImageTransformer2DModel") as mock_transformer_class,
-            patch("diffusers.FlowMatchEulerDiscreteScheduler") as mock_scheduler_class,
-            patch("diffusers.DiffusionPipeline") as mock_diffusion_pipeline,
-        ):
-            mock_transformer_class.from_single_file.return_value = mock_transformer
-            mock_scheduler_class.from_config.return_value = mock_scheduler
-            mock_diffusion_pipeline.from_pretrained.return_value = mock_pipe
-
-            pipeline = CivitaiCheckpointPipeline()
-            pipeline.load(
-                {
-                    "checkpoint_path": str(checkpoint),
-                    "base_model": "Qwen",
-                    "offload_type": "group",
-                }
-            )
-
-        mock_pipe.enable_sequential_cpu_offload.assert_not_called()
-        mock_apply_to_pipeline.assert_called_once_with(mock_pipe)
-
-    def test_load_qwen_sequential_false_uses_model_offload_on_cuda(self, tmp_path):
-        """Legacy sequential_cpu_offload=False keeps model offload for Qwen checkpoints."""
-        checkpoint = tmp_path / "qwen.safetensors"
-        checkpoint.write_bytes(b"dummy")
-
-        mock_pipe = MagicMock()
-        mock_transformer = MagicMock()
-        mock_scheduler = MagicMock()
-        qwen_state_dict = {"img_in.weight": MagicMock()}
-        mock_policy = DevicePolicy(
-            device="cuda",
-            dtype=torch.float16,
-            offload=OffloadMode.AUTO,
-            offload_type=OffloadType.MODEL,
-        )
-
-        with (
-            patch.object(CivitaiCheckpointPipeline, "configure_scheduler"),
-            patch.object(DevicePolicy, "auto_detect", return_value=mock_policy) as mock_auto_detect,
-            patch.object(
-                CivitaiCheckpointPipeline,
-                "_load_transformer_checkpoint",
-                return_value=qwen_state_dict,
-            ),
-            patch("diffusers.QwenImageTransformer2DModel") as mock_transformer_class,
-            patch("diffusers.FlowMatchEulerDiscreteScheduler") as mock_scheduler_class,
-            patch("diffusers.DiffusionPipeline") as mock_diffusion_pipeline,
-        ):
-            mock_transformer_class.from_single_file.return_value = mock_transformer
-            mock_scheduler_class.from_config.return_value = mock_scheduler
-            mock_diffusion_pipeline.from_pretrained.return_value = mock_pipe
-
-            pipeline = CivitaiCheckpointPipeline()
-            pipeline.load(
-                {
-                    "checkpoint_path": str(checkpoint),
-                    "base_model": "Qwen",
-                    "sequential_cpu_offload": False,
-                }
-            )
-
-        assert mock_auto_detect.call_args.kwargs["offload_type"] == "model"
-        mock_pipe.enable_sequential_cpu_offload.assert_not_called()
-        mock_pipe.enable_model_cpu_offload.assert_called_once_with()
-
-    def test_load_flux2_klein_single_file_assembles_klein_pipeline(self, tmp_path):
-        """CivitAI FLUX.2 Klein checkpoints load via the Flux2 transformer path."""
-        checkpoint = tmp_path / "flux2.safetensors"
-        checkpoint.write_bytes(b"dummy")
-
-        mock_pipeline_class = MagicMock()
-        mock_pipe = MagicMock()
-        mock_transformer = MagicMock()
-        flux2_state_dict = {"double_blocks.0.img_attn.norm.key_norm.weight": MagicMock()}
-        mock_policy = DevicePolicy(device="cpu", dtype=torch.bfloat16, offload=OffloadMode.NEVER)
-
-        with (
-            patch.object(CivitaiCheckpointPipeline, "configure_scheduler"),
-            patch.object(DevicePolicy, "auto_detect", return_value=mock_policy),
-            patch.object(
-                CivitaiCheckpointPipeline,
-                "_load_transformer_checkpoint",
-                return_value=flux2_state_dict,
-            ) as mock_load_checkpoint,
-            patch(
-                "oneiro.pipelines.civitai_checkpoint.get_diffusers_pipeline_class",
-                return_value=mock_pipeline_class,
-            ) as mock_get_class,
-            patch("diffusers.Flux2Transformer2DModel") as mock_transformer_class,
-            patch("diffusers.Flux2KleinPipeline") as mock_flux2_pipeline,
-        ):
-            mock_transformer_class.from_single_file.return_value = mock_transformer
-            mock_flux2_pipeline.from_pretrained.return_value = mock_pipe
-
-            pipeline = CivitaiCheckpointPipeline()
-            pipeline.load(
-                {
-                    "checkpoint_path": str(checkpoint),
-                    "base_model": "Flux.2 Klein 9B",
-                }
-            )
-
-        mock_get_class.assert_not_called()
-        mock_pipeline_class.from_single_file.assert_not_called()
-        mock_load_checkpoint.assert_called_once_with(checkpoint)
-        mock_transformer_class.from_single_file.assert_called_once_with(
-            flux2_state_dict,
-            torch_dtype=torch.bfloat16,
-            config="black-forest-labs/FLUX.2-klein-9B",
-            subfolder="transformer",
-        )
-        mock_flux2_pipeline.from_pretrained.assert_called_once_with(
-            "black-forest-labs/FLUX.2-klein-9B",
-            transformer=mock_transformer,
-            torch_dtype=torch.bfloat16,
-        )
-
-    def test_load_krea2_single_file_assembles_krea_pipeline(self, tmp_path):
-        """CivitAI Krea checkpoints replace the transformer in the hosted pipeline."""
-        checkpoint = tmp_path / "krea2.safetensors"
-        checkpoint.write_bytes(b"dummy")
-        mock_pipe = MagicMock()
-        mock_transformer = MagicMock()
-        mock_tokenizer = MagicMock()
-        mock_policy = DevicePolicy(device="cpu", dtype=torch.bfloat16, offload=OffloadMode.NEVER)
-
-        def load_tokenizer(repo):
-            mock_load_transformer.assert_called_once()
-            return mock_tokenizer
-
-        with (
-            patch.object(CivitaiCheckpointPipeline, "configure_scheduler"),
-            patch.object(DevicePolicy, "auto_detect", return_value=mock_policy),
-            patch.object(
-                CivitaiCheckpointPipeline,
-                "_load_krea2_transformer_from_single_file",
-                create=True,
-                return_value=mock_transformer,
-            ) as mock_load_transformer,
-            patch(
-                "oneiro.pipelines.krea2.load_krea2_tokenizer",
-                create=True,
-                side_effect=load_tokenizer,
-            ) as mock_load_tokenizer,
-            patch(
-                "oneiro.pipelines.civitai_checkpoint.get_diffusers_pipeline_class"
-            ) as mock_get_class,
-            patch("diffusers.Krea2Pipeline") as mock_krea2_pipeline,
-        ):
-            mock_krea2_pipeline.from_pretrained.return_value = mock_pipe
-
-            pipeline = CivitaiCheckpointPipeline()
-            pipeline.load(
-                {
-                    "checkpoint_path": str(checkpoint),
-                    "base_model": "Krea 2",
-                }
-            )
-
-        mock_get_class.assert_not_called()
-        mock_load_transformer.assert_called_once_with(
-            checkpoint,
-            "krea/Krea-2-Turbo",
-            "transformer",
-        )
-        mock_load_tokenizer.assert_called_once_with("krea/Krea-2-Turbo")
-        mock_krea2_pipeline.from_pretrained.assert_called_once_with(
-            "krea/Krea-2-Turbo",
-            transformer=mock_transformer,
-            tokenizer=mock_tokenizer,
-            torch_dtype=torch.bfloat16,
+        profile = {"checkpoint_path": "unused", "base_model": label}
+        if source == "remote":
+            profile = {"civitai_model_id": 1}
+        resolved = await pipeline.resolve_config(profile, client)
+        assert resolved["family"] == family
+        assert resolved["variant"] == variant
+        assert pipeline.validate_request(has_image=True) == (
+            "image_conditioned" if family == "flux2" else "image2image"
         )
 
     @pytest.mark.parametrize(
-        ("component_repo", "expected_steps", "expected_guidance"),
+        "base_model",
         [
-            ("krea/Krea-2-Raw", 28, 4.5),
-            ("drawthings/krea2-turbo", 8, 0.0),
+            None,
+            "Other",
+            "SD 1.5",
+            "SD 2.1",
+            "PixArt Sigma",
+            "Kolors",
+            "Hunyuan DiT",
+            "Lumina",
+            "AuraFlow",
+            "unknown XL",
+            "Flux.9000",
+            "Krea Unknown",
         ],
     )
-    def test_load_krea2_component_repo_uses_matching_defaults(
+    async def test_civitai_rejects_removed_family_before_download(
+        self, base_model: str | None
+    ) -> None:
+        """Unsupported remote metadata cannot reach any weight loader or download."""
+        pipeline = CivitaiCheckpointPipeline()
+        client = AsyncMock()
+        client.get_model_version.return_value = SimpleNamespace(base_model=base_model)
+        with patch.object(pipeline, "_load_from_path") as loader:
+            with pytest.raises(ValueError, match="base model"):
+                await pipeline.load_async({"civitai_model_id": 1, "civitai_version_id": 2}, client)
+        client.download_model_version.assert_not_awaited()
+        loader.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "config",
+        [
+            {},
+            {"pipeline_class": "StableDiffusionXLPipeline"},
+            {"base_model": "SD 1.5"},
+            {"base_model": "SDXL 1.0", "pipeline_class": "StableDiffusionPipeline"},
+            {"base_model": "Qwen", "sequential_cpu_offload": False},
+            {"base_model": "Qwen", "scheduler": "dpm++"},
+            {"base_model": "Krea 2", "component_repo": "custom/raw-looking-repo"},
+            {"base_model": "Krea 2", "component_repo": "krea/Krea-2-Raw", "variant": "turbo"},
+        ],
+    )
+    async def test_local_preflight_needs_known_family(
+        self, config: dict[str, Any], tmp_path: Path
+    ) -> None:
+        """Local sources cannot bypass family, variant or scheduler preflight."""
+        pipeline = CivitaiCheckpointPipeline()
+        with pytest.raises(ValueError):
+            await pipeline.resolve_config(
+                {"checkpoint_path": str(tmp_path / "missing"), **config}, None
+            )
+
+    async def test_metadata_preflight_retains_version_without_download(
+        self, tmp_path: Path
+    ) -> None:
+        """Resolve once, then reuse the retained version in the asynchronous loader."""
+        pipeline = CivitaiCheckpointPipeline()
+        version = SimpleNamespace(base_model="Pony")
+        client = AsyncMock()
+        client.get_model.return_value = SimpleNamespace(latest_version=version)
+        resolved = await pipeline.resolve_config({"civitai_model_id": 1}, client)
+        assert resolved["family"] == pipeline.family == "sdxl"
+        assert pipeline._resolved_version is version
+        client.download_model_version.assert_not_awaited()
+        client.download_model_version.return_value = tmp_path / "pony.safetensors"
+        with patch.object(pipeline, "load") as load:
+            await pipeline.load_async(resolved, client, {"embeddings": {}})
+        client.get_model.assert_awaited_once()
+        client.download_model_version.assert_awaited_once_with(version)
+        assert load.call_args.args[0]["base_model"] == "Pony"
+        assert load.call_args.args[1] == {"embeddings": {}}
+
+    @pytest.mark.parametrize("override", ["Flux.1 D", "Other"])
+    async def test_remote_metadata_cannot_be_replaced_by_another_family(
+        self, override: str
+    ) -> None:
+        """Remote metadata remains authoritative when a local base_model override conflicts."""
+        pipeline = CivitaiCheckpointPipeline()
+        client = AsyncMock()
+        client.get_model.return_value = SimpleNamespace(
+            latest_version=SimpleNamespace(base_model="Pony")
+        )
+        with pytest.raises(ValueError, match="base model"):
+            await pipeline.resolve_config({"civitai_model_id": 1, "base_model": override}, client)
+        client.download_model_version.assert_not_awaited()
+
+    async def test_async_local_load_runs_off_event_loop(self, tmp_path: Path) -> None:
+        """Even local async conversion runs in a worker, not on the event loop."""
+        loop_thread = threading.get_ident()
+        threads = []
+        pipeline = CivitaiCheckpointPipeline()
+        with patch.object(
+            pipeline, "load", side_effect=lambda *args: threads.append(threading.get_ident())
+        ):
+            await pipeline.load_async(
+                {"checkpoint_path": str(tmp_path / "local"), "base_model": "Pony"}, AsyncMock()
+            )
+        assert threads and threads[0] != loop_thread
+
+    @pytest.mark.parametrize("base_model", list(CIVITAI_BASE_MODEL_PIPELINE_MAP))
+    def test_every_retained_metadata_has_explicit_family(self, base_model: str) -> None:
+        """Every retained metadata name selects one supported native family."""
+        assert get_pipeline_config_for_base_model(base_model).family in {
+            "sdxl",
+            "sd3",
+            "flux1",
+            "flux2",
+            "flux2-klein",
+            "krea2",
+            "qwen",
+            "zimage",
+        }
+
+    def test_pipeline_config_requires_family(self) -> None:
+        """Conversion class metadata cannot replace an explicit resolved family."""
+        with pytest.raises(TypeError):
+            PipelineConfig(pipeline_class="StableDiffusionXLPipeline")
+
+    def test_normalized_sd3_metadata_selects_matching_components(self) -> None:
+        """Case/whitespace normalization must not fall back to SD3 medium components."""
+        pipeline = CivitaiCheckpointPipeline()
+        pipeline._configure_recipe({"base_model": " sd 3.5 large "})
+        assert pipeline._component_repo == "stabilityai/stable-diffusion-3.5-large"
+
+
+def checkpoint_wrapper(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    base_model: str = "Pony",
+    variant: str | None = None,
+    omit: str | None = None,
+) -> tuple[CivitaiCheckpointPipeline, dict[str, Any], dict[str, Any]]:
+    """Use a real original native graph/manager with model-free component doubles."""
+    repo = tmp_path / "repo"
+    repo.mkdir(exist_ok=True)
+    (repo / "model_index.json").write_text("{}")
+    checkpoint = tmp_path / "checkpoint.safetensors"
+    checkpoint.touch()
+    pipeline = CivitaiCheckpointPipeline()
+    config = {
+        "checkpoint_path": str(checkpoint),
+        "base_model": base_model,
+        "component_repo": str(repo),
+        "cpu_offload": False,
+        "scheduler": "default",
+    }
+    if variant:
+        config["variant"] = variant
+    pipeline._configure_recipe(config)
+    components = {
+        spec.name: TinyTokenizer() if "tokenizer" in spec.name else torch.nn.Linear(2, 2)
+        for spec in pipeline.blocks.expected_components
+        if spec.default_creation_method == "from_pretrained"
+    }
+    components["scheduler"] = (
+        DDIMScheduler() if pipeline.family == "sdxl" else FlowMatchEulerDiscreteScheduler()
+    )
+    if omit:
+        components.pop(omit)
+    monkeypatch.setattr(pipeline, "_load_checkpoint_components", lambda *args: components)
+    return pipeline, config, components
+
+
+class TestCheckpointComponents:
+    """Loading, resource hooks and inference use the reviewed shared lifecycle."""
+
+    @pytest.mark.parametrize(
+        ("base", "variant", "family"),
+        [
+            ("Pony", None, "sdxl"),
+            ("Illustrious", None, "sdxl"),
+            ("SD 3.5 Large", None, "sd3"),
+            ("Flux.1 D", "dev", "flux1"),
+            ("Flux.1 S", "schnell", "flux1"),
+            ("Flux.2", None, "flux2"),
+            ("Flux.2 Klein 4B", "distilled", "flux2-klein"),
+            ("Flux.2 Klein 9B-base", "base", "flux2-klein"),
+            ("Qwen", "image", "qwen"),
+            ("Krea 2", "raw", "krea2"),
+            ("Krea 2", "turbo", "krea2"),
+            ("Z-Image", "turbo", "zimage"),
+        ],
+    )
+    def test_checkpoint_components_use_shared_workflow(
         self,
-        tmp_path,
-        component_repo,
-        expected_steps,
-        expected_guidance,
-    ):
-        """Krea component model names, not organization names, select the recipe."""
-        checkpoint = tmp_path / "krea2-raw.safetensors"
-        checkpoint.write_bytes(b"dummy")
-        mock_transformer = MagicMock()
-        mock_tokenizer = MagicMock()
-        mock_policy = DevicePolicy(device="cpu", dtype=torch.bfloat16, offload=OffloadMode.NEVER)
-
-        with (
-            patch.object(CivitaiCheckpointPipeline, "configure_scheduler"),
-            patch.object(DevicePolicy, "auto_detect", return_value=mock_policy),
-            patch.object(
-                CivitaiCheckpointPipeline,
-                "_load_krea2_transformer_from_single_file",
-                return_value=mock_transformer,
-            ),
-            patch(
-                "oneiro.pipelines.krea2.load_krea2_tokenizer",
-                return_value=mock_tokenizer,
-            ) as mock_load_tokenizer,
-            patch("diffusers.Krea2Pipeline") as mock_krea2_pipeline,
-        ):
-            mock_krea2_pipeline.from_pretrained.return_value = MagicMock()
-            pipeline = CivitaiCheckpointPipeline()
-            pipeline.load(
-                {
-                    "checkpoint_path": str(checkpoint),
-                    "base_model": "Krea 2",
-                    "krea2_component_repo": component_repo,
-                }
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        base: str,
+        variant: str | None,
+        family: str,
+    ) -> None:
+        """All retained recipes declare actual text and image request inputs."""
+        pipeline, config, components = checkpoint_wrapper(tmp_path, monkeypatch, base, variant)
+        if family == "zimage":
+            monkeypatch.setattr(
+                "oneiro.pipelines.zimage.ZImageInpaintPipeline",
+                lambda **kwargs: SimpleNamespace(**kwargs),
             )
-
-        assert pipeline.pipeline_config is not None
-        assert pipeline.pipeline_config.default_steps == expected_steps
-        assert pipeline.pipeline_config.default_guidance_scale == expected_guidance
-        mock_load_tokenizer.assert_called_once_with(component_repo)
-        mock_krea2_pipeline.from_pretrained.assert_called_once_with(
-            component_repo,
-            transformer=mock_transformer,
-            tokenizer=mock_tokenizer,
-            torch_dtype=torch.bfloat16,
+        pipeline.load(config)
+        assert isinstance(pipeline, ModularPipelineWrapper)
+        assert pipeline.family == family
+        assert pipeline.pipe.components.get(
+            "unet", pipeline.pipe.components.get("transformer")
+        ) is components.get("unet", components.get("transformer"))
+        assert pipeline.validate_request(has_image=True) == (
+            "image_conditioned" if family in {"flux2", "flux2-klein"} else "image2image"
         )
+        assert pipeline.supports_inpaint == (family in {"sdxl", "qwen", "krea2", "zimage"})
 
-    def test_get_krea2_checkpoint_precision_reports_fp8_tensor_header(self, tmp_path):
-        """Tensor dtypes identify native FP8 Krea checkpoints."""
-        from safetensors.torch import save_file
+        def inference(self: BasePipeline, values: dict[str, Any], img2img: bool) -> dict[str, Any]:
+            """Catch wrapper/actual native graph mismatches at the inference boundary."""
+            assert values.keys() <= set(pipeline.pipe.blocks.input_names)
+            return {"images": [Image.new("RGB", (32, 32))]}
 
-        checkpoint = tmp_path / "krea2-fp8.safetensors"
-        save_file(
-            {
-                "first.weight": torch.ones(2, dtype=torch.float8_e4m3fn),
-                "last.linear.weight": torch.ones(2, dtype=torch.float8_e4m3fn),
-                "blocks.0.attn.wq.weight": torch.ones(2, dtype=torch.float8_e4m3fn),
-            },
-            checkpoint,
+        monkeypatch.setattr(BasePipeline, "run_inference", inference)
+        for helper in ("sdxl", "sd3", "flux"):
+            monkeypatch.setattr(
+                f"oneiro.pipelines.civitai_checkpoint.get_weighted_text_embeddings_{helper}",
+                lambda *args, _count=2 if helper == "flux" else 4, **kwargs: (
+                    (torch.ones(1),) * _count
+                ),
+            )
+        assert pipeline.generate("(cat:1.5)", width=32, height=32).workflow == "text2image"
+        assert pipeline.generate("cat", init_image=image_bytes(), width=32, height=32).workflow == (
+            "image_conditioned" if family in {"flux2", "flux2-klein"} else "image2image"
         )
+        pipeline.unload()
+        assert pipeline.pipe is pipeline.components_manager is pipeline.inpaint_pipe is None
 
-        assert get_krea2_checkpoint_precision(checkpoint) == "fp8"
+    def test_partial_checkpoint_load_releases_components(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Missing required native components release the partial manager and wrapper."""
+        pipeline, config, _ = checkpoint_wrapper(tmp_path, monkeypatch, omit="unet")
+        monkeypatch.setattr(ComponentSpec, "load", lambda *args, **kwargs: None)
+        with pytest.raises(RuntimeError, match="unet"):
+            pipeline.load(config)
+        assert pipeline.pipe is pipeline.components_manager is None
 
-    def test_get_krea2_checkpoint_precision_reports_unsupported_tensor_names(self):
-        """Unsupported quantized tensors identify their key, dtype, and shape."""
-        header = {
-            "first.weight": {"dtype": "F8_E4M3", "shape": [2, 2]},
-            "last.linear.weight": {"dtype": "F8_E4M3", "shape": [2, 2]},
-            "blocks.0.attn.wq.weight": {"dtype": "F8_E4M3", "shape": [2, 2]},
-            "blocks.0.attn.wq.weight_scale": {"dtype": "U8", "shape": [2, 1]},
-        }
+    def test_classic_container_is_discarded_before_placement(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Single-file containers leave only original native graph component references."""
+        pipeline = CivitaiCheckpointPipeline()
+        pipeline._configure_recipe({"base_model": "Pony"})
 
-        with pytest.raises(
-            ValueError,
-            match=r"blocks\.0\.attn\.wq\.weight_scale \(U8 \[2, 1\]\)",
+        class Container:
+            components = {"unet": object(), "watermark": object()}
+
+        container = Container()
+        reference = weakref.ref(container)
+        unet = container.components["unet"]
+        containers = [container]
+        del container
+        loader = SimpleNamespace(from_single_file=lambda *args, **kwargs: containers.pop())
+        monkeypatch.setattr(
+            "oneiro.pipelines.civitai_checkpoint.get_diffusers_pipeline_class", lambda name: loader
+        )
+        components = pipeline._load_checkpoint_components(tmp_path / "unused", {})
+        assert components == {"unet": unet}
+        assert reference() is None
+
+    def test_sdxl_text_component_retry_and_overrides(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Only missing SDXL text weights retry with explicitly configured components."""
+        pipeline = CivitaiCheckpointPipeline()
+        pipeline._configure_recipe({"base_model": "Pony"})
+        container = SimpleNamespace(components={"unet": object()})
+        calls = []
+
+        def load(*args: Any, **kwargs: Any) -> Any:
+            """Fail the first conversion exactly as the missing-CLIP loader does."""
+            calls.append(kwargs)
+            if len(calls) == 1:
+                raise ValueError("Weights for this component appear to be missing CLIPTextModel")
+            return container
+
+        monkeypatch.setattr(
+            "oneiro.pipelines.civitai_checkpoint.get_diffusers_pipeline_class",
+            lambda name: SimpleNamespace(from_single_file=load),
+        )
+        with (
+            patch("transformers.CLIPTextModel.from_pretrained", return_value=object()) as text,
+            patch(
+                "transformers.CLIPTextModelWithProjection.from_pretrained", return_value=object()
+            ),
+            patch("transformers.CLIPTokenizer.from_pretrained", return_value=object()),
         ):
-            get_krea2_checkpoint_precision_from_header(header)
-
-    def test_get_krea2_checkpoint_precision_accepts_comfy_quant_fp8_descriptors(self):
-        """Per-layer Comfy descriptors are valid auxiliaries for FP8 weights."""
-        header = {
-            "first.weight": {"dtype": "F8_E4M3", "shape": [2, 2]},
-            "first.comfy_quant": {"dtype": "U8", "shape": [27]},
-            "last.linear.weight": {"dtype": "F8_E4M3", "shape": [2, 2]},
-            "last.linear.comfy_quant": {"dtype": "U8", "shape": [27]},
-            "blocks.0.attn.wq.weight": {"dtype": "F8_E4M3", "shape": [2, 2]},
-            "blocks.0.attn.wq.comfy_quant": {"dtype": "U8", "shape": [27]},
-        }
-
-        assert get_krea2_checkpoint_precision_from_header(header) == "fp8"
-
-    def test_get_krea2_checkpoint_precision_rejects_non_u8_comfy_descriptor(self):
-        """Comfy quantization descriptors must use their serialized U8 representation."""
-        header = {
-            "first.weight": {"dtype": "F8_E4M3", "shape": [2, 2]},
-            "first.comfy_quant": {"dtype": "F32", "shape": [27]},
-            "last.linear.weight": {"dtype": "F8_E4M3", "shape": [2, 2]},
-            "last.linear.comfy_quant": {"dtype": "F32", "shape": [27]},
-            "blocks.0.attn.wq.weight": {"dtype": "F8_E4M3", "shape": [2, 2]},
-            "blocks.0.attn.wq.comfy_quant": {"dtype": "F32", "shape": [27]},
-        }
-
-        with pytest.raises(ValueError, match="descriptors must be U8"):
-            get_krea2_checkpoint_precision_from_header(header)
+            pipeline._load_checkpoint_components(
+                tmp_path / "unused",
+                {"text_encoder_repo": "custom/text", "text_encoder_subfolder": "clip"},
+            )
+        assert text.call_args.args == ("custom/text",)
+        assert text.call_args.kwargs["subfolder"] == "clip"
+        assert len(calls) == 2 and "text_encoder_2" in calls[1]
+        assert not pipeline._should_retry_with_sdxl_text_components(
+            ValueError("corrupt checkpoint"), {}
+        )
 
     @pytest.mark.parametrize(
-        ("payload", "error"),
+        ("base", "variant", "loader_name"),
         [
-            (b"not json", "Invalid Krea 2 quantization descriptor"),
-            (b'{"format": "mxfp8"}', "Unsupported Krea 2 quantization format: mxfp8"),
-            (
-                b'{"format": "float8_e4m3fn", "full_precision_matrix_mult": "false"}',
-                "full_precision_matrix_mult must be a boolean",
-            ),
+            ("Qwen", "image", "QwenImageTransformer2DModel"),
+            ("Flux.2", None, "Flux2Transformer2DModel"),
+            ("Flux.2 Klein 4B-base", "base", "Flux2Transformer2DModel"),
+            ("Z-Image", "turbo", "ZImageTransformer2DModel"),
         ],
     )
-    def test_get_krea2_checkpoint_precision_validates_comfy_descriptor_payload(
-        self, tmp_path, payload, error
-    ):
-        """Downloaded FP8 candidates validate descriptor JSON before selection."""
-        from safetensors.torch import save_file
+    def test_transformer_only_conversion_injects_no_classic_pipeline(
+        self,
+        tmp_path: Path,
+        base: str,
+        variant: str | None,
+        loader_name: str,
+    ) -> None:
+        """Non-container families inject released component converters directly."""
+        pipeline = CivitaiCheckpointPipeline()
+        pipeline._configure_recipe({"base_model": base})
+        state = {"double_blocks.weight": torch.ones(1)}
+        with (
+            patch.object(pipeline, "_load_transformer_checkpoint", return_value=state),
+            patch(f"diffusers.{loader_name}.from_single_file", return_value=object()) as load,
+        ):
+            result = pipeline._load_checkpoint_components(tmp_path / "weights.safetensors", {})
+        assert load.call_args.args == (state,)
+        assert "transformer" in result and set(result) <= {"transformer", "scheduler"}
+        assert load.call_args.kwargs["torch_dtype"] == pipeline.policy.dtype
 
-        checkpoint = tmp_path / "krea2-comfy-quant.safetensors"
-        weight = torch.ones((2, 2), dtype=torch.float8_e4m3fn)
-        descriptor = torch.tensor(list(payload), dtype=torch.uint8)
-        save_file(
-            {
-                "first.weight": weight,
-                "first.comfy_quant": descriptor,
-                "last.linear.weight": weight.clone(),
-                "last.linear.comfy_quant": descriptor.clone(),
-                "blocks.0.attn.wq.weight": weight.clone(),
-                "blocks.0.attn.wq.comfy_quant": descriptor.clone(),
-            },
-            checkpoint,
+    def test_qwen_gguf_and_explicit_precision(self, tmp_path: Path) -> None:
+        """Qwen keeps GGUF compute precision separate from requested storage precision."""
+        pipeline = CivitaiCheckpointPipeline()
+        pipeline._configure_recipe({"base_model": "Qwen"})
+        with patch(
+            "diffusers.QwenImageTransformer2DModel.from_single_file", return_value=object()
+        ) as load:
+            pipeline._load_checkpoint_components(
+                tmp_path / "weights.gguf", {"transformer_dtype": "fp8_e4m3fn"}
+            )
+        assert load.call_args.kwargs["torch_dtype"] == torch.float8_e4m3fn
+        assert load.call_args.kwargs["quantization_config"].compute_dtype == pipeline.policy.dtype
+
+    def test_zimage_component_overrides_are_injected_before_gap_loading(
+        self, tmp_path: Path
+    ) -> None:
+        """Explicit per-component sources must survive migration to hosted gap loading."""
+        pipeline = CivitaiCheckpointPipeline()
+        pipeline._configure_recipe({"base_model": "Z-Image"})
+        with (
+            patch.object(pipeline, "_load_transformer_checkpoint", return_value={}),
+            patch("diffusers.ZImageTransformer2DModel.from_single_file", return_value=object()),
+            patch.object(ComponentSpec, "load", return_value=object()) as load,
+        ):
+            components = pipeline._load_checkpoint_components(
+                tmp_path / "unused",
+                {"text_encoder_repo": "custom/text", "text_encoder_subfolder": "encoder"},
+            )
+        assert "text_encoder" in components
+        assert load.call_args.kwargs["pretrained_model_name_or_path"] == "custom/text"
+        assert load.call_args.kwargs["subfolder"] == "encoder"
+
+    @pytest.mark.parametrize("variant", ["raw", "turbo"])
+    def test_krea_checkpoint_uses_hosted_local_graph(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, variant: str
+    ) -> None:
+        """Both Krea variants share hosted graph types and the returned loader policy."""
+        pipeline = CivitaiCheckpointPipeline()
+        repo = "krea/Krea-2-Raw" if variant == "raw" else "krea/Krea-2-Turbo"
+        pipeline._configure_recipe({"base_model": "Krea 2", "component_repo": repo})
+        from oneiro.pipelines.backports.krea2 import Krea2AutoBlocks, Krea2TurboAutoBlocks
+
+        assert type(pipeline.blocks) is (
+            Krea2AutoBlocks if variant == "raw" else Krea2TurboAutoBlocks
         )
+        policy = DevicePolicy(device="cpu", dtype=torch.float32, group_offload_use_stream=False)
+        with (
+            patch(
+                "oneiro.pipelines.civitai_checkpoint.load_krea2_transformer",
+                return_value=(object(), policy),
+            ),
+            patch("oneiro.pipelines.krea2.load_krea2_tokenizer", return_value=object()),
+        ):
+            result = pipeline._load_checkpoint_components(tmp_path / "unused", {})
+        assert set(result) == {"tokenizer", "transformer"}
+        assert pipeline.policy is policy
 
-        with pytest.raises(ValueError, match=error):
-            get_krea2_checkpoint_precision(checkpoint)
 
-    def test_get_krea2_checkpoint_precision_reads_tensor_header(self, tmp_path):
-        """Displayed checkpoint precision comes from the SafeTensor header."""
-        from safetensors.torch import save_file
+class TestCheckpointGeneration:
+    """Native input declarations and shared rollback govern every request."""
 
-        checkpoint = tmp_path / "mislabeled-fp16.safetensors"
-        save_file(
+    @pytest.mark.parametrize(
+        "base,variant", [("Pony", None), ("SD 3.5", None), ("Flux.1 D", "dev")]
+    )
+    def test_native_state_preserves_weighted_embeddings(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, base: str, variant: str | None
+    ) -> None:
+        """The installed native embedding step preserves tensors and denoiser field tags."""
+        pipeline, config, _ = checkpoint_wrapper(tmp_path, monkeypatch, base, variant)
+        pipeline.load(config)
+        step = pipeline.pipe.blocks.sub_blocks["text_encoder"]
+        native = step.init_pipeline()
+        values = {output.name: torch.ones(1, 2, 2) for output in step.intermediate_outputs}
+        state = native(**values)
+        assert all(state.get(name) is tensor for name, tensor in values.items())
+        for output in step.intermediate_outputs:
+            if output.kwargs_type is not None:
+                assert state.get_by_kwargs(output.kwargs_type)[output.name] is values[output.name]
+        assert {spec.name for spec in step.expected_components} >= {"text_encoder", "tokenizer"}
+        pipeline.unload()
+
+    @pytest.mark.parametrize("base,variant", [("Pony", None), ("Flux.1 D", "dev")])
+    def test_checkpoint_uses_native_textual_inversion_loader(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, base: str, variant: str | None
+    ) -> None:
+        """Supported native loaders, not legacy family mixins, consume resolved embeddings."""
+        source, embedding = local_embedding_wrapper(tmp_path)
+        pipeline, config, components = checkpoint_wrapper(tmp_path, monkeypatch, base, variant)
+        components.update(text_encoder=source.pipe.text_encoder, tokenizer=source.pipe.tokenizer)
+        config["_resolved_embeddings"] = [embedding]
+        pipeline.load(config, {"embeddings": {}})
+        token_id = pipeline.pipe.tokenizer.convert_tokens_to_ids("<style>")
+        torch.testing.assert_close(
+            pipeline.pipe.text_encoder.get_input_embeddings().weight[token_id],
+            torch.arange(8).float(),
+        )
+        assert pipeline.active_embeddings == ["<style>"]
+        pipeline.unload_single_embedding("<style>")
+        assert pipeline.active_embeddings == []
+        pipeline.unload()
+
+    @pytest.mark.parametrize("failure", [False, True])
+    def test_scheduler_is_restored_after_request(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: bool
+    ) -> None:
+        """Request-local scheduler changes restore the profile on success and failure."""
+        pipeline, config, _ = checkpoint_wrapper(tmp_path, monkeypatch)
+        pipeline.load(config)
+        profile = pipeline.pipe.scheduler
+        seen = []
+
+        def inference(self: BasePipeline, values: dict[str, Any], img2img: bool) -> dict[str, Any]:
+            """Observe the temporary scheduler and optionally fail inference."""
+            seen.append(pipeline.pipe.scheduler)
+            assert "prompt_embeds" in values and "prompt" not in values
+            if failure:
+                raise RuntimeError("inference failed")
+            return {"images": [Image.new("RGB", (32, 32))]}
+
+        monkeypatch.setattr(BasePipeline, "run_inference", inference)
+        monkeypatch.setattr(
+            "oneiro.pipelines.civitai_checkpoint.get_weighted_text_embeddings_sdxl",
+            lambda *args, **kwargs: (torch.ones(1),) * 4,
+        )
+        if failure:
+            with pytest.raises(RuntimeError, match="inference failed"):
+                pipeline.generate(
+                    "(cat:1.5)", negative_prompt="bad", scheduler="euler", width=32, height=32
+                )
+        else:
+            result = pipeline.generate(
+                "(cat:1.5)", negative_prompt="bad", scheduler="euler", width=32, height=32
+            )
+            assert result.workflow == "text2image"
+        assert seen[0] is not profile
+        assert pipeline.pipe.scheduler is profile
+
+    @pytest.mark.parametrize("base", ["Qwen", "Krea 2", "Flux.1 D", "Flux.2", "SD 3.5", "Z-Image"])
+    def test_flow_family_rejects_discrete_scheduler(self, base: str) -> None:
+        """Discrete scheduler overrides cannot be applied to flow-matching recipes."""
+        with pytest.raises(ValueError, match="not compatible"):
+            CivitaiCheckpointPipeline()._configure_recipe(
+                {"base_model": base, "scheduler": "dpm++"}
+            )
+
+    def test_krea_checkpoint_shared_inference(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Tiny local Krea components run actual shared text and mask inference offline."""
+        tiny = local_wrapper(tmp_path)
+        pipeline = CivitaiCheckpointPipeline()
+        checkpoint = tmp_path / "unused"
+        checkpoint.touch()
+        components = dict(tiny.pipe.components)
+        # Inject only original graph components, keeping local text and transformer identities.
+        monkeypatch.setattr(pipeline, "_load_checkpoint_components", lambda *args: components)
+        pipeline.load(
             {
-                "model.diffusion_model.first.weight": torch.ones(2, dtype=torch.bfloat16),
-                "model.diffusion_model.last.linear.weight": torch.ones(2, dtype=torch.bfloat16),
-                "model.diffusion_model.blocks.0.attn.wq.weight": torch.ones(
-                    2, dtype=torch.bfloat16
+                "checkpoint_path": str(checkpoint),
+                "base_model": "Krea 2",
+                "component_repo": str(tmp_path / "components"),
+                "variant": "turbo",
+            }
+        )
+        pipeline.pipe.set_progress_bar_config(disable=True)
+        result = pipeline.generate(
+            "a cat", width=32, height=32, steps=1, seed=7, max_sequence_length=8
+        )
+        assert result.image.size == (32, 32)
+        result = pipeline.generate(
+            "a cat",
+            init_image=image_bytes(),
+            mask_image=image_bytes(),
+            width=32,
+            height=32,
+            steps=2,
+            strength=1.0,
+            max_sequence_length=8,
+        )
+        assert result.workflow == "inpainting" and result.strength == 1.0
+
+    def test_native_zimage_masks_share_components_and_size(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The retained native mask view shares components and normalizes output size."""
+        pipeline, config, _ = checkpoint_wrapper(tmp_path, monkeypatch, "Z-Image", "turbo")
+        constructor = {}
+
+        class Native:
+            def __init__(self, **kwargs: Any) -> None:
+                """Capture identities passed to the native mask constructor."""
+                constructor.update(kwargs)
+
+            def __call__(self, **kwargs: Any) -> SimpleNamespace:
+                """Check the native mask request's normalized dimensions."""
+                assert kwargs["image"].size == kwargs["mask_image"].size == (64, 32)
+                return SimpleNamespace(images=[Image.new("RGB", (64, 32))])
+
+        # workflow_inputs needs the reviewed class signature; patch only the constructor hook.
+        monkeypatch.setattr(
+            pipeline,
+            "_initialize_native_inpaint",
+            lambda: setattr(
+                pipeline,
+                "inpaint_pipe",
+                Native(
+                    **{
+                        name: pipeline.pipe.components[name]
+                        for name in ("transformer", "vae", "text_encoder", "tokenizer", "scheduler")
+                    }
                 ),
-            },
-            checkpoint,
+            ),
         )
-
-        assert get_krea2_checkpoint_precision(checkpoint) == "bf16"
-
-    def test_get_krea2_checkpoint_precision_reports_dominant_weight_dtype(self, tmp_path):
-        """FP32 norms do not make a BF16 checkpoint report compound precision."""
-        from safetensors.torch import save_file
-
-        checkpoint = tmp_path / "mixed.safetensors"
-        save_file(
-            {
-                "first.weight": torch.ones(100, dtype=torch.bfloat16),
-                "last.linear.weight": torch.ones(100, dtype=torch.bfloat16),
-                "blocks.0.attn.wq.weight": torch.ones(100, dtype=torch.bfloat16),
-                "last.norm.scale": torch.ones(10, dtype=torch.float32),
-            },
-            checkpoint,
+        pipeline.load(config)
+        assert all(value is pipeline.pipe.components[name] for name, value in constructor.items())
+        result = pipeline.generate(
+            "a cat",
+            init_image=image_bytes(),
+            mask_image=image_bytes(),
+            width=64,
+            height=32,
+            steps=2,
+            strength=1.0,
         )
+        assert result.image.size == (64, 32) and result.workflow == "inpainting"
 
-        assert get_krea2_checkpoint_precision(checkpoint) == "bf16"
 
-    def test_get_krea2_checkpoint_precision_reports_scaled_fp8_metadata(self, tmp_path):
-        """Comfy FP8 scales remain eligible for native quantized loading."""
-        from safetensors.torch import save_file
+def tiny_krea_transformer() -> torch.nn.Module:
+    """Create meta-only conversion targets, with no pretrained assets."""
+    with torch.device("meta"):
+        model = torch.nn.Module()
+        model.img_in = torch.nn.Linear(2, 2, bias=False)
+        model.final_layer = torch.nn.Module()
+        model.final_layer.linear = torch.nn.Linear(2, 2, bias=False)
+        model.final_layer.norm = torch.nn.LayerNorm(2, bias=False)
+        block = torch.nn.Module()
+        block.attn = torch.nn.Module()
+        block.attn.to_q = torch.nn.Linear(2, 2, bias=False)
+        model.transformer_blocks = torch.nn.ModuleList([block])
+    model._keep_in_fp32_modules = ["norm"]
+    return model
 
-        checkpoint = tmp_path / "krea2-scaled-fp8.safetensors"
-        save_file(
-            {
-                "first.weight": torch.ones(2, dtype=torch.float8_e4m3fn),
-                "first.weight_scale": torch.tensor(0.5),
-                "last.linear.weight": torch.ones(2, dtype=torch.float8_e4m3fn),
-                "last.linear.weight_scale": torch.tensor(0.5),
-                "blocks.0.attn.wq.weight": torch.ones(2, dtype=torch.float8_e4m3fn),
-                "blocks.0.attn.wq.weight_scale": torch.tensor(0.5),
-            },
-            checkpoint,
-            metadata={
-                "_quantization_metadata": (
-                    '{"layers":{"first":{"format":"float8_e4m3fn"},'
-                    '"last.linear":{"format":"float8_e4m3fn"},'
-                    '"blocks.0.attn.wq":{"format":"float8_e4m3fn"}}}'
-                )
-            },
-        )
 
-        assert get_krea2_checkpoint_precision(checkpoint) == "fp8"
+def krea_weights(dtype: torch.dtype = torch.bfloat16) -> dict[str, torch.Tensor]:
+    """Supply the smallest valid streamed checkpoint for the meta-only target."""
+    return {
+        "first.weight": torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=dtype),
+        "last.linear.weight": torch.ones((2, 2), dtype=dtype),
+        "last.norm.scale": torch.ones(2),
+        "blocks.0.attn.wq.weight": torch.ones((2, 2), dtype=dtype),
+    }
 
-    def test_get_krea2_checkpoint_precision_rejects_missing_fp8_scale(self, tmp_path):
-        """Scaled FP8 metadata requires a scale for every quantized weight."""
-        from safetensors.torch import save_file
 
-        checkpoint = tmp_path / "krea2-missing-fp8-scale.safetensors"
-        save_file(
-            {
-                "first.weight": torch.ones(2, dtype=torch.float8_e4m3fn),
-                "last.linear.weight": torch.ones(2, dtype=torch.float8_e4m3fn),
-                "blocks.0.attn.wq.weight": torch.ones(2, dtype=torch.float8_e4m3fn),
-            },
-            checkpoint,
-            metadata={
-                "_quantization_metadata": (
-                    '{"layers":{"first":{"format":"float8_e4m3fn"},'
-                    '"last.linear":{"format":"float8_e4m3fn"},'
-                    '"blocks.0.attn.wq":{"format":"float8_e4m3fn"}}}'
-                )
-            },
-        )
+class TestKreaConversion:
+    """Retained header/key/shape/FP8/scale gates, moved to the extracted public API."""
 
-        with pytest.raises(ValueError, match="scale"):
-            get_krea2_checkpoint_precision(checkpoint)
+    @pytest.mark.parametrize(
+        "dtype,precision", [(torch.bfloat16, "bf16"), (torch.float8_e4m3fn, "fp8")]
+    )
+    def test_get_krea2_checkpoint_precision_reads_tensor_header(
+        self, tmp_path: Path, dtype: torch.dtype, precision: str
+    ) -> None:
+        """Precision comes from real tensor headers, not checkpoint filenames."""
+        path = tmp_path / "mislabeled.safetensors"
+        save_file(krea_weights(dtype), path)
+        assert get_krea2_checkpoint_precision(path) == precision
 
-    def test_load_krea2_transformer_uses_policy_dtype_and_keeps_norms_fp32(self, tmp_path):
-        """Krea weights follow the policy while declared norm modules remain FP32."""
-        from safetensors.torch import save_file
+    @pytest.mark.parametrize(
+        "mutation,error",
+        [
+            ("unsupported", "Unsupported Krea 2 checkpoint tensors"),
+            ("missing", "does not contain Krea 2"),
+            ("orphan_scale", "missing or orphaned scales"),
+            ("scale_dtype", "scalar FP32"),
+            ("descriptor_dtype", "descriptors must be U8"),
+            ("descriptor_shape", "descriptor shape"),
+            ("metadata", "Invalid Krea 2 quantization metadata"),
+            ("format", "Unsupported Krea 2 quantization format"),
+            ("bool", "must be a boolean"),
+            ("missing_scale", "missing weight scales"),
+            ("mismatch", "does not match checkpoint weights"),
+        ],
+    )
+    def test_header_validation_failures(self, mutation: str, error: str) -> None:
+        """Retain rejection of malformed precision, scale and quantization metadata."""
+        header = {
+            key: {"dtype": "F8_E4M3", "shape": [2, 2]}
+            for key in ("first.weight", "last.linear.weight", "blocks.0.attn.wq.weight")
+        }
+        if mutation == "unsupported":
+            header["first.weight"]["dtype"] = "I8"
+        elif mutation == "missing":
+            del header["first.weight"]
+        elif mutation == "orphan_scale":
+            header["other.weight_scale"] = {"dtype": "F32", "shape": []}
+        elif mutation in {"scale_dtype", "missing_scale"}:
+            for key in list(header):
+                header[key.removesuffix(".weight") + ".weight_scale"] = {
+                    "dtype": "BF16" if mutation == "scale_dtype" else "F32",
+                    "shape": [],
+                }
+            if mutation == "missing_scale":
+                for key in list(header):
+                    if key.endswith("_scale"):
+                        del header[key]
+                header["__metadata__"] = {
+                    "_quantization_metadata": json.dumps(
+                        {
+                            "layers": {
+                                key.removesuffix(".weight"): {"format": "float8_e4m3fn"}
+                                for key in header
+                            }
+                        }
+                    )
+                }
+        elif mutation.startswith("descriptor"):
+            for key in list(header):
+                header[key.removesuffix(".weight") + ".comfy_quant"] = {
+                    "dtype": "F32" if mutation == "descriptor_dtype" else "U8",
+                    "shape": [5000] if mutation == "descriptor_shape" else [27],
+                }
+        else:
+            config = {"format": "mxfp8" if mutation == "format" else "float8_e4m3fn"}
+            if mutation == "bool":
+                config["full_precision_matrix_mult"] = "false"
+            header["__metadata__"] = {
+                "_quantization_metadata": "bad"
+                if mutation == "metadata"
+                else json.dumps({"layers": {"first": config}})
+            }
+        with pytest.raises(ValueError, match=error):
+            get_krea2_checkpoint_precision_from_header(header)
 
-        checkpoint = tmp_path / "krea2.safetensors"
-        source_weight = torch.arange(8, dtype=torch.float32).reshape(4, 2)
-        source_bias = torch.arange(4, dtype=torch.float32)
-        source_norm = torch.arange(4, dtype=torch.float32)
-        source_linear = torch.arange(8, dtype=torch.float32).reshape(4, 2)
-        source_query = torch.arange(8, dtype=torch.float32).reshape(4, 2)
-        save_file(
-            {
-                "first.weight": source_weight,
-                "first.bias": source_bias,
-                "last.norm.scale": source_norm,
-                "last.linear.weight": source_linear,
-                "blocks.0.attn.wq.weight": source_query,
-            },
-            checkpoint,
-        )
-
-        with torch.device("meta"):
-            transformer = torch.nn.Module()
-            transformer.img_in = torch.nn.Linear(2, 4)
-            transformer.final_layer = torch.nn.Module()
-            transformer.final_layer.norm = torch.nn.LayerNorm(4, bias=False)
-            transformer.final_layer.linear = torch.nn.Linear(2, 4, bias=False)
-            block = torch.nn.Module()
-            block.attn = torch.nn.Module()
-            block.attn.to_q = torch.nn.Linear(2, 4, bias=False)
-            transformer.transformer_blocks = torch.nn.ModuleList([block])
-        transformer._keep_in_fp32_modules = ["norm", "norm1", "norm2", "norm_q", "norm_k"]
-
-        pipeline = CivitaiCheckpointPipeline()
-        pipeline.policy = DevicePolicy(
-            device="cpu",
-            dtype=torch.bfloat16,
-            offload=OffloadMode.NEVER,
-        )
-
-        with patch("diffusers.Krea2Transformer2DModel") as mock_transformer_class:
-            mock_transformer_class.load_config.return_value = {"test": True}
-            mock_transformer_class.from_config.return_value = transformer
-
-            result = pipeline._load_krea2_transformer_from_single_file(
-                checkpoint,
-                "krea/Krea-2-Turbo",
-                "transformer",
-            )
-
-        assert result is transformer
-        assert result.img_in.weight.device.type == "cpu"
+    def test_load_krea2_transformer_uses_policy_dtype_and_keeps_norms_fp32(
+        self, tmp_path: Path
+    ) -> None:
+        """Stream CPU weights with policy dtype while retaining FP32 normalization."""
+        path = tmp_path / "krea.safetensors"
+        save_file(krea_weights(torch.float32), path)
+        model = tiny_krea_transformer()
+        policy = DevicePolicy(device="cpu", dtype=torch.bfloat16, offload=OffloadMode.NEVER)
+        with (
+            patch.object(BackportedKrea2Transformer2DModel, "load_config", return_value={}),
+            patch.object(BackportedKrea2Transformer2DModel, "from_config", return_value=model),
+        ):
+            result, returned_policy = load_krea2_transformer(path, "repo", "transformer", policy)
+        assert result is model and returned_policy is policy
         assert result.img_in.weight.dtype == torch.bfloat16
-        assert result.img_in.bias.dtype == torch.bfloat16
         assert result.final_layer.norm.weight.dtype == torch.float32
-        assert torch.equal(result.img_in.weight, source_weight.to(torch.bfloat16))
-        assert torch.equal(result.img_in.bias, source_bias.to(torch.bfloat16))
-        assert torch.equal(result.final_layer.norm.weight, source_norm)
+        assert result.img_in.weight.device.type == "cpu"
 
-    def test_load_krea2_transformer_runs_scaled_fp8_with_offloadable_storage(self, tmp_path):
-        """FP8 storage and scales remain visible to module device transfers."""
-        from safetensors.torch import save_file
-
-        checkpoint = tmp_path / "krea2-fp8.safetensors"
-        source_weight = torch.tensor(
-            [[1.0, 2.0], [3.0, 4.0]],
-            dtype=torch.float8_e4m3fn,
-        )
+    @pytest.mark.parametrize("descriptors", [False, True])
+    def test_load_krea2_transformer_runs_scaled_fp8_with_offloadable_storage(
+        self,
+        tmp_path: Path,
+        descriptors: bool,
+    ) -> None:
+        """FP8 metadata and descriptors preserve scale, storage and full-precision matmul."""
+        path = tmp_path / "fp8.safetensors"
+        weights = krea_weights(torch.float8_e4m3fn)
+        layers = {}
+        for key in list(weights):
+            if key.endswith(".weight"):
+                layer = key.removesuffix(".weight")
+                weights[layer + ".weight_scale"] = torch.tensor(0.5)
+                layers[layer] = {
+                    "format": "float8_e4m3fn",
+                    "full_precision_matrix_mult": layer == "last.linear",
+                }
+                if descriptors:
+                    weights[layer + ".comfy_quant"] = torch.tensor(
+                        list(json.dumps(layers[layer]).encode()), dtype=torch.uint8
+                    )
         save_file(
-            {
-                "first.weight": source_weight,
-                "first.weight_scale": torch.tensor(0.5),
-                "last.linear.weight": source_weight.clone(),
-                "last.linear.weight_scale": torch.tensor(0.5),
-                "blocks.0.attn.wq.weight": source_weight.clone(),
-                "blocks.0.attn.wq.weight_scale": torch.tensor(0.5),
-            },
-            checkpoint,
-            metadata={
-                "_quantization_metadata": (
-                    '{"layers":{"first":{"format":"float8_e4m3fn"},'
-                    '"last.linear":{"format":"float8_e4m3fn",'
-                    '"full_precision_matrix_mult":true},'
-                    '"blocks.0.attn.wq":{"format":"float8_e4m3fn"}}}'
-                )
-            },
+            weights,
+            path,
+            metadata={}
+            if descriptors
+            else {"_quantization_metadata": json.dumps({"layers": layers})},
         )
-        with torch.device("meta"):
-            transformer = torch.nn.Module()
-            transformer.img_in = torch.nn.Linear(2, 2, bias=False)
-            transformer.final_layer = torch.nn.Module()
-            transformer.final_layer.linear = torch.nn.Linear(2, 2, bias=False)
-            block = torch.nn.Module()
-            block.attn = torch.nn.Module()
-            block.attn.to_q = torch.nn.Linear(2, 2, bias=False)
-            transformer.transformer_blocks = torch.nn.ModuleList([block])
-        transformer._keep_in_fp32_modules = []
-
-        pipeline = CivitaiCheckpointPipeline()
-        pipeline.policy = DevicePolicy(
-            device="cpu",
-            dtype=torch.bfloat16,
-            offload=OffloadMode.NEVER,
-        )
-
-        with patch("diffusers.Krea2Transformer2DModel") as mock_transformer_class:
-            mock_transformer_class.load_config.return_value = {"test": True}
-            mock_transformer_class.from_config.return_value = transformer
-            result = pipeline._load_krea2_transformer_from_single_file(
-                checkpoint,
-                "krea/Krea-2-Turbo",
-                "transformer",
-            )
-
+        model = tiny_krea_transformer()
+        policy = DevicePolicy(device="cpu", dtype=torch.bfloat16)
+        with (
+            patch.object(BackportedKrea2Transformer2DModel, "load_config", return_value={}),
+            patch.object(BackportedKrea2Transformer2DModel, "from_config", return_value=model),
+        ):
+            result, returned_policy = load_krea2_transformer(path, "repo", "transformer", policy)
         assert result.img_in.weight.dtype == torch.float8_e4m3fn
         assert (
             result.img_in._oneiro_weight_scale
             is dict(result.img_in.named_buffers())["_oneiro_weight_scale"]
         )
-        assert result.img_in._oneiro_weight_scale.item() == 0.5
+        assert (
+            returned_policy.group_offload_use_stream is False
+            and policy.group_offload_use_stream is True
+        )
         from comfy_kitchen.tensor import TensorCoreFP8Layout
 
         with patch.object(
-            TensorCoreFP8Layout,
-            "quantize",
-            wraps=TensorCoreFP8Layout.quantize,
+            TensorCoreFP8Layout, "quantize", wraps=TensorCoreFP8Layout.quantize
         ) as quantize:
-            input_tensor = torch.tensor([[[2.0, 1.0]]], dtype=torch.bfloat16)
-            output = result.img_in(input_tensor)
+            output = result.img_in(torch.tensor([[[2.0, 1.0]]], dtype=torch.bfloat16))
             quantize.assert_called_once()
             quantize.reset_mock()
-            result.final_layer.linear(input_tensor)
+            result.final_layer.linear(torch.tensor([[[2.0, 1.0]]], dtype=torch.bfloat16))
             quantize.assert_not_called()
         assert torch.equal(output, torch.tensor([[[2.0, 5.0]]], dtype=torch.bfloat16))
-        assert pipeline.policy.group_offload_use_stream is False
-
-    def test_load_krea2_transformer_runs_comfy_quant_fp8(self, tmp_path):
-        """Converted FP8 descriptors preserve native FP8 execution."""
-        from safetensors.torch import save_file
-
-        checkpoint = tmp_path / "krea2-comfy-quant-fp8.safetensors"
-        source_weight = torch.tensor(
-            [[1.0, 2.0], [3.0, 4.0]],
-            dtype=torch.float8_e4m3fn,
-        )
-        descriptor = torch.tensor(
-            list(b'{"format": "float8_e4m3fn"}'),
-            dtype=torch.uint8,
-        )
-        save_file(
-            {
-                "first.weight": source_weight,
-                "first.comfy_quant": descriptor,
-            },
-            checkpoint,
-        )
-        with torch.device("meta"):
-            transformer = torch.nn.Module()
-            transformer.img_in = torch.nn.Linear(2, 2, bias=False)
-        transformer._keep_in_fp32_modules = []
-
-        pipeline = CivitaiCheckpointPipeline()
-        pipeline.policy = DevicePolicy(
-            device="cpu",
-            dtype=torch.bfloat16,
-            offload=OffloadMode.NEVER,
-        )
-
-        with (
-            patch("diffusers.Krea2Transformer2DModel") as mock_transformer_class,
-            patch(
-                "oneiro.pipelines.civitai_checkpoint._get_krea2_checkpoint_precision",
-                return_value="fp8",
-            ),
-        ):
-            mock_transformer_class.load_config.return_value = {"test": True}
-            mock_transformer_class.from_config.return_value = transformer
-            result = pipeline._load_krea2_transformer_from_single_file(
-                checkpoint,
-                "krea/Krea-2-Turbo",
-                "transformer",
-            )
-
-        assert result.img_in.weight.dtype == torch.float8_e4m3fn
-        output = result.img_in(torch.tensor([[[2.0, 1.0]]], dtype=torch.bfloat16))
-        assert torch.equal(output, torch.tensor([[[4.0, 10.0]]], dtype=torch.bfloat16))
-
-    def test_load_krea2_transformer_rejects_incomplete_checkpoint(self, tmp_path):
-        """A truncated Krea checkpoint cannot leave meta parameters in the pipeline."""
-        from safetensors.torch import save_file
-
-        checkpoint = tmp_path / "krea2-incomplete.safetensors"
-        save_file(
-            {
-                "first.weight": torch.zeros((4, 2)),
-                "last.linear.weight": torch.zeros((4, 2)),
-                "blocks.0.attn.wq.weight": torch.zeros((4, 2)),
-            },
-            checkpoint,
-        )
-        with torch.device("meta"):
-            transformer = torch.nn.Module()
-            transformer.img_in = torch.nn.Linear(2, 4)
-            transformer.final_layer = torch.nn.Module()
-            transformer.final_layer.linear = torch.nn.Linear(2, 4, bias=False)
-            block = torch.nn.Module()
-            block.attn = torch.nn.Module()
-            block.attn.to_q = torch.nn.Linear(2, 4, bias=False)
-            transformer.transformer_blocks = torch.nn.ModuleList([block])
-        transformer._keep_in_fp32_modules = ["norm", "norm1", "norm2", "norm_q", "norm_k"]
-
-        pipeline = CivitaiCheckpointPipeline()
-        pipeline.policy = DevicePolicy(
-            device="cpu",
-            dtype=torch.bfloat16,
-            offload=OffloadMode.NEVER,
-        )
-
-        with (
-            patch("diffusers.Krea2Transformer2DModel") as mock_transformer_class,
-            pytest.raises(ValueError, match="Krea 2 checkpoint is missing tensors: img_in.bias"),
-        ):
-            mock_transformer_class.load_config.return_value = {"test": True}
-            mock_transformer_class.from_config.return_value = transformer
-            pipeline._load_krea2_transformer_from_single_file(
-                checkpoint,
-                "krea/Krea-2-Turbo",
-                "transformer",
-            )
-
-    def test_load_krea2_transformer_explains_gated_component_repo(self, tmp_path):
-        """A gated component failure tells operators how to authorize Hugging Face."""
-        pipeline = CivitaiCheckpointPipeline()
-
-        with (
-            patch("diffusers.Krea2Transformer2DModel") as mock_transformer_class,
-            pytest.raises(RuntimeError, match="accept its license.*HF_TOKEN"),
-        ):
-            mock_transformer_class.load_config.side_effect = OSError("not a valid model identifier")
-            pipeline._load_krea2_transformer_from_single_file(
-                tmp_path / "krea2.safetensors",
-                "krea/Krea-2-Turbo",
-                "transformer",
-            )
-
-    def test_flux2_klein_4b_base_uses_4b_base_repo(self):
-        """FLUX.2 Klein 4B base models default to the matching 4B base repo."""
-        pipeline = CivitaiCheckpointPipeline()
-        pipeline._base_model = "Flux.2 Klein 4B-base"
-
-        assert pipeline._default_flux2_component_repo() == "black-forest-labs/FLUX.2-klein-base-4B"
 
     @pytest.mark.parametrize(
-        ("source_key", "source_shape", "expected_key", "expected_shape"),
+        "mutation,error",
+        [
+            ("shape", "Invalid shape"),
+            ("unexpected", "Unexpected Krea 2 checkpoint tensor"),
+            ("missing", "missing tensors"),
+            ("scale", "Invalid Krea 2 FP8 weight scale"),
+            ("descriptor", "Invalid Krea 2 quantization descriptor"),
+            ("conflict", "Conflicting Krea 2 quantization metadata"),
+        ],
+    )
+    def test_streamed_conversion_failures(self, tmp_path: Path, mutation: str, error: str) -> None:
+        """Conversion still rejects corrupt shapes, keys, scales and descriptors."""
+        weights = krea_weights(
+            torch.float8_e4m3fn
+            if mutation in {"scale", "descriptor", "conflict"}
+            else torch.bfloat16
+        )
+        metadata = {}
+        if mutation == "shape":
+            weights["first.weight"] = torch.ones((3, 2))
+        elif mutation == "unexpected":
+            weights["alien"] = torch.ones(1)
+        elif mutation == "missing":
+            del weights["last.norm.scale"]
+        elif mutation == "scale":
+            for key in list(weights):
+                if key.endswith(".weight"):
+                    weights[key.removesuffix(".weight") + ".weight_scale"] = torch.tensor(
+                        float("nan")
+                    )
+        else:
+            layers = {}
+            for key in list(weights):
+                if key.endswith(".weight"):
+                    layer = key.removesuffix(".weight")
+                    layers[layer] = {"format": "float8_e4m3fn"}
+                    weights[layer + ".weight_scale"] = torch.tensor(1.0)
+                    descriptor = (
+                        b"not json"
+                        if mutation == "descriptor"
+                        else b'{"format":"float8_e4m3fn","full_precision_matrix_mult":true}'
+                    )
+                    weights[layer + ".comfy_quant"] = torch.tensor(
+                        list(descriptor), dtype=torch.uint8
+                    )
+            metadata = {"_quantization_metadata": json.dumps({"layers": layers})}
+        path = tmp_path / "broken.safetensors"
+        save_file(weights, path, metadata=metadata)
+        with (
+            patch.object(BackportedKrea2Transformer2DModel, "load_config", return_value={}),
+            patch.object(
+                BackportedKrea2Transformer2DModel,
+                "from_config",
+                return_value=tiny_krea_transformer(),
+            ),
+            pytest.raises(ValueError, match=error),
+        ):
+            load_krea2_transformer(
+                path, "repo", "transformer", DevicePolicy(device="cpu", dtype=torch.float32)
+            )
+
+    def test_load_krea2_transformer_explains_gated_component_repo(self, tmp_path: Path) -> None:
+        """Gated Krea sources give actionable license and token diagnostics."""
+        with (
+            patch.object(
+                BackportedKrea2Transformer2DModel, "load_config", side_effect=OSError("gated")
+            ),
+            pytest.raises(RuntimeError, match="accept its license.*HF_TOKEN"),
+        ):
+            load_krea2_transformer(
+                tmp_path / "unused",
+                "repo",
+                "transformer",
+                DevicePolicy(device="cpu", dtype=torch.float32),
+            )
+
+    @pytest.mark.parametrize(
+        "source,shape,target,expected",
         [
             ("first.weight", (4, 2), "img_in.weight", (4, 2)),
-            (
-                "model.diffusion_model.first.weight",
-                (4, 2),
-                "img_in.weight",
-                (4, 2),
-            ),
+            ("model.diffusion_model.first.weight", (4, 2), "img_in.weight", (4, 2)),
             ("tmlp.0.weight", (4, 2), "time_embed.linear_1.weight", (4, 2)),
-            ("tproj.1.bias", (24,), "time_mod_proj.bias", (24,)),
             ("txtmlp.0.scale", (4,), "txt_in.norm.weight", (4,)),
-            (
-                "txtfusion.layerwise_blocks.0.attn.wq.weight",
-                (4, 4),
-                "text_fusion.layerwise_blocks.0.attn.to_q.weight",
-                (4, 4),
-            ),
-            (
-                "txtfusion.refiner_blocks.1.mlp.down.weight",
-                (4, 8),
-                "text_fusion.refiner_blocks.1.ff.down.weight",
-                (4, 8),
-            ),
-            (
-                "blocks.0.attn.qknorm.knorm.scale",
-                (2,),
-                "transformer_blocks.0.attn.norm_k.weight",
-                (2,),
-            ),
-            (
-                "blocks.0.attn.wo.weight",
-                (4, 4),
-                "transformer_blocks.0.attn.to_out.0.weight",
-                (4, 4),
-            ),
+            ("blocks.0.attn.wq.weight", (4, 2), "transformer_blocks.0.attn.to_q.weight", (4, 2)),
             ("blocks.0.mod.lin", (24,), "transformer_blocks.0.scale_shift_table", (6, 4)),
             ("last.modulation.lin", (8,), "final_layer.scale_shift_table", (2, 4)),
             ("last.norm.scale", (4,), "final_layer.norm.weight", (4,)),
         ],
     )
     def test_krea2_checkpoint_keys_convert_to_diffusers(
-        self,
-        source_key,
-        source_shape,
-        expected_key,
-        expected_shape,
-    ):
-        """Comfy Krea tensors map to the corresponding Diffusers parameters."""
-        tensor = torch.zeros(source_shape)
+        self, source: str, shape: tuple[int, ...], target: str, expected: tuple[int, ...]
+    ) -> None:
+        """Published Comfy keys preserve converted names and reshaped dimensions."""
+        key, tensor = convert_krea2_checkpoint_tensor(source, torch.zeros(shape))
+        assert key == target and tensor.shape == expected
 
-        key, converted = CivitaiCheckpointPipeline._convert_krea2_checkpoint_tensor(
-            source_key, tensor
-        )
+    def test_transformer_checkpoint_strips_comfy_diffusion_model_prefix(
+        self, tmp_path: Path
+    ) -> None:
+        """Transformer-only loaders accept the known Comfy checkpoint wrapper prefix."""
+        path = tmp_path / "weights.safetensors"
+        save_file({"model.diffusion_model.double_blocks.weight": torch.ones(1)}, path)
+        result = CivitaiCheckpointPipeline()._load_transformer_checkpoint(path)
+        assert set(result) == {"double_blocks.weight"}
 
-        assert key == expected_key
-        assert converted.shape == expected_shape
-
-    def test_all_krea2_checkpoint_keys_exist_in_diffusers_model(self):
-        """Every published Comfy Krea tensor maps to a real Diffusers parameter."""
+    def test_all_krea2_checkpoint_keys_exist_in_diffusers_model(self) -> None:
+        """Every published Comfy key still maps to the complete compatible 430-key model."""
         from accelerate import init_empty_weights
-        from diffusers import Krea2Transformer2DModel
 
         source_keys = [
             "first.bias",
@@ -1590,7 +953,7 @@ class TestCivitaiCheckpointPipelineLoad:
             "txtmlp.3.weight",
             "txtfusion.projector.weight",
         ]
-        block_suffixes = [
+        suffixes = [
             "attn.qknorm.knorm.scale",
             "attn.qknorm.qnorm.scale",
             "mod.lin",
@@ -1605,1332 +968,21 @@ class TestCivitaiCheckpointPipelineLoad:
             "mlp.gate.weight",
             "mlp.up.weight",
         ]
-        text_block_suffixes = [suffix for suffix in block_suffixes if suffix != "mod.lin"]
-        source_keys.extend(
-            f"blocks.{index}.{suffix}" for index in range(28) for suffix in block_suffixes
-        )
+        source_keys.extend(f"blocks.{index}.{suffix}" for index in range(28) for suffix in suffixes)
         source_keys.extend(
             f"txtfusion.{group}.{index}.{suffix}"
             for group in ("layerwise_blocks", "refiner_blocks")
             for index in range(2)
-            for suffix in text_block_suffixes
+            for suffix in suffixes
+            if suffix != "mod.lin"
         )
-
         with init_empty_weights():
-            model_keys = Krea2Transformer2DModel().state_dict().keys()
-
+            model_keys = BackportedKrea2Transformer2DModel().state_dict().keys()
         converted_keys = set()
-        for source_key in source_keys:
-            tensor_size = 6 if source_key.endswith(".mod.lin") else 2
-            key, _ = CivitaiCheckpointPipeline._convert_krea2_checkpoint_tensor(
-                source_key,
-                torch.empty(tensor_size),
+        for source in source_keys:
+            key, _ = convert_krea2_checkpoint_tensor(
+                source, torch.empty(6 if source.endswith(".mod.lin") else 2)
             )
             assert key in model_keys
             converted_keys.add(key)
-
         assert len(source_keys) == len(converted_keys) == len(model_keys) == 430
-
-    def test_transformer_checkpoint_strips_comfy_diffusion_model_prefix(self, tmp_path):
-        """CivitAI/Comfy transformer checkpoints are normalized before conversion."""
-        checkpoint = tmp_path / "flux2.safetensors"
-        prefixed_key = "model.diffusion_model.double_blocks.0.img_attn.norm.key_norm.weight"
-        second_prefixed_key = "model.diffusion_model.single_blocks.0.norm.query_norm.weight"
-        prefixed_tensor = torch.ones(2)
-        second_prefixed_tensor = torch.zeros(2)
-
-        pipeline = CivitaiCheckpointPipeline()
-        with patch("safetensors.torch.load_file") as mock_load_file:
-            mock_load_file.return_value = {
-                prefixed_key: prefixed_tensor,
-                second_prefixed_key: second_prefixed_tensor,
-            }
-
-            result = pipeline._load_transformer_checkpoint(checkpoint)
-
-        mock_load_file.assert_called_once_with(checkpoint, device="cpu")
-        assert result["double_blocks.0.img_attn.norm.key_norm.weight"] is prefixed_tensor
-        assert result["single_blocks.0.norm.query_norm.weight"] is second_prefixed_tensor
-
-    def test_transformer_checkpoint_keeps_diffusers_keys(self, tmp_path):
-        """Already-unwrapped transformer checkpoints pass through unchanged."""
-        checkpoint = tmp_path / "flux2.safetensors"
-        state_dict = {"double_blocks.0.img_attn.norm.key_norm.weight": torch.ones(2)}
-
-        pipeline = CivitaiCheckpointPipeline()
-        with patch("safetensors.torch.load_file", return_value=state_dict):
-            result = pipeline._load_transformer_checkpoint(checkpoint)
-
-        assert result is state_dict
-
-    def test_load_non_zimage_single_file_does_not_load_text_components(self, tmp_path):
-        """Non-Z-Image checkpoints keep the original single-file loading behavior."""
-        checkpoint = tmp_path / "model.safetensors"
-        checkpoint.write_bytes(b"dummy")
-
-        mock_pipeline_class = MagicMock()
-        mock_pipeline_class.from_single_file.return_value = MagicMock()
-        mock_policy = DevicePolicy(device="cpu", dtype=torch.float32, offload=OffloadMode.NEVER)
-
-        with (
-            patch.object(CivitaiCheckpointPipeline, "configure_scheduler"),
-            patch.object(DevicePolicy, "auto_detect", return_value=mock_policy),
-            patch(
-                "oneiro.pipelines.civitai_checkpoint.get_diffusers_pipeline_class",
-                return_value=mock_pipeline_class,
-            ),
-            patch("transformers.Qwen3Model", create=True) as mock_qwen3_model,
-            patch("transformers.AutoTokenizer") as mock_auto_tokenizer,
-        ):
-            pipeline = CivitaiCheckpointPipeline()
-            pipeline.load(
-                {
-                    "checkpoint_path": str(checkpoint),
-                    "base_model": "SDXL 1.0",
-                }
-            )
-
-        mock_qwen3_model.from_pretrained.assert_not_called()
-        mock_auto_tokenizer.from_pretrained.assert_not_called()
-        mock_pipeline_class.from_single_file.assert_called_once_with(
-            str(checkpoint),
-            torch_dtype=torch.float32,
-        )
-
-    def test_load_sdxl_single_file_retries_with_text_components(self, tmp_path):
-        """SDXL checkpoints retry with explicit text components when weights are missing."""
-        checkpoint = tmp_path / "model.safetensors"
-        checkpoint.write_bytes(b"dummy")
-
-        mock_pipeline_class = MagicMock()
-        mock_pipe = MagicMock()
-        mock_pipeline_class.from_single_file.side_effect = [
-            RuntimeError(
-                "Failed to load CLIPTextModel. Weights for this component appear to be "
-                "missing in the checkpoint."
-            ),
-            mock_pipe,
-        ]
-        mock_text_encoder = MagicMock()
-        mock_text_encoder_2 = MagicMock()
-        mock_tokenizer = MagicMock()
-        mock_tokenizer_2 = MagicMock()
-        mock_policy = DevicePolicy(device="cpu", dtype=torch.float16, offload=OffloadMode.NEVER)
-
-        with (
-            patch.object(CivitaiCheckpointPipeline, "configure_scheduler"),
-            patch.object(DevicePolicy, "auto_detect", return_value=mock_policy),
-            patch(
-                "oneiro.pipelines.civitai_checkpoint.get_diffusers_pipeline_class",
-                return_value=mock_pipeline_class,
-            ),
-            patch("transformers.CLIPTextModel") as mock_clip_text_model,
-            patch("transformers.CLIPTextModelWithProjection") as mock_clip_text_model_2,
-            patch("transformers.CLIPTokenizer") as mock_clip_tokenizer,
-        ):
-            mock_clip_text_model.from_pretrained.return_value = mock_text_encoder
-            mock_clip_text_model_2.from_pretrained.return_value = mock_text_encoder_2
-            mock_clip_tokenizer.from_pretrained.side_effect = [mock_tokenizer, mock_tokenizer_2]
-
-            pipeline = CivitaiCheckpointPipeline()
-            pipeline.load(
-                {
-                    "checkpoint_path": str(checkpoint),
-                    "base_model": "Illustrious",
-                }
-            )
-
-        assert mock_pipeline_class.from_single_file.call_count == 2
-        first_call = mock_pipeline_class.from_single_file.call_args_list[0]
-        assert first_call.args == (str(checkpoint),)
-        assert first_call.kwargs == {"torch_dtype": torch.float16}
-
-        second_call = mock_pipeline_class.from_single_file.call_args_list[1]
-        assert second_call.args == (str(checkpoint),)
-        assert second_call.kwargs["torch_dtype"] == torch.float16
-        assert second_call.kwargs["config"] == "stabilityai/stable-diffusion-xl-base-1.0"
-        assert second_call.kwargs["text_encoder"] is mock_text_encoder
-        assert second_call.kwargs["text_encoder_2"] is mock_text_encoder_2
-        assert second_call.kwargs["tokenizer"] is mock_tokenizer
-        assert second_call.kwargs["tokenizer_2"] is mock_tokenizer_2
-
-        mock_clip_text_model.from_pretrained.assert_called_once_with(
-            "stabilityai/stable-diffusion-xl-base-1.0",
-            subfolder="text_encoder",
-            torch_dtype=torch.float16,
-        )
-        mock_clip_text_model_2.from_pretrained.assert_called_once_with(
-            "stabilityai/stable-diffusion-xl-base-1.0",
-            subfolder="text_encoder_2",
-            torch_dtype=torch.float16,
-        )
-        assert mock_clip_tokenizer.from_pretrained.call_args_list == [
-            (("stabilityai/stable-diffusion-xl-base-1.0",), {"subfolder": "tokenizer"}),
-            (("stabilityai/stable-diffusion-xl-base-1.0",), {"subfolder": "tokenizer_2"}),
-        ]
-
-    def test_load_sdxl_single_file_uses_component_overrides_on_retry(self, tmp_path):
-        """SDXL text component fallback supports custom repos and subfolders."""
-        checkpoint = tmp_path / "model.safetensors"
-        checkpoint.write_bytes(b"dummy")
-
-        mock_pipeline_class = MagicMock()
-        mock_pipeline_class.from_single_file.side_effect = [
-            RuntimeError(
-                "Failed to load CLIPTextModelWithProjection. Weights for this component "
-                "appear to be missing in the checkpoint."
-            ),
-            MagicMock(),
-        ]
-        mock_policy = DevicePolicy(device="cpu", dtype=torch.float32, offload=OffloadMode.NEVER)
-
-        with (
-            patch.object(CivitaiCheckpointPipeline, "configure_scheduler"),
-            patch.object(DevicePolicy, "auto_detect", return_value=mock_policy),
-            patch(
-                "oneiro.pipelines.civitai_checkpoint.get_diffusers_pipeline_class",
-                return_value=mock_pipeline_class,
-            ),
-            patch("transformers.CLIPTextModel") as mock_clip_text_model,
-            patch("transformers.CLIPTextModelWithProjection") as mock_clip_text_model_2,
-            patch("transformers.CLIPTokenizer") as mock_clip_tokenizer,
-        ):
-            pipeline = CivitaiCheckpointPipeline()
-            pipeline.load(
-                {
-                    "checkpoint_path": str(checkpoint),
-                    "base_model": "SDXL 1.0",
-                    "sdxl_component_repo": "base/sdxl",
-                    "single_file_config_repo": "config/sdxl",
-                    "text_encoder_repo": "custom/text",
-                    "text_encoder_subfolder": "clip_l",
-                    "text_encoder_2_repo": "custom/text2",
-                    "text_encoder_2_subfolder": "clip_g",
-                    "tokenizer_repo": "custom/tokenizer",
-                    "tokenizer_subfolder": "tok_l",
-                    "tokenizer_2_repo": "custom/tokenizer2",
-                    "tokenizer_2_subfolder": "tok_g",
-                }
-            )
-
-        retry_kwargs = mock_pipeline_class.from_single_file.call_args_list[1].kwargs
-        assert retry_kwargs["config"] == "config/sdxl"
-        mock_clip_text_model.from_pretrained.assert_called_once_with(
-            "custom/text",
-            subfolder="clip_l",
-            torch_dtype=torch.float32,
-        )
-        mock_clip_text_model_2.from_pretrained.assert_called_once_with(
-            "custom/text2",
-            subfolder="clip_g",
-            torch_dtype=torch.float32,
-        )
-        assert mock_clip_tokenizer.from_pretrained.call_args_list == [
-            (("custom/tokenizer",), {"subfolder": "tok_l"}),
-            (("custom/tokenizer2",), {"subfolder": "tok_g"}),
-        ]
-
-    def test_load_zimage_single_file_allows_component_repo_overrides(self, tmp_path):
-        """Z-Image component locations can be overridden independently."""
-        checkpoint = tmp_path / "model.safetensors"
-        checkpoint.write_bytes(b"dummy")
-
-        mock_pipeline_class = MagicMock()
-        mock_pipeline_class.from_single_file.return_value = MagicMock()
-        mock_policy = DevicePolicy(device="cpu", dtype=torch.float32, offload=OffloadMode.NEVER)
-
-        with (
-            patch.object(CivitaiCheckpointPipeline, "configure_scheduler"),
-            patch.object(DevicePolicy, "auto_detect", return_value=mock_policy),
-            patch(
-                "oneiro.pipelines.civitai_checkpoint.get_diffusers_pipeline_class",
-                return_value=mock_pipeline_class,
-            ),
-            patch.object(
-                CivitaiCheckpointPipeline,
-                "_checkpoint_has_component",
-                return_value=False,
-            ) as mock_has_component,
-            patch("diffusers.AutoencoderKL") as mock_autoencoder_kl,
-            patch("transformers.Qwen3Model", create=True) as mock_qwen3_model,
-            patch("transformers.AutoTokenizer") as mock_auto_tokenizer,
-        ):
-            pipeline = CivitaiCheckpointPipeline()
-            pipeline.load(
-                {
-                    "checkpoint_path": str(checkpoint),
-                    "pipeline_class": "ZImagePipeline",
-                    "text_encoder_repo": "custom/text",
-                    "text_encoder_subfolder": "encoder",
-                    "tokenizer_repo": "custom/tokenizer",
-                    "tokenizer_subfolder": "tok",
-                    "vae_repo": "custom/vae",
-                    "vae_subfolder": "decoder",
-                }
-            )
-
-        mock_qwen3_model.from_pretrained.assert_called_once_with(
-            "custom/text",
-            subfolder="encoder",
-            dtype=torch.float32,
-        )
-        mock_auto_tokenizer.from_pretrained.assert_called_once_with(
-            "custom/tokenizer",
-            subfolder="tok",
-        )
-        mock_autoencoder_kl.from_pretrained.assert_called_once_with(
-            "custom/vae",
-            subfolder="decoder",
-            torch_dtype=torch.float32,
-        )
-        mock_has_component.assert_called_once_with(checkpoint, "vae")
-
-
-class TestCivitaiCheckpointPipelineLoadAsync:
-    """Tests for CivitaiCheckpointPipeline.load_async method."""
-
-    @pytest.mark.asyncio
-    async def test_load_async_with_checkpoint_path(self, tmp_path):
-        """load_async() uses checkpoint_path if provided."""
-        checkpoint = tmp_path / "model.safetensors"
-        checkpoint.write_bytes(b"dummy")
-
-        pipeline = CivitaiCheckpointPipeline()
-
-        with patch.object(pipeline, "_load_from_path") as mock_load:
-            await pipeline.load_async(
-                {"checkpoint_path": str(checkpoint)},
-                civitai_client=MagicMock(),
-            )
-            mock_load.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_load_async_requires_model_id(self):
-        """load_async() requires civitai_model_id when no path."""
-        pipeline = CivitaiCheckpointPipeline()
-        client = MagicMock()
-
-        with pytest.raises(ValueError, match="civitai_model_id required"):
-            await pipeline.load_async({}, civitai_client=client)
-
-    @pytest.mark.asyncio
-    async def test_load_async_fetches_model_info(self, tmp_path):
-        """load_async() fetches model info from CivitAI."""
-        checkpoint = tmp_path / "model.safetensors"
-        checkpoint.write_bytes(b"dummy")
-
-        # Mock CivitAI client
-        mock_version = MagicMock()
-        mock_version.base_model = "SDXL 1.0"
-        mock_version.name = "Test Model v1"
-
-        mock_model = MagicMock()
-        mock_model.latest_version = mock_version
-
-        mock_client = AsyncMock()
-        mock_client.get_model.return_value = mock_model
-        mock_client.download_model_version.return_value = checkpoint
-
-        pipeline = CivitaiCheckpointPipeline()
-
-        with patch.object(pipeline, "_load_from_path") as mock_load:
-            await pipeline.load_async(
-                {"civitai_model_id": 12345},
-                civitai_client=mock_client,
-            )
-
-            mock_client.get_model.assert_called_once_with(12345)
-            mock_client.download_model_version.assert_called_once_with(mock_version)
-            assert pipeline._base_model == "SDXL 1.0"
-            mock_load.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_load_async_with_version_id(self, tmp_path):
-        """load_async() fetches specific version when version_id provided."""
-        checkpoint = tmp_path / "model.safetensors"
-        checkpoint.write_bytes(b"dummy")
-
-        mock_version = MagicMock()
-        mock_version.base_model = "Flux.1 Dev"
-        mock_version.name = "Test Model v2"
-
-        mock_client = AsyncMock()
-        mock_client.get_model_version.return_value = mock_version
-        mock_client.download_model_version.return_value = checkpoint
-
-        pipeline = CivitaiCheckpointPipeline()
-
-        with patch.object(pipeline, "_load_from_path"):
-            await pipeline.load_async(
-                {"civitai_model_id": 12345, "civitai_version_id": 67890},
-                civitai_client=mock_client,
-            )
-
-            mock_client.get_model_version.assert_called_once_with(67890)
-            mock_client.get_model.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_load_async_no_versions_available(self):
-        """load_async() raises when model has no versions."""
-        mock_model = MagicMock()
-        mock_model.latest_version = None
-
-        mock_client = AsyncMock()
-        mock_client.get_model.return_value = mock_model
-
-        pipeline = CivitaiCheckpointPipeline()
-
-        with pytest.raises(ValueError, match="No versions available"):
-            await pipeline.load_async(
-                {"civitai_model_id": 12345},
-                civitai_client=mock_client,
-            )
-
-
-class TestCivitaiCheckpointPipelineGenerate:
-    """Tests for CivitaiCheckpointPipeline.generate method."""
-
-    def test_generate_requires_loaded_pipeline(self):
-        """generate() raises if pipeline not loaded."""
-        pipeline = CivitaiCheckpointPipeline()
-        with pytest.raises(RuntimeError, match="Pipeline not loaded"):
-            pipeline.generate("test prompt")
-
-    def test_generate_requires_pipeline_config(self):
-        """generate() raises if pipeline_config not set."""
-        pipeline = CivitaiCheckpointPipeline()
-        pipeline.pipe = MagicMock()  # Pretend pipeline is loaded
-        with pytest.raises(RuntimeError, match="Pipeline config not initialized"):
-            pipeline.generate("test prompt")
-
-    def test_generate_uses_config_defaults(self):
-        """generate() uses defaults from pipeline config."""
-        pipeline = CivitaiCheckpointPipeline()
-        pipeline._pipeline_config = PipelineConfig(
-            pipeline_class="StableDiffusionXLPipeline",
-            default_steps=25,
-            default_guidance_scale=7.0,
-            default_width=1024,
-            default_height=1024,
-        )
-
-        mock_pipe = MagicMock()
-        mock_image = MagicMock()
-        mock_image.width = 1024
-        mock_image.height = 1024
-        mock_pipe.return_value.images = [mock_image]
-        pipeline.pipe = mock_pipe
-
-        with patch.object(pipeline, "_encode_prompts_to_embeddings"):
-            pipeline.generate("test prompt")
-
-        call_kwargs = mock_pipe.call_args.kwargs
-        assert call_kwargs["num_inference_steps"] == 25
-        assert call_kwargs["guidance_scale"] == 7.0
-        assert call_kwargs["width"] == 1024
-        assert call_kwargs["height"] == 1024
-
-    def test_generate_respects_custom_params(self):
-        """generate() respects custom parameters over defaults."""
-        pipeline = CivitaiCheckpointPipeline()
-        pipeline._pipeline_config = PipelineConfig(
-            pipeline_class="StableDiffusionPipeline",
-            default_steps=20,
-            default_guidance_scale=7.5,
-        )
-
-        mock_pipe = MagicMock()
-        mock_image = MagicMock()
-        mock_image.width = 768
-        mock_image.height = 768
-        mock_pipe.return_value.images = [mock_image]
-        pipeline.pipe = mock_pipe
-
-        with patch.object(pipeline, "_encode_prompts_to_embeddings"):
-            pipeline.generate(
-                "test prompt",
-                steps=10,
-                guidance_scale=5.0,
-                width=768,
-                height=768,
-            )
-
-        call_kwargs = mock_pipe.call_args.kwargs
-        assert call_kwargs["num_inference_steps"] == 10
-        assert call_kwargs["guidance_scale"] == 5.0
-        assert call_kwargs["width"] == 768
-        assert call_kwargs["height"] == 768
-
-    def test_generate_handles_negative_prompt(self):
-        """generate() includes negative_prompt for supporting pipelines."""
-        pipeline = CivitaiCheckpointPipeline()
-        pipeline._pipeline_config = PipelineConfig(
-            pipeline_class="StableDiffusionXLPipeline",
-            supports_negative_prompt=True,
-        )
-
-        mock_pipe = MagicMock()
-        mock_image = MagicMock()
-        mock_image.width = 1024
-        mock_image.height = 1024
-        mock_pipe.return_value.images = [mock_image]
-        pipeline.pipe = mock_pipe
-
-        with (
-            patch.object(DevicePolicy, "clear_cache"),
-            patch.object(pipeline, "_encode_prompts_to_embeddings"),
-        ):
-            pipeline.generate("test prompt", negative_prompt="bad quality")
-
-        # All pipelines using the embedding-based approach (SD 1.x, SD 2.x, SDXL, SD3)
-        # handle negative prompts via embeddings (negative_prompt_embeds, and for SDXL,
-        # negative_pooled_prompt_embeds) computed in _encode_prompts_to_embeddings,
-        # not via direct negative_prompt kwarg. Verify the mock was called correctly.
-        mock_pipe.assert_called_once()
-
-    def test_generate_omits_negative_prompt_for_flux(self):
-        """generate() omits negative_prompt for Flux pipelines."""
-        pipeline = CivitaiCheckpointPipeline()
-        pipeline._pipeline_config = PipelineConfig(
-            pipeline_class="FluxPipeline",
-            supports_negative_prompt=False,
-        )
-
-        mock_pipe = MagicMock()
-        mock_image = MagicMock()
-        mock_image.width = 1024
-        mock_image.height = 1024
-        mock_pipe.return_value.images = [mock_image]
-        pipeline.pipe = mock_pipe
-
-        with (
-            patch.object(DevicePolicy, "clear_cache"),
-            patch.object(pipeline, "_encode_prompts_to_embeddings"),
-        ):
-            pipeline.generate("test prompt", negative_prompt="bad quality")
-
-        call_kwargs = mock_pipe.call_args.kwargs
-        assert "negative_prompt" not in call_kwargs
-
-    def test_generate_qwen_uses_true_cfg_scale(self):
-        """Qwen generation uses true_cfg_scale instead of SDXL guidance kwargs."""
-        pipeline = CivitaiCheckpointPipeline()
-        pipeline._pipeline_config = PipelineConfig(
-            pipeline_class="QwenImagePipeline",
-            default_steps=8,
-            default_guidance_scale=4.0,
-            default_width=1024,
-            default_height=1024,
-        )
-
-        mock_pipe = MagicMock()
-        mock_image = MagicMock()
-        mock_image.width = 1024
-        mock_image.height = 1024
-        mock_pipe.return_value.images = [mock_image]
-        pipeline.pipe = mock_pipe
-
-        with patch.object(DevicePolicy, "clear_cache"):
-            pipeline.generate("test prompt", negative_prompt=None)
-
-        call_kwargs = mock_pipe.call_args.kwargs
-        assert call_kwargs["prompt"] == "test prompt"
-        assert call_kwargs["negative_prompt"] == " "
-        assert call_kwargs["true_cfg_scale"] == 4.0
-        assert "guidance_scale" not in call_kwargs
-        assert "prompt_embeds" not in call_kwargs
-
-    def test_generate_returns_generation_result(self):
-        """generate() returns proper GenerationResult."""
-        pipeline = CivitaiCheckpointPipeline()
-        pipeline._pipeline_config = PipelineConfig(
-            pipeline_class="StableDiffusionXLPipeline",
-            default_steps=25,
-            default_guidance_scale=7.0,
-        )
-
-        mock_pipe = MagicMock()
-        mock_image = MagicMock()
-        mock_image.width = 1024
-        mock_image.height = 1024
-        mock_pipe.return_value.images = [mock_image]
-        pipeline.pipe = mock_pipe
-
-        with (
-            patch.object(DevicePolicy, "clear_cache"),
-            patch.object(pipeline, "_encode_prompts_to_embeddings"),
-        ):
-            result = pipeline.generate("test prompt", seed=42)
-
-        assert result.prompt == "test prompt"
-        assert result.seed == 42
-        assert result.image == mock_image
-        assert result.width == 1024
-        assert result.height == 1024
-        assert result.steps == 25
-        assert result.guidance_scale == 7.0
-
-    def test_generate_handles_img2img(self):
-        """generate() handles img2img with init_image."""
-        pipeline = CivitaiCheckpointPipeline()
-        pipeline._pipeline_config = PipelineConfig(
-            pipeline_class="StableDiffusionXLPipeline",
-        )
-
-        mock_pipe = MagicMock()
-        mock_image = MagicMock()
-        mock_image.width = 1024
-        mock_image.height = 1024
-        mock_pipe.return_value.images = [mock_image]
-        pipeline.pipe = mock_pipe
-
-        # Mock init image loading
-        mock_init_image = MagicMock()
-        with (
-            patch.object(DevicePolicy, "clear_cache"),
-            patch.object(pipeline, "_load_init_image", return_value=mock_init_image),
-            patch.object(pipeline, "_encode_prompts_to_embeddings"),
-        ):
-            pipeline.generate("test prompt", init_image=b"dummy", strength=0.5)
-
-        call_kwargs = mock_pipe.call_args.kwargs
-        assert call_kwargs["image"] == mock_init_image
-        assert call_kwargs["strength"] == 0.5
-        assert "width" not in call_kwargs
-        assert "height" not in call_kwargs
-
-    @pytest.mark.parametrize("argument", ["init_image", "mask_image"])
-    def test_generate_krea2_rejects_image_input(self, argument):
-        """CivitAI-backed Krea checkpoints remain text-to-image only."""
-        pipeline = CivitaiCheckpointPipeline()
-        pipeline._pipeline_config = PipelineConfig(pipeline_class="Krea2Pipeline")
-        pipeline.pipe = MagicMock()
-
-        with pytest.raises(ValueError, match="Krea 2 supports text-to-image only"):
-            pipeline.generate("test prompt", **{argument: b"dummy"})
-
-        pipeline.pipe.assert_not_called()
-
-    def test_generate_krea2_passes_negative_prompt(self):
-        """Fetched Krea Raw checkpoints keep user negative prompts for CFG."""
-        pipeline = CivitaiCheckpointPipeline()
-        pipeline._pipeline_config = get_pipeline_config_for_base_model("Krea 2")
-        mock_image = MagicMock(width=1024, height=1024)
-        pipeline.pipe = MagicMock(return_value=MagicMock(images=[mock_image]))
-
-        with patch.object(DevicePolicy, "clear_cache"):
-            pipeline.generate("test prompt", negative_prompt="blurry", guidance_scale=4.5)
-
-        assert pipeline.pipe.call_args.kwargs["negative_prompt"] == "blurry"
-
-    def test_generate_flux2_klein_img2img_omits_strength(self):
-        """Flux2 Klein accepts image input but not img2img strength."""
-        pipeline = CivitaiCheckpointPipeline()
-        pipeline._pipeline_config = PipelineConfig(
-            pipeline_class="Flux2KleinPipeline",
-            supports_negative_prompt=False,
-            default_steps=4,
-            default_guidance_scale=1.0,
-        )
-
-        mock_pipe = MagicMock()
-        mock_image = MagicMock()
-        mock_image.width = 1024
-        mock_image.height = 1024
-        mock_pipe.return_value.images = [mock_image]
-        pipeline.pipe = mock_pipe
-
-        mock_init_image = MagicMock()
-        with (
-            patch.object(DevicePolicy, "clear_cache"),
-            patch.object(pipeline, "_load_init_image", return_value=mock_init_image),
-        ):
-            pipeline.generate("test prompt", init_image=b"dummy", strength=0.5)
-
-        call_kwargs = mock_pipe.call_args.kwargs
-        assert call_kwargs["prompt"] == "test prompt"
-        assert call_kwargs["image"] == mock_init_image
-        assert call_kwargs["num_inference_steps"] == 4
-        assert call_kwargs["guidance_scale"] == 1.0
-        assert "strength" not in call_kwargs
-        assert "negative_prompt" not in call_kwargs
-        assert "width" not in call_kwargs
-        assert "height" not in call_kwargs
-
-    def test_generate_with_scheduler_override(self):
-        pipeline = CivitaiCheckpointPipeline()
-        pipeline._pipeline_config = PipelineConfig(
-            pipeline_class="StableDiffusionXLPipeline",
-            default_scheduler="dpm++_karras",
-        )
-
-        mock_pipe = MagicMock()
-        mock_scheduler = MagicMock()
-        mock_scheduler.config = {}
-        mock_pipe.scheduler = mock_scheduler
-        mock_image = MagicMock()
-        mock_image.width = 1024
-        mock_image.height = 1024
-        mock_pipe.return_value.images = [mock_image]
-        pipeline.pipe = mock_pipe
-
-        mock_euler = MagicMock()
-        with (
-            patch.object(DevicePolicy, "clear_cache"),
-            patch("diffusers.EulerAncestralDiscreteScheduler", mock_euler),
-            patch.object(pipeline, "_encode_prompts_to_embeddings"),
-        ):
-            pipeline.generate("test prompt", scheduler="euler_a")
-
-        mock_euler.from_config.assert_called_once()
-
-
-class TestSchedulerMap:
-    def test_scheduler_choices_matches_map_keys(self):
-        assert set(SCHEDULER_CHOICES) == set(SCHEDULER_MAP.keys())
-
-    def test_default_entry_has_none_class(self):
-        class_name, kwargs = SCHEDULER_MAP["default"]
-        assert class_name is None
-        assert kwargs == {}
-
-    def test_dpm_karras_entry(self):
-        class_name, kwargs = SCHEDULER_MAP["dpm++_karras"]
-        assert class_name == "DPMSolverMultistepScheduler"
-        assert kwargs["algorithm_type"] == "sde-dpmsolver++"
-        assert kwargs["use_karras_sigmas"] is True
-
-    def test_dpm_entry(self):
-        class_name, kwargs = SCHEDULER_MAP["dpm++"]
-        assert class_name == "DPMSolverMultistepScheduler"
-        assert kwargs["algorithm_type"] == "sde-dpmsolver++"
-        assert kwargs["use_karras_sigmas"] is False
-
-    def test_euler_a_entry(self):
-        class_name, kwargs = SCHEDULER_MAP["euler_a"]
-        assert class_name == "EulerAncestralDiscreteScheduler"
-        assert kwargs == {}
-
-    def test_euler_entry(self):
-        class_name, kwargs = SCHEDULER_MAP["euler"]
-        assert class_name == "EulerDiscreteScheduler"
-        assert kwargs == {}
-
-    def test_heun_entry(self):
-        class_name, kwargs = SCHEDULER_MAP["heun"]
-        assert class_name == "HeunDiscreteScheduler"
-        assert kwargs == {}
-
-    def test_ddim_entry(self):
-        class_name, kwargs = SCHEDULER_MAP["ddim"]
-        assert class_name == "DDIMScheduler"
-        assert kwargs == {}
-
-
-class TestDefaultSchedulers:
-    def test_sd15_has_dpm_karras(self):
-        config = CIVITAI_BASE_MODEL_PIPELINE_MAP["SD 1.5"]
-        assert config.default_scheduler == "dpm++_karras"
-
-    def test_sdxl_has_dpm_karras(self):
-        config = CIVITAI_BASE_MODEL_PIPELINE_MAP["SDXL 1.0"]
-        assert config.default_scheduler == "dpm++_karras"
-
-    def test_pony_has_dpm_karras(self):
-        config = CIVITAI_BASE_MODEL_PIPELINE_MAP["Pony"]
-        assert config.default_scheduler == "dpm++_karras"
-
-    def test_illustrious_has_dpm_karras(self):
-        config = CIVITAI_BASE_MODEL_PIPELINE_MAP["Illustrious"]
-        assert config.default_scheduler == "dpm++_karras"
-
-    def test_sdxl_turbo_keeps_default(self):
-        config = CIVITAI_BASE_MODEL_PIPELINE_MAP["SDXL Turbo"]
-        assert config.default_scheduler == "default"
-
-    def test_sdxl_lightning_keeps_default(self):
-        config = CIVITAI_BASE_MODEL_PIPELINE_MAP["SDXL Lightning"]
-        assert config.default_scheduler == "default"
-
-    def test_flux_keeps_default(self):
-        config = CIVITAI_BASE_MODEL_PIPELINE_MAP["Flux.1 Dev"]
-        assert config.default_scheduler == "default"
-
-    def test_sd3_keeps_default(self):
-        config = CIVITAI_BASE_MODEL_PIPELINE_MAP["SD 3"]
-        assert config.default_scheduler == "default"
-
-
-class TestConfigureScheduler:
-    def test_configure_scheduler_with_none_uses_pipeline_default(self):
-        pipeline = CivitaiCheckpointPipeline()
-        pipeline._pipeline_config = PipelineConfig(
-            pipeline_class="StableDiffusionXLPipeline",
-            default_scheduler="dpm++_karras",
-        )
-        mock_pipe = MagicMock()
-        mock_scheduler = MagicMock()
-        mock_scheduler.config = {}
-        mock_pipe.scheduler = mock_scheduler
-        pipeline.pipe = mock_pipe
-
-        mock_dpm = MagicMock()
-        with patch("diffusers.DPMSolverMultistepScheduler", mock_dpm):
-            pipeline.configure_scheduler(None)
-
-        mock_dpm.from_config.assert_called_once()
-
-    def test_configure_scheduler_default_string_no_change(self):
-        pipeline = CivitaiCheckpointPipeline()
-        pipeline._pipeline_config = PipelineConfig(
-            pipeline_class="StableDiffusionXLPipeline",
-            default_scheduler="default",
-        )
-        mock_pipe = MagicMock()
-        original_scheduler = MagicMock()
-        mock_pipe.scheduler = original_scheduler
-        pipeline.pipe = mock_pipe
-
-        pipeline.configure_scheduler("default")
-
-        assert mock_pipe.scheduler is original_scheduler
-
-    def test_configure_scheduler_unknown_warns(self, capsys):
-        pipeline = CivitaiCheckpointPipeline()
-        pipeline._pipeline_config = PipelineConfig(
-            pipeline_class="StableDiffusionXLPipeline",
-        )
-        mock_pipe = MagicMock()
-        original_scheduler = MagicMock()
-        mock_pipe.scheduler = original_scheduler
-        pipeline.pipe = mock_pipe
-
-        pipeline.configure_scheduler("unknown_scheduler")
-
-        captured = capsys.readouterr()
-        assert "Unknown scheduler" in captured.out
-        assert mock_pipe.scheduler is original_scheduler
-
-    def test_configure_scheduler_euler_a(self):
-        pipeline = CivitaiCheckpointPipeline()
-        pipeline._pipeline_config = PipelineConfig(
-            pipeline_class="StableDiffusionXLPipeline",
-        )
-        mock_pipe = MagicMock()
-        mock_scheduler = MagicMock()
-        mock_scheduler.config = {}
-        mock_pipe.scheduler = mock_scheduler
-        pipeline.pipe = mock_pipe
-
-        mock_euler = MagicMock()
-        with patch("diffusers.EulerAncestralDiscreteScheduler", mock_euler):
-            pipeline.configure_scheduler("euler_a")
-
-        mock_euler.from_config.assert_called_once_with({})
-
-    def test_configure_scheduler_with_kwargs(self):
-        pipeline = CivitaiCheckpointPipeline()
-        pipeline._pipeline_config = PipelineConfig(
-            pipeline_class="StableDiffusionXLPipeline",
-        )
-        mock_pipe = MagicMock()
-        mock_scheduler = MagicMock()
-        mock_scheduler.config = {"some": "config"}
-        mock_pipe.scheduler = mock_scheduler
-        pipeline.pipe = mock_pipe
-
-        mock_dpm = MagicMock()
-        with patch("diffusers.DPMSolverMultistepScheduler", mock_dpm):
-            pipeline.configure_scheduler("dpm++_karras")
-
-        mock_dpm.from_config.assert_called_once_with(
-            {"some": "config"},
-            algorithm_type="sde-dpmsolver++",
-            use_karras_sigmas=True,
-        )
-
-    def test_configure_scheduler_skips_redundant_reconfiguration(self):
-        pipeline = CivitaiCheckpointPipeline()
-        pipeline._pipeline_config = PipelineConfig(
-            pipeline_class="StableDiffusionXLPipeline",
-        )
-        mock_pipe = MagicMock()
-        mock_scheduler = MagicMock()
-        mock_scheduler.config = {}
-        mock_pipe.scheduler = mock_scheduler
-        pipeline.pipe = mock_pipe
-
-        mock_euler = MagicMock()
-        with patch("diffusers.EulerAncestralDiscreteScheduler", mock_euler):
-            pipeline.configure_scheduler("euler_a")
-            pipeline.configure_scheduler("euler_a")
-
-        mock_euler.from_config.assert_called_once()
-
-
-class TestSupportsPromptEmbeddings:
-    """Tests for CivitaiCheckpointPipeline._supports_prompt_embeddings method."""
-
-    def test_returns_false_when_pipe_is_none(self):
-        """Returns False when pipeline is not loaded."""
-        pipeline = CivitaiCheckpointPipeline()
-        pipeline._pipeline_config = PipelineConfig(pipeline_class="StableDiffusionXLPipeline")
-        # pipe is None by default
-        assert pipeline._supports_prompt_embeddings() is False
-
-    def test_returns_false_when_pipeline_config_is_none(self):
-        """Returns False when pipeline config is not set."""
-        pipeline = CivitaiCheckpointPipeline()
-        pipeline.pipe = MagicMock()  # Pretend pipeline is loaded
-        # _pipeline_config is None by default
-        assert pipeline._supports_prompt_embeddings() is False
-
-    def test_returns_true_for_stable_diffusion_pipeline(self):
-        """Returns True for StableDiffusionPipeline (SD 1.x/2.x)."""
-        pipeline = CivitaiCheckpointPipeline()
-        pipeline.pipe = MagicMock()
-        pipeline._pipeline_config = PipelineConfig(pipeline_class="StableDiffusionPipeline")
-        assert pipeline._supports_prompt_embeddings() is True
-
-    def test_returns_true_for_stable_diffusion_xl_pipeline(self):
-        """Returns True for StableDiffusionXLPipeline."""
-        pipeline = CivitaiCheckpointPipeline()
-        pipeline.pipe = MagicMock()
-        pipeline._pipeline_config = PipelineConfig(pipeline_class="StableDiffusionXLPipeline")
-        assert pipeline._supports_prompt_embeddings() is True
-
-    def test_returns_true_for_flux_pipeline(self):
-        """Returns True for FluxPipeline."""
-        pipeline = CivitaiCheckpointPipeline()
-        pipeline.pipe = MagicMock()
-        pipeline._pipeline_config = PipelineConfig(
-            pipeline_class="FluxPipeline", supports_negative_prompt=False
-        )
-        assert pipeline._supports_prompt_embeddings() is True
-
-    def test_returns_true_for_stable_diffusion_3_pipeline(self):
-        """Returns True for StableDiffusion3Pipeline."""
-        pipeline = CivitaiCheckpointPipeline()
-        pipeline.pipe = MagicMock()
-        pipeline._pipeline_config = PipelineConfig(pipeline_class="StableDiffusion3Pipeline")
-        assert pipeline._supports_prompt_embeddings() is True
-
-    def test_returns_false_for_unsupported_pipeline(self):
-        """Returns False for unsupported pipeline classes."""
-        pipeline = CivitaiCheckpointPipeline()
-        pipeline.pipe = MagicMock()
-
-        unsupported_pipelines = [
-            "PixArtAlphaPipeline",
-            "PixArtSigmaPipeline",
-            "KolorsPipeline",
-            "HunyuanDiTPipeline",
-            "LuminaText2ImgPipeline",
-            "AuraFlowPipeline",
-            "CustomPipeline",
-        ]
-
-        for pipeline_class in unsupported_pipelines:
-            pipeline._pipeline_config = PipelineConfig(pipeline_class=pipeline_class)
-            assert pipeline._supports_prompt_embeddings() is False, (
-                f"Expected False for {pipeline_class}"
-            )
-
-
-class TestEncodePromptsToEmbeddings:
-    """Tests for CivitaiCheckpointPipeline._encode_prompts_to_embeddings method."""
-
-    def test_returns_empty_dict_when_pipe_is_none(self):
-        """Returns empty dict when pipeline is not loaded."""
-        pipeline = CivitaiCheckpointPipeline()
-        pipeline._pipeline_config = PipelineConfig(pipeline_class="StableDiffusionXLPipeline")
-        # pipe is None by default
-        result = pipeline._encode_prompts_to_embeddings("test prompt", None)
-        assert result == {}
-
-    def test_returns_empty_dict_when_pipeline_config_is_none(self):
-        """Returns empty dict when pipeline config is not set."""
-        pipeline = CivitaiCheckpointPipeline()
-        pipeline.pipe = MagicMock()
-        # _pipeline_config is None by default
-        result = pipeline._encode_prompts_to_embeddings("test prompt", None)
-        assert result == {}
-
-    def test_flux_pipeline_encoding(self):
-        """FluxPipeline returns prompt_embeds and pooled_prompt_embeds only."""
-        pipeline = CivitaiCheckpointPipeline()
-        pipeline.pipe = MagicMock()
-        pipeline._pipeline_config = PipelineConfig(
-            pipeline_class="FluxPipeline", supports_negative_prompt=False
-        )
-
-        mock_prompt_embeds = MagicMock()
-        mock_pooled_embeds = MagicMock()
-
-        with patch(
-            "oneiro.pipelines.civitai_checkpoint.get_weighted_text_embeddings_flux",
-            return_value=(mock_prompt_embeds, mock_pooled_embeds),
-        ) as mock_func:
-            result = pipeline._encode_prompts_to_embeddings("test prompt", "negative")
-
-        mock_func.assert_called_once_with(pipeline.pipe, prompt="test prompt")
-        assert result["prompt_embeds"] is mock_prompt_embeds
-        assert result["pooled_prompt_embeds"] is mock_pooled_embeds
-        # Flux doesn't support negative prompts
-        assert "negative_prompt_embeds" not in result
-
-    def test_sd3_pipeline_encoding_with_negative(self):
-        """SD3 Pipeline returns all embedding types including negative."""
-        pipeline = CivitaiCheckpointPipeline()
-        pipeline.pipe = MagicMock()
-        pipeline._pipeline_config = PipelineConfig(
-            pipeline_class="StableDiffusion3Pipeline", supports_negative_prompt=True
-        )
-
-        mock_prompt = MagicMock()
-        mock_neg_prompt = MagicMock()
-        mock_pooled = MagicMock()
-        mock_neg_pooled = MagicMock()
-
-        with patch(
-            "oneiro.pipelines.civitai_checkpoint.get_weighted_text_embeddings_sd3",
-            return_value=(mock_prompt, mock_neg_prompt, mock_pooled, mock_neg_pooled),
-        ) as mock_func:
-            result = pipeline._encode_prompts_to_embeddings("test prompt", "bad quality")
-
-        mock_func.assert_called_once_with(
-            pipeline.pipe, prompt="test prompt", negative_prompt="bad quality"
-        )
-        assert result["prompt_embeds"] is mock_prompt
-        assert result["pooled_prompt_embeds"] is mock_pooled
-        assert result["negative_prompt_embeds"] is mock_neg_prompt
-        assert result["negative_pooled_prompt_embeds"] is mock_neg_pooled
-
-    def test_sd3_pipeline_without_negative_support(self):
-        """SD3 Pipeline without negative prompt support omits negative embeddings."""
-        pipeline = CivitaiCheckpointPipeline()
-        pipeline.pipe = MagicMock()
-        pipeline._pipeline_config = PipelineConfig(
-            pipeline_class="StableDiffusion3Pipeline", supports_negative_prompt=False
-        )
-
-        mock_prompt = MagicMock()
-        mock_neg_prompt = MagicMock()
-        mock_pooled = MagicMock()
-        mock_neg_pooled = MagicMock()
-
-        with patch(
-            "oneiro.pipelines.civitai_checkpoint.get_weighted_text_embeddings_sd3",
-            return_value=(mock_prompt, mock_neg_prompt, mock_pooled, mock_neg_pooled),
-        ):
-            result = pipeline._encode_prompts_to_embeddings("test prompt", "bad quality")
-
-        assert result["prompt_embeds"] is mock_prompt
-        assert result["pooled_prompt_embeds"] is mock_pooled
-        assert "negative_prompt_embeds" not in result
-        assert "negative_pooled_prompt_embeds" not in result
-
-    def test_sdxl_pipeline_encoding_with_negative(self):
-        """SDXL Pipeline returns all embedding types including negative."""
-        pipeline = CivitaiCheckpointPipeline()
-        pipeline.pipe = MagicMock()
-        pipeline._pipeline_config = PipelineConfig(
-            pipeline_class="StableDiffusionXLPipeline", supports_negative_prompt=True
-        )
-
-        mock_prompt = MagicMock()
-        mock_neg_prompt = MagicMock()
-        mock_pooled = MagicMock()
-        mock_neg_pooled = MagicMock()
-
-        with patch(
-            "oneiro.pipelines.civitai_checkpoint.get_weighted_text_embeddings_sdxl",
-            return_value=(mock_prompt, mock_neg_prompt, mock_pooled, mock_neg_pooled),
-        ) as mock_func:
-            result = pipeline._encode_prompts_to_embeddings("test prompt", "bad quality")
-
-        mock_func.assert_called_once_with(
-            pipeline.pipe, prompt="test prompt", negative_prompt="bad quality"
-        )
-        assert result["prompt_embeds"] is mock_prompt
-        assert result["pooled_prompt_embeds"] is mock_pooled
-        assert result["negative_prompt_embeds"] is mock_neg_prompt
-        assert result["negative_pooled_prompt_embeds"] is mock_neg_pooled
-
-    def test_sdxl_pipeline_without_negative_support(self):
-        """SDXL Pipeline without negative prompt support omits negative embeddings."""
-        pipeline = CivitaiCheckpointPipeline()
-        pipeline.pipe = MagicMock()
-        pipeline._pipeline_config = PipelineConfig(
-            pipeline_class="StableDiffusionXLPipeline", supports_negative_prompt=False
-        )
-
-        mock_prompt = MagicMock()
-        mock_neg_prompt = MagicMock()
-        mock_pooled = MagicMock()
-        mock_neg_pooled = MagicMock()
-
-        with patch(
-            "oneiro.pipelines.civitai_checkpoint.get_weighted_text_embeddings_sdxl",
-            return_value=(mock_prompt, mock_neg_prompt, mock_pooled, mock_neg_pooled),
-        ):
-            result = pipeline._encode_prompts_to_embeddings("test prompt", "bad quality")
-
-        assert result["prompt_embeds"] is mock_prompt
-        assert result["pooled_prompt_embeds"] is mock_pooled
-        assert "negative_prompt_embeds" not in result
-        assert "negative_pooled_prompt_embeds" not in result
-
-    def test_sd15_pipeline_encoding_with_negative(self):
-        """SD 1.x/2.x Pipeline returns prompt and negative embeddings."""
-        pipeline = CivitaiCheckpointPipeline()
-        pipeline.pipe = MagicMock()
-        pipeline._pipeline_config = PipelineConfig(
-            pipeline_class="StableDiffusionPipeline", supports_negative_prompt=True
-        )
-
-        mock_prompt = MagicMock()
-        mock_neg_prompt = MagicMock()
-
-        with patch(
-            "oneiro.pipelines.civitai_checkpoint.get_weighted_text_embeddings_sd15",
-            return_value=(mock_prompt, mock_neg_prompt),
-        ) as mock_func:
-            result = pipeline._encode_prompts_to_embeddings("test prompt", "bad quality")
-
-        mock_func.assert_called_once_with(
-            pipeline.pipe, prompt="test prompt", negative_prompt="bad quality"
-        )
-        assert result["prompt_embeds"] is mock_prompt
-        assert result["negative_prompt_embeds"] is mock_neg_prompt
-        # SD 1.x/2.x don't have pooled embeddings
-        assert "pooled_prompt_embeds" not in result
-
-    def test_sd15_pipeline_without_negative_support(self):
-        """SD 1.x/2.x Pipeline without negative prompt support omits negative embeddings."""
-        pipeline = CivitaiCheckpointPipeline()
-        pipeline.pipe = MagicMock()
-        pipeline._pipeline_config = PipelineConfig(
-            pipeline_class="StableDiffusionPipeline", supports_negative_prompt=False
-        )
-
-        mock_prompt = MagicMock()
-        mock_neg_prompt = MagicMock()
-
-        with patch(
-            "oneiro.pipelines.civitai_checkpoint.get_weighted_text_embeddings_sd15",
-            return_value=(mock_prompt, mock_neg_prompt),
-        ):
-            result = pipeline._encode_prompts_to_embeddings("test prompt", "bad quality")
-
-        assert result["prompt_embeds"] is mock_prompt
-        assert "negative_prompt_embeds" not in result
-
-    def test_handles_none_negative_prompt(self):
-        """Handles None negative prompt by converting to empty string."""
-        pipeline = CivitaiCheckpointPipeline()
-        pipeline.pipe = MagicMock()
-        pipeline._pipeline_config = PipelineConfig(
-            pipeline_class="StableDiffusionPipeline", supports_negative_prompt=True
-        )
-
-        mock_prompt = MagicMock()
-        mock_neg_prompt = MagicMock()
-
-        with patch(
-            "oneiro.pipelines.civitai_checkpoint.get_weighted_text_embeddings_sd15",
-            return_value=(mock_prompt, mock_neg_prompt),
-        ) as mock_func:
-            pipeline._encode_prompts_to_embeddings("test prompt", None)
-
-        # Should convert None to empty string
-        mock_func.assert_called_once_with(pipeline.pipe, prompt="test prompt", negative_prompt="")
-
-    def test_falls_back_to_sd15_for_unknown_pipeline(self):
-        """Falls back to SD 1.5 encoding for unknown pipeline classes."""
-        pipeline = CivitaiCheckpointPipeline()
-        pipeline.pipe = MagicMock()
-        # Use a pipeline class that's not in the supported list but would
-        # still go through the else branch
-        pipeline._pipeline_config = PipelineConfig(
-            pipeline_class="SomeOtherDiffusionPipeline", supports_negative_prompt=True
-        )
-
-        mock_prompt = MagicMock()
-        mock_neg_prompt = MagicMock()
-
-        with patch(
-            "oneiro.pipelines.civitai_checkpoint.get_weighted_text_embeddings_sd15",
-            return_value=(mock_prompt, mock_neg_prompt),
-        ) as mock_func:
-            result = pipeline._encode_prompts_to_embeddings("test prompt", "bad")
-
-        mock_func.assert_called_once()
-        assert result["prompt_embeds"] is mock_prompt
-        assert result["negative_prompt_embeds"] is mock_neg_prompt
-
-
-class TestDynamicLoraGeneration:
-    """Tests for dynamic LoRA loading during generation."""
-
-    def _create_pipeline_with_mocks(self):
-        """Create a pipeline with common mocks for dynamic LoRA tests."""
-        pipeline = CivitaiCheckpointPipeline()
-        pipeline._pipeline_config = PipelineConfig(
-            pipeline_class="StableDiffusionXLPipeline",
-            default_steps=25,
-            default_guidance_scale=7.0,
-            default_width=1024,
-            default_height=1024,
-        )
-        mock_pipe = MagicMock()
-        mock_image = MagicMock()
-        mock_image.width = 1024
-        mock_image.height = 1024
-        mock_pipe.return_value.images = [mock_image]
-        pipeline.pipe = mock_pipe
-        pipeline._cpu_offload = False
-        return pipeline
-
-    def test_generate_with_dynamic_loras(self):
-        """generate() loads dynamic LoRAs passed via kwargs."""
-        pipeline = self._create_pipeline_with_mocks()
-
-        lora = LoraConfig(name="test-lora", source=LoraSource.LOCAL, path="/fake/path.safetensors")
-        lora._resolved_path = Path("/fake/path.safetensors")
-
-        with (
-            patch.object(DevicePolicy, "clear_cache"),
-            patch.object(pipeline, "_encode_prompts_to_embeddings"),
-            patch.object(pipeline, "_load_dynamic_loras") as mock_load,
-            patch.object(pipeline, "_restore_static_loras") as mock_restore,
-        ):
-            pipeline.generate("test prompt", loras=[lora])
-
-        mock_load.assert_called_once_with([lora])
-        mock_restore.assert_called_once()
-
-    def test_generate_restores_static_loras_after_dynamic(self):
-        """generate() restores static LoRAs after using dynamic ones."""
-        pipeline = self._create_pipeline_with_mocks()
-
-        static_lora = LoraConfig(
-            name="static-lora", source=LoraSource.LOCAL, path="/static.safetensors"
-        )
-        pipeline._static_lora_configs = [static_lora]
-
-        dynamic_lora = LoraConfig(
-            name="dynamic-lora", source=LoraSource.LOCAL, path="/dynamic.safetensors"
-        )
-        dynamic_lora._resolved_path = Path("/dynamic.safetensors")
-
-        with (
-            patch.object(DevicePolicy, "clear_cache"),
-            patch.object(pipeline, "_encode_prompts_to_embeddings"),
-            patch.object(pipeline, "unload_loras") as mock_unload,
-            patch.object(pipeline, "load_single_lora", return_value="dynamic-lora"),
-            patch.object(pipeline, "set_lora_adapters"),
-            patch.object(pipeline, "load_loras_sync") as mock_load_sync,
-        ):
-            pipeline.generate("test prompt", loras=[dynamic_lora])
-
-        assert mock_unload.call_count == 2
-        mock_load_sync.assert_called_once_with([static_lora])
-
-    def test_generate_handles_dynamic_lora_loading_failure(self):
-        """generate() restores static LoRAs when dynamic loading fails."""
-        pipeline = self._create_pipeline_with_mocks()
-
-        static_lora = LoraConfig(
-            name="static-lora", source=LoraSource.LOCAL, path="/static.safetensors"
-        )
-        pipeline._static_lora_configs = [static_lora]
-
-        dynamic_lora = LoraConfig(name="bad-lora", source=LoraSource.LOCAL, path="/bad.safetensors")
-        dynamic_lora._resolved_path = Path("/bad.safetensors")
-
-        with (
-            patch.object(DevicePolicy, "clear_cache"),
-            patch.object(pipeline, "_encode_prompts_to_embeddings"),
-            patch.object(pipeline, "_load_dynamic_loras", side_effect=RuntimeError("Load failed")),
-            patch.object(pipeline, "_restore_static_loras") as mock_restore,
-        ):
-            with pytest.raises(RuntimeError, match="Load failed"):
-                pipeline.generate("test prompt", loras=[dynamic_lora])
-
-        mock_restore.assert_called_once()
-
-    def test_generate_cleanup_on_generation_failure(self):
-        """generate() cleans up dynamic LoRAs even if generation fails."""
-        pipeline = self._create_pipeline_with_mocks()
-
-        dynamic_lora = LoraConfig(
-            name="dynamic-lora", source=LoraSource.LOCAL, path="/dynamic.safetensors"
-        )
-        dynamic_lora._resolved_path = Path("/dynamic.safetensors")
-
-        pipeline.pipe.side_effect = RuntimeError("Generation failed")
-
-        with (
-            patch.object(DevicePolicy, "clear_cache"),
-            patch.object(pipeline, "_encode_prompts_to_embeddings"),
-            patch.object(pipeline, "_load_dynamic_loras"),
-            patch.object(pipeline, "_restore_static_loras") as mock_restore,
-        ):
-            with pytest.raises(RuntimeError, match="Generation failed"):
-                pipeline.generate("test prompt", loras=[dynamic_lora])
-
-        mock_restore.assert_called_once()
-
-    def test_generate_without_dynamic_loras_skips_lora_handling(self):
-        """generate() skips LoRA handling when no dynamic LoRAs provided."""
-        pipeline = self._create_pipeline_with_mocks()
-
-        with (
-            patch.object(DevicePolicy, "clear_cache"),
-            patch.object(pipeline, "_encode_prompts_to_embeddings"),
-            patch.object(pipeline, "_load_dynamic_loras") as mock_load,
-            patch.object(pipeline, "_restore_static_loras") as mock_restore,
-        ):
-            pipeline.generate("test prompt")
-
-        mock_load.assert_not_called()
-        mock_restore.assert_not_called()
-
-    def test_load_dynamic_loras_respects_cpu_offload(self):
-        """_load_dynamic_loras() skips .to(device) when cpu_offload enabled."""
-        pipeline = self._create_pipeline_with_mocks()
-        pipeline._cpu_offload = True
-
-        lora = LoraConfig(name="test-lora", source=LoraSource.LOCAL, path="/fake.safetensors")
-        lora._resolved_path = Path("/fake.safetensors")
-
-        with (
-            patch.object(pipeline, "unload_loras"),
-            patch.object(pipeline, "load_single_lora", return_value="test-lora"),
-            patch.object(pipeline, "set_lora_adapters"),
-        ):
-            pipeline._load_dynamic_loras([lora])
-
-        pipeline.pipe.to.assert_not_called()
-
-    def test_load_dynamic_loras_moves_to_device_without_cpu_offload(self):
-        """_load_dynamic_loras() calls .to(device) when cpu_offload disabled."""
-        pipeline = self._create_pipeline_with_mocks()
-        pipeline._cpu_offload = False
-        # Set policy with CUDA device
-        pipeline.policy = DevicePolicy(
-            device="cuda", dtype=torch.float16, offload=OffloadMode.NEVER
-        )
-
-        lora = LoraConfig(name="test-lora", source=LoraSource.LOCAL, path="/fake.safetensors")
-        lora._resolved_path = Path("/fake.safetensors")
-
-        with (
-            patch.object(pipeline, "unload_loras"),
-            patch.object(pipeline, "load_single_lora", return_value="test-lora"),
-            patch.object(pipeline, "set_lora_adapters"),
-        ):
-            pipeline._load_dynamic_loras([lora])
-
-        pipeline.pipe.to.assert_called_once_with("cuda")

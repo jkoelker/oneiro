@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from oneiro.pipelines.lora import LoraConfig
 
-from oneiro.pipelines.lora import PIPELINE_BASE_MODEL_MAP
+from oneiro.pipelines.lora import is_resource_compatible
 
 
 @dataclass
@@ -99,16 +99,7 @@ class AutoLoraDetector:
         if not lora.base_model:
             return False
 
-        compatible_bases = PIPELINE_BASE_MODEL_MAP.get(pipeline_type, [])
-        if not compatible_bases:
-            return True
-
-        lora_base_lower = lora.base_model.lower()
-        for base in compatible_bases:
-            if base.lower() in lora_base_lower or lora_base_lower in base.lower():
-                return True
-
-        return False
+        return is_resource_compatible(pipeline_type, lora.base_model)
 
     def _get_index(self, pipeline_type: str) -> TriggerIndex:
         """Get or build the trigger index for a pipeline type."""

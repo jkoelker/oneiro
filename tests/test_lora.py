@@ -6,7 +6,6 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from oneiro.pipelines.lora import (
-    PIPELINE_BASE_MODEL_MAP,
     LoraConfig,
     LoraIncompatibleError,
     LoraSource,
@@ -526,19 +525,16 @@ class TestParseLORAsFromConfig:
         assert len(loras) == 1
         assert loras[0].adapter_name == "shared"
 
-    def test_missing_named_reference_warns(self, capsys):
-        """Missing named reference prints warning."""
+    def test_missing_named_reference_raises(self) -> None:
+        """Explicit model resources must exist, unlike optional global auto-loads."""
         full_config = {"loras": {}}
         model_config = {
             "type": "flux2",
             "loras": ["nonexistent"],
         }
 
-        loras = parse_loras_from_config(full_config, model_config)
-
-        assert len(loras) == 0
-        captured = capsys.readouterr()
-        assert "not found" in captured.out
+        with pytest.raises(ValueError, match="not found"):
+            parse_loras_from_config(full_config, model_config)
 
     def test_missing_auto_load_warns(self, capsys):
         """Missing auto_load LoRA prints warning."""
@@ -624,6 +620,7 @@ class TestIsLoraCompatible:
         assert is_resource_compatible("flux2-klein", "Flux.2 Klein 9B")
         assert is_resource_compatible("flux2-klein", "FLUX.2-klein-4B")
         assert not is_resource_compatible("flux2", "Flux.1 Dev")
+        assert not is_resource_compatible("flux1", "Flux.2")
         assert not is_resource_compatible("flux2", "Flux.2 Klein 9B")
         assert not is_resource_compatible("flux2-klein", "Flux.2")
 
@@ -644,14 +641,19 @@ class TestIsLoraCompatible:
         assert not is_resource_compatible("flux2", "SDXL 1.0")
         assert not is_resource_compatible("sdxl", "Flux.1 Dev")
         assert not is_resource_compatible("flux2", "SD 1.5")
+        assert not is_resource_compatible("flux1", "")
+        assert not is_resource_compatible("flux1", "Flux")
+        assert not is_resource_compatible("sdxl", "XL")
 
     def test_none_base_model_is_compatible(self):
         """None base model assumed compatible."""
         assert is_resource_compatible("flux2", None)
 
-    def test_unknown_pipeline_is_compatible(self):
-        """Unknown pipeline type assumed compatible."""
-        assert is_resource_compatible("unknown", "SDXL 1.0")
+    def test_unknown_pipeline_is_incompatible(self) -> None:
+        """A source type or removed family cannot bypass architecture validation."""
+        assert not is_resource_compatible("unknown", "SDXL 1.0")
+        assert not is_resource_compatible("civitai", "SDXL 1.0")
+        assert not is_resource_compatible("sd15", "SD 1.5")
 
     def test_case_insensitive(self):
         """Comparison is case-insensitive."""
@@ -675,17 +677,6 @@ class TestLoraIncompatibleError:
         assert err.lora_name == "my_lora"
         assert err.pipeline_type == "flux2"
         assert err.base_model == "SDXL 1.0"
-
-
-class TestPipelineBaseModelMap:
-    """Tests for PIPELINE_BASE_MODEL_MAP constant."""
-
-    def test_all_pipeline_types_have_mappings(self):
-        """All common pipeline types have base model mappings."""
-        expected_types = ["flux2", "flux2-klein", "krea2", "zimage", "qwen", "sdxl", "sd15"]
-        for pipeline_type in expected_types:
-            assert pipeline_type in PIPELINE_BASE_MODEL_MAP
-            assert len(PIPELINE_BASE_MODEL_MAP[pipeline_type]) > 0
 
 
 @pytest.mark.asyncio

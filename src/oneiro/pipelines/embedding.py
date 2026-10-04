@@ -260,7 +260,7 @@ def parse_embeddings_from_config(
                     embeddings.append(parse_embedding_config(emb_config, name=ref))
                     loaded_names.add(ref)
                 else:
-                    print(f"Warning: embedding '{ref}' not found in [embeddings] section")
+                    raise ValueError(f"Embedding '{ref}' not found in [embeddings] section")
             elif isinstance(ref, dict):
                 # Inline dict definition in the embeddings array
                 emb_name = ref.get("name", f"inline_{len(embeddings)}")

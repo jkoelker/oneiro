@@ -1,7 +1,10 @@
 """Tests for pipelines.base module."""
 
+import asyncio
 import io
+import threading
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
@@ -16,6 +19,257 @@ from oneiro.pipelines.flux2_klein import Flux2KleinPipelineWrapper
 from oneiro.pipelines.krea2 import Krea2PipelineWrapper
 from oneiro.pipelines.lora import LoraConfig, LoraSource
 from oneiro.pipelines.qwen import QwenPipelineWrapper
+
+
+async def test_manager_uses_resolved_family_for_loras(tmp_path: Path) -> None:
+    """CivitAI's resolved Pony family validates explicit local resources before unload."""
+    from oneiro.pipelines.lora import LoraIncompatibleError
+
+    checkpoint = tmp_path / "pony.safetensors"
+    checkpoint.touch()
+    lora = tmp_path / "flux.safetensors"
+    lora.touch()
+    model_config = {
+        "type": "civitai",
+        "checkpoint_path": str(checkpoint),
+        "base_model": "Pony",
+        "inline_loras": [
+            {"name": "flux", "source": "local", "path": str(lora), "base_model": "Flux.1 D"}
+        ],
+    }
+    config = Mock(data={"models": {"pony": model_config}})
+    config.get.return_value = model_config
+    manager = PipelineManager(config)
+    previous = Mock()
+    manager.pipeline, manager.current_model = previous, "old"
+    with pytest.raises(LoraIncompatibleError):
+        await manager.load_model("pony")
+    previous.unload.assert_not_called()
+    assert manager.pipeline is previous
+
+
+@pytest.mark.parametrize("source", [LoraSource.LOCAL, LoraSource.HUGGINGFACE])
+async def test_incompatible_request_lora_never_reaches_inference(source: LoraSource) -> None:
+    """Explicit request resources fail on actual family metadata, for every local source."""
+    from oneiro.pipelines.lora import LoraIncompatibleError
+
+    manager = PipelineManager(Mock(data={}))
+    manager.pipeline, manager.current_model = Mock(family="sdxl"), "pony"
+    lora = LoraConfig(
+        name="flux",
+        source=source,
+        path="unused",
+        repo="unused",
+        base_model="Flux.1 D",
+    )
+    with pytest.raises(LoraIncompatibleError):
+        await manager.generate("a cat", loras=[lora])
+    manager.pipeline.generate.assert_not_called()
+
+
+async def assert_model_switch_ownership(cancel: bool) -> None:
+    """Even repeated cancellation retains the lock until the worker is really done."""
+    started, release = threading.Event(), threading.Event()
+    old = Mock(family="sdxl")
+
+    def generate(*args: Any, **kwargs: Any) -> Mock:
+        """Hold the inference worker until the test releases it."""
+        started.set()
+        assert release.wait(5)
+        return Mock()
+
+    old.generate.side_effect = generate
+    config = Mock(data={})
+    config.get.return_value = {"type": "qwen"}
+    manager = PipelineManager(config)
+    manager.pipeline, manager.current_model = old, "old"
+    task = asyncio.create_task(manager.generate("a cat"))
+    try:
+        assert await asyncio.to_thread(started.wait, 5)
+        if cancel:
+            task.cancel()
+            await asyncio.sleep(0)
+            task.cancel()
+        with patch.object(QwenPipelineWrapper, "load"):
+            switch_started = asyncio.Event()
+
+            async def switch_model() -> None:
+                """Signal the attempted switch before it waits on the manager lock."""
+                switch_started.set()
+                await manager.load_model("new")
+
+            switch = asyncio.create_task(switch_model())
+            await switch_started.wait()
+            old.unload.assert_not_called()
+            assert not switch.done()
+            release.set()
+            if cancel:
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            else:
+                result = await task
+                assert result.model_name == "old"
+            await switch
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_model_switch_waits_for_inference() -> None:
+    """A queued model switch cannot unload a running inference."""
+    await assert_model_switch_ownership(False)
+
+
+async def test_cancelled_inference_retains_model_ownership() -> None:
+    """Repeated caller cancellation does not orphan the inference thread."""
+    await assert_model_switch_ownership(True)
+
+
+async def test_queued_request_revalidates_new_family() -> None:
+    """A strength request queued under SDXL must fail after switching to conditioned FLUX.2."""
+    from diffusers import Flux2AutoBlocks
+
+    started, release = threading.Event(), threading.Event()
+    old = Mock(family="sdxl")
+
+    def hold_generation(*args: Any, **kwargs: Any) -> Mock:
+        """Keep the old model owned while the switch and request queue."""
+        started.set()
+        assert release.wait(5)
+        return Mock()
+
+    old.generate.side_effect = hold_generation
+    config = Mock(data={})
+    config.get.return_value = {"type": "flux2"}
+    manager = PipelineManager(config)
+    manager.pipeline, manager.current_model = old, "old"
+    manager.validate_request(has_image=True, strength=0.75)
+
+    def load(
+        pipeline: Flux2PipelineWrapper, model_config: dict[str, Any], full_config: dict[str, Any]
+    ) -> None:
+        """Install real conditioned workflow declarations without external components."""
+        pipeline.blocks = Flux2AutoBlocks()
+        pipeline.pipe = MagicMock()
+
+    first = asyncio.create_task(manager.generate("first"))
+    try:
+        assert await asyncio.to_thread(started.wait, 5)
+        with patch.object(Flux2PipelineWrapper, "load", autospec=True, side_effect=load):
+            switch = asyncio.create_task(manager.load_model("new"))
+            await asyncio.sleep(0)
+            queued = asyncio.create_task(
+                manager.generate("queued", init_image=b"unused", strength=0.75)
+            )
+            release.set()
+            await first
+            await switch
+            with pytest.raises(ValueError, match="Denoising strength"):
+                await queued
+        assert manager.family == "flux2"
+        assert old.generate.call_count == 1
+    finally:
+        release.set()
+        await asyncio.gather(first, return_exceptions=True)
+
+
+async def test_preflight_failure_keeps_old_model() -> None:
+    """Invalid CivitAI metadata never unloads the usable previous model."""
+    manager = PipelineManager(Mock(data={}))
+    manager.config.get.return_value = {"type": "civitai", "civitai_model_id": 1}
+    client = AsyncMock()
+    client.get_model.return_value = Mock(latest_version=Mock(base_model="SD 1.5"))
+    manager.set_civitai_client(client)
+    old = Mock(family="sdxl")
+    old.generate.return_value = Mock()
+    manager.pipeline, manager.current_model = old, "old"
+    with pytest.raises(ValueError, match="base model"):
+        await manager.load_model("bad")
+    old.unload.assert_not_called()
+    client.download_model_version.assert_not_awaited()
+    result = await manager.generate("still works")
+    assert result.model_name == "old" and manager.pipeline is old
+
+
+@pytest.mark.parametrize("fail", [False, True])
+async def test_cancelled_load_retains_model_ownership(fail: bool) -> None:
+    """Cancellation drains native loading and cleanup before allowing another owner."""
+    started, release, unloaded = threading.Event(), threading.Event(), threading.Event()
+    manager = PipelineManager(Mock(data={}))
+    manager.config.get.return_value = {"type": "qwen"}
+    partial = []
+
+    def load(
+        pipeline: QwenPipelineWrapper, model_config: dict[str, Any], full_config: dict[str, Any]
+    ) -> None:
+        """Hold a partially initialized wrapper until cancellation is observed."""
+        partial.append(pipeline)
+        pipeline.pipe = MagicMock()
+        started.set()
+        assert release.wait(5)
+        if fail:
+            raise RuntimeError("native load failed")
+
+    def unload(pipeline: QwenPipelineWrapper) -> None:
+        """Record cleanup only after the loader thread finishes."""
+        assert release.is_set()
+        pipeline.pipe = None
+        unloaded.set()
+
+    with (
+        patch.object(QwenPipelineWrapper, "load", autospec=True, side_effect=load),
+        patch.object(QwenPipelineWrapper, "unload", autospec=True, side_effect=unload),
+    ):
+        task = asyncio.create_task(manager.load_model("qwen"))
+        try:
+            assert await asyncio.to_thread(started.wait, 5)
+            task.cancel()
+            await asyncio.sleep(0)
+            task.cancel()
+            await asyncio.sleep(0)
+            assert manager._lock.locked() and not task.done() and not unloaded.is_set()
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert manager._lock.locked() is False
+            assert unloaded.is_set() is fail
+            assert (manager.pipeline is None) is fail
+            if not fail:
+                assert manager.current_model == "qwen"
+        finally:
+            release.set()
+            await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_lazy_load_does_not_reacquire_lock() -> None:
+    """Generation initializes the default via the private owned loader, without deadlock."""
+    manager = PipelineManager(Mock(data={}))
+    manager.config.get.side_effect = ["qwen", {"type": "qwen"}]
+    with (
+        patch.object(QwenPipelineWrapper, "load"),
+        patch.object(QwenPipelineWrapper, "validate_request", return_value="text2image"),
+        patch.object(QwenPipelineWrapper, "generate", return_value=Mock()),
+    ):
+        result = await asyncio.wait_for(manager.generate("a cat"), timeout=5)
+    assert result.model_name == "qwen"
+
+
+@pytest.mark.parametrize("resource", ["loras", "embeddings"])
+async def test_missing_explicit_resource_preserves_old_model(resource: str) -> None:
+    """Required named references cannot silently disappear during preflight."""
+    manager = PipelineManager(Mock(data={}))
+    manager.config.get.return_value = {
+        "type": "civitai",
+        "checkpoint_path": "unused",
+        "base_model": "Pony",
+        resource: ["missing"],
+    }
+    old = Mock(family="sdxl")
+    manager.pipeline, manager.current_model = old, "old"
+    with pytest.raises(ValueError, match="not found"):
+        await manager.load_model("bad")
+    old.unload.assert_not_called()
+    assert manager.pipeline is old
 
 
 class TestGenerationResult:
@@ -136,13 +390,10 @@ class TestPipelineManagerRegistry:
 class TestPipelineManagerLoad:
     """Tests for model configuration flow during pipeline loading."""
 
-    @patch("oneiro.pipelines.base.torch.set_num_interop_threads")
-    @patch("oneiro.pipelines.base.torch.set_num_threads")
-    @patch("oneiro.pipelines.krea2.load_krea2_tokenizer")
-    @patch("diffusers.Krea2Pipeline", create=True)
+    @patch.object(Krea2PipelineWrapper, "load", autospec=True)
     async def test_resolves_named_local_lora_before_krea_load(
-        self, mock_krea2_pipeline, mock_tokenizer, mock_threads, mock_interop, tmp_path
-    ):
+        self, mock_load: Mock, tmp_path: Path
+    ) -> None:
         """Krea loading resolves local named LoRAs before synchronous model setup."""
         lora_path = tmp_path / "portrait.safetensors"
         lora_path.write_bytes(b"test")
@@ -160,15 +411,22 @@ class TestPipelineManagerLoad:
         config.get.return_value = model_config
         config.data = full_config
         manager = PipelineManager(config)
-        mock_krea2_pipeline.from_pretrained.return_value = MagicMock()
+
+        def load_without_external_model(
+            pipeline: BasePipeline, config: dict[str, Any], full_config: dict[str, Any]
+        ) -> None:
+            """Install a model-free component container without external loading."""
+            pipeline.pipe = MagicMock()
+
+        mock_load.side_effect = load_without_external_model
 
         await manager.load_model("krea2-turbo")
 
         assert manager.pipeline is not None
         assert manager.pipeline.active_loras == ["portrait"]
 
-    async def test_does_not_pass_full_config_to_other_pipelines(self):
-        """Shared Krea resource config does not activate sibling embedding loading."""
+    async def test_passes_full_config_without_activating_unrequested_embeddings(self) -> None:
+        """Only selected resources activate; all wrappers receive the full config contract."""
         model_config = {"type": "flux2", "repo": "example/flux2"}
         config = Mock()
         config.get.return_value = model_config
@@ -178,7 +436,7 @@ class TestPipelineManagerLoad:
         with patch.object(Flux2PipelineWrapper, "load") as mock_load:
             await manager.load_model("flux2")
 
-        mock_load.assert_called_once_with(model_config)
+        mock_load.assert_called_once_with(model_config, config.data)
 
     async def test_resolves_named_local_lora_for_any_lora_pipeline(self, tmp_path):
         """Named LoRA resolution is based on wrapper capability, not model type."""
@@ -193,7 +451,10 @@ class TestPipelineManagerLoad:
         }
         manager = PipelineManager(config)
 
-        def load_without_external_model(pipeline, config):
+        def load_without_external_model(
+            pipeline: BasePipeline, config: dict[str, Any], full_config: dict[str, Any]
+        ) -> None:
+            """Install a model-free component container without external loading."""
             pipeline.pipe = MagicMock()
 
         with patch.object(
@@ -217,7 +478,10 @@ class TestPipelineManagerLoad:
         config.data = {"models": {"qwen": model_config}}
         manager = PipelineManager(config)
 
-        def load_without_external_model(pipeline, config):
+        def load_without_external_model(
+            pipeline: BasePipeline, config: dict[str, Any], full_config: dict[str, Any]
+        ) -> None:
+            """Install a model-free component container without external loading."""
             pipeline.pipe = MagicMock()
 
         with patch.object(
@@ -247,7 +511,10 @@ class TestPipelineManagerLoad:
         }
         manager = PipelineManager(config)
 
-        def load_without_external_model(pipeline, config):
+        def load_without_external_model(
+            pipeline: BasePipeline, config: dict[str, Any], full_config: dict[str, Any]
+        ) -> None:
+            """Install a model-free component container without external loading."""
             pipeline.pipe = MagicMock()
 
         with patch.object(
@@ -274,7 +541,10 @@ class TestPipelineManagerLoad:
         }
         manager = PipelineManager(config)
 
-        def load_without_external_model(pipeline, config):
+        def load_without_external_model(
+            pipeline: BasePipeline, config: dict[str, Any], full_config: dict[str, Any]
+        ) -> None:
+            """Install a model-free component container without external loading."""
             pipeline.pipe = MagicMock()
 
         with patch.object(
@@ -300,7 +570,10 @@ class TestPipelineManagerLoad:
         }
         manager = PipelineManager(config)
 
-        def load_without_external_model(pipeline, config):
+        def load_without_external_model(
+            pipeline: BasePipeline, config: dict[str, Any], full_config: dict[str, Any]
+        ) -> None:
+            """Install a model-free component container with a failing adapter loader."""
             pipeline.pipe = MagicMock()
             pipeline.pipe.load_lora_weights.side_effect = RuntimeError("adapter load failed")
 
@@ -332,7 +605,10 @@ class TestPipelineManagerLoad:
         }
         manager = PipelineManager(config)
 
-        def load_without_external_model(pipeline, config):
+        def load_without_external_model(
+            pipeline: BasePipeline, config: dict[str, Any], full_config: dict[str, Any]
+        ) -> None:
+            """Install a model-free container with an optional first adapter failure."""
             pipeline.pipe = MagicMock()
             pipeline.pipe.load_lora_weights.side_effect = [RuntimeError("auto failed"), None]
 
@@ -359,7 +635,10 @@ class TestPipelineManagerLoad:
         }
         manager = PipelineManager(config)
 
-        def load_without_external_model(pipeline, config):
+        def load_without_external_model(
+            pipeline: BasePipeline, config: dict[str, Any], full_config: dict[str, Any]
+        ) -> None:
+            """Model partial external adapter state without loading real model weights."""
             pipeline.pipe = MagicMock()
             pipeline.pipe.adapter_resident = False
 
@@ -396,7 +675,10 @@ class TestPipelineManagerLoad:
         }
         manager = PipelineManager(config)
 
-        def load_without_external_model(pipeline, config):
+        def load_without_external_model(
+            pipeline: BasePipeline, config: dict[str, Any], full_config: dict[str, Any]
+        ) -> None:
+            """Install a model-free container with a failing adapter activation."""
             pipeline.pipe = MagicMock()
             pipeline.pipe.set_adapters.side_effect = RuntimeError("activation failed")
 
@@ -424,7 +706,10 @@ class TestPipelineManagerLoad:
         }
         manager = PipelineManager(config)
 
-        def load_without_external_model(pipeline, config):
+        def load_without_external_model(
+            pipeline: BasePipeline, config: dict[str, Any], full_config: dict[str, Any]
+        ) -> None:
+            """Install a model-free container with failing adapter rollback."""
             pipeline.pipe = MagicMock()
             pipeline.pipe.load_lora_weights.side_effect = RuntimeError("adapter load failed")
             pipeline.pipe.unload_lora_weights.side_effect = RuntimeError("rollback failed")
@@ -470,7 +755,10 @@ class TestPipelineManagerLoad:
         manager = PipelineManager(config)
         partial_pipeline = None
 
-        def fail_after_pipe_creation(pipeline, config):
+        def fail_after_pipe_creation(
+            pipeline: BasePipeline, config: dict[str, Any], full_config: dict[str, Any]
+        ) -> None:
+            """Leave a partial component container for manager cleanup."""
             nonlocal partial_pipeline
             pipeline.pipe = MagicMock()
             partial_pipeline = pipeline
@@ -498,7 +786,10 @@ class TestPipelineManagerLoad:
         config.data = {"models": {"qwen": model_config}}
         manager = PipelineManager(config)
 
-        def fail_after_pipe_creation(pipeline, config):
+        def fail_after_pipe_creation(
+            pipeline: BasePipeline, config: dict[str, Any], full_config: dict[str, Any]
+        ) -> None:
+            """Fail loading after component creation, before a failing cleanup."""
             pipeline.pipe = MagicMock()
             raise RuntimeError("load failed")
 
@@ -812,7 +1103,7 @@ class TestPipelineManagerLoraResolution:
         mock_config = Mock()
         mock_config.get = Mock(return_value={})
         manager = PipelineManager(mock_config)
-        manager.pipeline = Mock()
+        manager.pipeline = Mock(family="sdxl")
         manager.pipeline.generate = Mock(return_value=Mock())
         return manager
 
@@ -857,7 +1148,7 @@ class TestPipelineManagerLoraResolution:
         mock_resolve.assert_called_once()
 
     async def test_generate_handles_lora_resolution_failure(self):
-        """generate() skips LoRAs that fail resolution with warning."""
+        """Explicit resource failures abort generation, rather than silently skipping."""
         manager = self._create_manager_with_mocks()
         manager._civitai_client = None
 
@@ -868,13 +1159,13 @@ class TestPipelineManagerLoraResolution:
             new_callable=AsyncMock,
             side_effect=FileNotFoundError("Not found"),
         ):
-            await manager.generate("test prompt", loras=[lora])
+            with pytest.raises(FileNotFoundError, match="Not found"):
+                await manager.generate("test prompt", loras=[lora])
 
-        call_kwargs = manager.pipeline.generate.call_args.kwargs
-        assert "loras" not in call_kwargs or call_kwargs.get("loras") is None
+        manager.pipeline.generate.assert_not_called()
 
     async def test_generate_resolves_multiple_loras(self):
-        """generate() resolves multiple LoRAs, skipping failed ones."""
+        """Every explicitly requested LoRA must resolve before inference."""
         manager = self._create_manager_with_mocks()
         manager._civitai_client = None
 
@@ -891,10 +1182,10 @@ class TestPipelineManagerLoraResolution:
             new_callable=AsyncMock,
             side_effect=resolve_side_effect,
         ):
-            await manager.generate("test prompt", loras=[good_lora, bad_lora])
+            with pytest.raises(FileNotFoundError, match="Not found"):
+                await manager.generate("test prompt", loras=[good_lora, bad_lora])
 
-        call_kwargs = manager.pipeline.generate.call_args.kwargs
-        assert call_kwargs["loras"] == [good_lora]
+        manager.pipeline.generate.assert_not_called()
 
     async def test_generate_skips_lora_resolution_when_no_loras(self):
         """generate() skips LoRA resolution when no LoRAs provided."""

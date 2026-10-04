@@ -443,7 +443,7 @@ def parse_loras_from_config(
                     loras.append(parsed)
                     loaded_names.add(parsed.name)
                 else:
-                    print(f"Warning: LoRA '{ref}' not found in [loras] section")
+                    raise ValueError(f"LoRA '{ref}' not found in [loras] section")
             elif isinstance(ref, dict):
                 parsed = parse_lora_config(ref, index=len(loras))
                 if parsed.name not in loaded_names:
@@ -483,8 +483,7 @@ PIPELINE_BASE_MODEL_MAP: dict[str, list[str]] = {
     "krea2": ["Krea 2", "Krea-2"],
     "zimage": ["ZImageTurbo", "ZImageBase", "Z-Image"],
     "qwen": ["Qwen", "Qwen-Image"],
-    "sdxl": ["SDXL 1.0", "SDXL Turbo", "SDXL Lightning", "Pony", "Illustrious"],
-    "sd15": ["SD 1.5", "SD 1.4"],
+    "sdxl": ["SDXL", "Pony", "Illustrious"],
     "sd3": ["SD 3", "SD 3.5"],
 }
 
@@ -499,13 +498,12 @@ def is_resource_compatible(pipeline_type: str, civitai_base_model: str | None) -
     Returns:
         True if compatible, False otherwise
     """
-    if civitai_base_model is None:
-        # Can't verify, assume compatible
-        return True
-
     compatible_bases = PIPELINE_BASE_MODEL_MAP.get(pipeline_type, [])
     if not compatible_bases:
-        # Unknown pipeline type, assume compatible
+        return False
+
+    if civitai_base_model is None:
+        # No resource metadata to verify; the native loader still validates its weights.
         return True
 
     civitai_lower = civitai_base_model.lower()
@@ -514,9 +512,9 @@ def is_resource_compatible(pipeline_type: str, civitai_base_model: str | None) -
     if pipeline_type == "flux2-klein":
         return ("flux.2" in civitai_lower or "flux2" in civitai_lower) and "klein" in civitai_lower
 
-    # Check if any compatible base model matches (case-insensitive substring)
+    # A truncated or empty metadata string must not match every longer known base.
     for base in compatible_bases:
-        if base.lower() in civitai_lower or civitai_lower in base.lower():
+        if civitai_lower.startswith(base.lower()):
             return True
 
     return False
@@ -556,6 +554,12 @@ async def resolve_lora_path(
         LoraIncompatibleError: If LoRA is incompatible with pipeline type
         ValueError: If required parameters are missing
     """
+    if validate_compatibility and pipeline_type and lora.base_model is not None:
+        if not is_resource_compatible(pipeline_type, lora.base_model):
+            raise LoraIncompatibleError(
+                lora.adapter_name or lora.name, pipeline_type, lora.base_model
+            )
+
     if lora.source == LoraSource.LOCAL:
         if not lora.path:
             raise ValueError("Local LoRA requires path")

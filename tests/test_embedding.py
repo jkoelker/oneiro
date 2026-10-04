@@ -12,7 +12,6 @@ from oneiro.pipelines.embedding import (
     parse_embedding_config,
     parse_embeddings_from_config,
 )
-from oneiro.pipelines.lora import PIPELINE_BASE_MODEL_MAP, is_resource_compatible
 
 
 class TestEmbeddingConfig:
@@ -319,72 +318,21 @@ class TestParseEmbeddingsFromConfig:
         assert len(embeddings) == 1
         assert embeddings[0].name == "shared"
 
-    def test_missing_named_reference_warns(self, capsys):
-        """Missing named reference prints warning."""
+    def test_missing_named_reference_raises(self) -> None:
+        """A required named embedding cannot silently disappear during preflight."""
         full_config = {"embeddings": {}}
         model_config = {
             "type": "flux2",
             "embeddings": ["nonexistent"],
         }
 
-        embeddings = parse_embeddings_from_config(full_config, model_config)
-
-        assert len(embeddings) == 0
-        captured = capsys.readouterr()
-        assert "not found" in captured.out
+        with pytest.raises(ValueError, match="not found"):
+            parse_embeddings_from_config(full_config, model_config)
 
     def test_no_embeddings(self):
         """Returns empty list when no embeddings configured."""
         embeddings = parse_embeddings_from_config({}, {"type": "flux2"})
         assert embeddings == []
-
-
-class TestIsEmbeddingCompatible:
-    """Tests for is_resource_compatible function."""
-
-    def test_flux1_compatible(self):
-        """Flux.1 embeddings compatible with flux1 pipeline."""
-        assert is_resource_compatible("flux1", "Flux.1 Dev")
-        assert is_resource_compatible("flux1", "Flux.1 Schnell")
-        assert is_resource_compatible("flux1", "Flux.1 D")
-
-    def test_flux2_compatible(self):
-        """Flux.2 embeddings compatible with flux2 pipeline."""
-        assert is_resource_compatible("flux2", "Flux.2")
-        assert is_resource_compatible("flux2-klein", "Flux.2 Klein 9B")
-        assert is_resource_compatible("flux2-klein", "FLUX.2-klein-4B")
-        assert not is_resource_compatible("flux2", "Flux.2 Klein 9B")
-        assert not is_resource_compatible("flux2-klein", "Flux.2")
-
-    def test_flux1_flux2_incompatible(self):
-        """Flux.1 and Flux.2 embeddings are NOT cross-compatible."""
-        assert not is_resource_compatible("flux1", "Flux.2")
-        assert not is_resource_compatible("flux2", "Flux.1 Dev")
-
-    def test_sdxl_compatible(self):
-        """SDXL embeddings compatible with sdxl pipeline."""
-        assert is_resource_compatible("sdxl", "SDXL 1.0")
-        assert is_resource_compatible("sdxl", "Pony")
-        assert is_resource_compatible("sdxl", "Illustrious")
-
-    def test_incompatible_base_model(self):
-        """Incompatible base model returns False."""
-        assert not is_resource_compatible("flux2", "SDXL 1.0")
-        assert not is_resource_compatible("sdxl", "Flux.1 Dev")
-        assert not is_resource_compatible("flux2", "SD 1.5")
-
-    def test_none_base_model_is_compatible(self):
-        """None base model assumed compatible."""
-        assert is_resource_compatible("flux2", None)
-
-    def test_unknown_pipeline_is_compatible(self):
-        """Unknown pipeline type assumed compatible."""
-        assert is_resource_compatible("unknown", "SDXL 1.0")
-
-    def test_case_insensitive(self):
-        """Comparison is case-insensitive."""
-        assert is_resource_compatible("flux1", "flux.1 dev")
-        assert is_resource_compatible("flux1", "FLUX.1 DEV")
 
 
 class TestEmbeddingIncompatibleError:
@@ -403,17 +351,6 @@ class TestEmbeddingIncompatibleError:
         assert err.embedding_name == "my_embedding"
         assert err.pipeline_type == "flux2"
         assert err.base_model == "SDXL 1.0"
-
-
-class TestPipelineBaseModelMap:
-    """Tests for PIPELINE_BASE_MODEL_MAP constant."""
-
-    def test_all_pipeline_types_have_mappings(self):
-        """All common pipeline types have base model mappings."""
-        expected_types = ["flux2", "flux2-klein", "zimage", "qwen", "sdxl", "sd15"]
-        for pipeline_type in expected_types:
-            assert pipeline_type in PIPELINE_BASE_MODEL_MAP
-            assert len(PIPELINE_BASE_MODEL_MAP[pipeline_type]) > 0
 
 
 @pytest.mark.asyncio
