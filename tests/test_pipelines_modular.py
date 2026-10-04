@@ -347,7 +347,10 @@ def test_modular_unload_releases_ownership(tmp_path: Path) -> None:
     assert transformer() is None
 
 
-def test_cfg_guider_is_copied_and_restored(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("scale", [0.0, 0.5, 2.5])
+def test_cfg_guider_is_copied_and_restored(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scale: float
+) -> None:
     """Request CFG cannot mutate the guider shared by other native workflows."""
     wrapper = local_wrapper(tmp_path, Krea2AutoBlocks())
     original = wrapper.pipe.guider
@@ -359,9 +362,10 @@ def test_cfg_guider_is_copied_and_restored(tmp_path: Path, monkeypatch: pytest.M
 
     monkeypatch.setattr(wrapper, "run_inference", fail)
     with pytest.raises(RuntimeError, match="inference failed"):
-        wrapper.generate("test", guidance_scale=2.5)
+        wrapper.generate("test", guidance_scale=scale)
     assert seen[0] is not original
-    assert seen[0].config.guidance_scale == 2.5
+    assert seen[0].config.guidance_scale == scale
+    assert seen[0].config.use_original_formulation is True
     assert wrapper.pipe.guider is original
 
 

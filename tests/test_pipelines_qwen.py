@@ -2,14 +2,86 @@
 
 import math
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 from unittest.mock import patch
 
 import pytest
 import torch
+from diffusers.modular_pipelines.modular_pipeline import BlockState
+from diffusers.modular_pipelines.qwenimage.denoise import QwenImageLoopDenoiser
+from PIL import Image
 
 from oneiro.pipelines.qwen import QwenPipelineWrapper
+from tests.test_civitai_checkpoint import checkpoint_wrapper
 from tests.test_pipelines_modular import capture_generation, image_bytes, load_hosted
 from tests.test_pipelines_modular import offline as offline
+
+
+@pytest.mark.parametrize("source", ["hosted", "checkpoint"])
+@pytest.mark.parametrize("scale", [0.0, 0.25, 1.0, 3.0])
+@pytest.mark.parametrize("failure", [False, True])
+def test_native_qwen_positive_only_threshold_and_cfg(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source: str, scale: float, failure: bool
+) -> None:
+    """Real Qwen denoiser normalization must retain <=1 positive-only sampling for both sources."""
+    if source == "hosted":
+        wrapper, _ = load_hosted(QwenPipelineWrapper, monkeypatch)
+    else:
+        wrapper, config, _ = checkpoint_wrapper(tmp_path, monkeypatch, "Qwen", "image")
+        wrapper.load(config)
+    original = wrapper.pipe.guider
+    original_config, original_state = dict(original.config), original.get_state()
+    predictions = []
+    seen = []
+
+    class Prediction(torch.nn.Module):
+        def forward(
+            self, hidden_states: torch.Tensor, encoder_hidden_states: torch.Tensor, **kwargs: Any
+        ) -> tuple[torch.Tensor]:
+            value = encoder_hidden_states.clone()
+            predictions.append(value.tolist())
+            return (value,)
+
+    wrapper.pipe.register_components(transformer=Prediction())
+
+    def inference(values: dict[str, Any], is_img2img: bool) -> dict[str, Any]:
+        state = BlockState(
+            prompt_embeds=torch.tensor([[[10.0, 0.0]]]),
+            negative_prompt_embeds=torch.tensor([[[0.0, -10.0]]]),
+            prompt_embeds_mask=None,
+            negative_prompt_embeds_mask=None,
+            denoiser_input_fields={},
+            additional_cond_kwargs={},
+            latent_model_input=torch.zeros(1, 1, 2),
+            timestep=torch.tensor([1000.0]),
+            num_inference_steps=1,
+            attention_kwargs=None,
+        )
+        QwenImageLoopDenoiser()(wrapper.pipe, state, 0, torch.tensor(1000.0))
+        seen.append(SimpleNamespace(noise=state.noise_pred, guider=wrapper.pipe.guider))
+        if failure:
+            raise RuntimeError("after native Qwen denoising")
+        return {"images": [Image.new("RGB", (32, 32))]}
+
+    monkeypatch.setattr(wrapper, "run_inference", inference)
+    try:
+        if failure:
+            with pytest.raises(RuntimeError, match="after native Qwen"):
+                wrapper.generate("positive", negative_prompt="negative", guidance_scale=scale)
+        else:
+            result = wrapper.generate("positive", negative_prompt="negative", guidance_scale=scale)
+            assert result.guidance_scale == scale
+        expected = [10.0, 0.0] if scale <= 1 else [300 / math.sqrt(1300), 200 / math.sqrt(1300)]
+        torch.testing.assert_close(seen[0].noise, torch.tensor([[expected]]))
+        assert predictions == (
+            [[[[10.0, 0.0]]]] if scale <= 1 else [[[[10.0, 0.0]]], [[[0.0, -10.0]]]]
+        )
+        assert seen[0].guider is not original
+        assert wrapper.pipe.guider is original
+        assert dict(original.config) == original_config and original.get_state() == original_state
+    finally:
+        wrapper.unload()
 
 
 @pytest.mark.parametrize("filename,is_gguf", [("model.gguf", True), ("model.safetensors", False)])

@@ -314,6 +314,9 @@ class ModularPipelineWrapper(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipeline
         guider = self.pipe.components.get("guider")
         if guider is not None and guider.config.enabled:
             self._original_guider = guider
+            if self.family == "qwen" and guidance_scale <= 1.0:
+                # Qwen's classic <=1 path is positive-only, unlike Krea Raw's native math.
+                guidance_scale = 1.0
             self.pipe.register_components(guider=guider.new(guidance_scale=guidance_scale))
         elif "guidance_scale" in allowed:
             values["guidance_scale"] = guidance_scale
