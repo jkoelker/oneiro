@@ -54,7 +54,7 @@ class DreamContext:
     auto_detected_loras: list[tuple[str, str]]
     is_img2img: bool
     is_inpaint: bool
-    strength: float
+    strength: float | None
     pipeline_manager: "PipelineManager"
     start_time: float = field(default_factory=time.time)
     status_message: discord.Message | None = None
@@ -121,7 +121,12 @@ def create_dream_callbacks(
         image_buffer = context.pipeline_manager.image_to_bytes(result.image)
         file = discord.File(image_buffer, filename="dream.png")
 
-        mode = " (inpaint)" if context.is_inpaint else " (img2img)" if context.is_img2img else ""
+        mode = {
+            "image2image": " (img2img)",
+            "inpainting": " (inpaint)",
+            "reference": " (reference)",
+            "image_conditioned": " (image conditioned)",
+        }.get(result.workflow, "")
         embed = discord.Embed(title="🎨 Dream Generated" + mode, color=discord.Color.purple())
         embed.add_field(name="Prompt", value=context.prompt[:1024], inline=False)
         if context.negative_prompt:
@@ -133,11 +138,13 @@ def create_dream_callbacks(
         embed.add_field(name="Size", value=f"{result.width}×{result.height}", inline=True)
         embed.add_field(name="Seed", value=str(result.seed), inline=True)
         embed.add_field(name="Time", value=f"{elapsed:.1f}s", inline=True)
-        embed.add_field(name="Model", value=f"`{context.current_model}`", inline=True)
+        embed.add_field(
+            name="Model", value=f"`{result.model_name or context.current_model}`", inline=True
+        )
         embed.add_field(name="Steps", value=str(result.steps), inline=True)
         embed.add_field(name="CFG", value=f"{result.guidance_scale:.1f}", inline=True)
-        if context.is_img2img:
-            embed.add_field(name="Strength", value=f"{context.strength:.2f}", inline=True)
+        if result.workflow in {"image2image", "inpainting"} and result.strength is not None:
+            embed.add_field(name="Strength", value=f"{result.strength:.2f}", inline=True)
         if context.lora_configs:
             lora_display = ", ".join(f"`{lc.name}`:{lc.weight}" for lc in context.lora_configs)
             if len(lora_display) > 1024:

@@ -1,9 +1,84 @@
 """Tests for GenerationQueue."""
 
 import asyncio
+from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, Mock
 
+import pytest
+from PIL import Image
+
+from oneiro.pipelines.civitai_checkpoint import CivitaiCheckpointPipeline
 from oneiro.queue import GenerationQueue, QueueRequest, QueueResult, QueueStatus
+from tests.test_bot import _attachment, _dream_context, _image_bytes, _register_test_commands
+
+
+@pytest.mark.parametrize(
+    ("option", "base_model", "workflow", "strength"),
+    [
+        ("image", "Krea 2", "image2image", 0.75),
+        ("mask", "Krea 2", "inpainting", 0.75),
+        ("reference_image", "Krea 2", "reference", None),
+        ("image", "Flux.2", "image_conditioned", None),
+        ("image", "Flux.2 Klein 4B", "image_conditioned", None),
+        ("reference_image", "Flux.2 Klein 4B", "image_conditioned", None),
+    ],
+)
+async def test_queue_preserves_omission_through_model_switch(
+    option: str,
+    base_model: str,
+    workflow: str,
+    strength: float | None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Real admission/queue/execution cannot freeze the submission model's img2img default."""
+    ctx = await _dream_context()
+    attachments = {option: _attachment(_image_bytes())}
+    if option == "mask":
+        attachments["image"] = _attachment(_image_bytes())
+    await _register_test_commands()["dream"](
+        ctx,
+        "prompt",
+        guidance_scale=1.0 if "Klein" in base_model else None,
+        **attachments,
+    )
+    queue = ctx.bot.generation_queue
+    queued = queue._queue.get_nowait()
+    key = {"image": "init_image", "mask": "mask_image", "reference_image": "reference_image"}[
+        option
+    ]
+    assert queued.request[key] == _image_bytes()
+    assert "strength" not in queued.request
+    # Switch to real declarations; only inference is stubbed (no model weights).
+    pipeline = CivitaiCheckpointPipeline()
+    await pipeline.resolve_config({"checkpoint_path": "unused", "base_model": base_model}, None)
+    pipeline.pipe = SimpleNamespace(components={"scheduler": object(), "guider": None})
+    calls = []
+
+    def infer(values: dict[str, Any], is_img2img: bool) -> dict[str, Any]:
+        calls.append(values)
+        return {"images": [Image.new("RGB", (8, 8))]}
+
+    monkeypatch.setattr(pipeline, "run_inference", infer)
+    ctx.bot.pipeline_manager.pipeline = pipeline
+    ctx.bot.pipeline_manager.current_model = "execution-model"
+    queue._pipeline = ctx.bot.pipeline_manager
+    await queue._process_request(queued)
+    assert queue.size == 0 and queue.user_count(ctx.author.id) == 0
+    assert calls, ctx.followup.send.await_args_list
+    assert isinstance(
+        calls[0]["reference_image" if workflow == "reference" else "image"], Image.Image
+    )
+    assert calls[0].get("strength") == strength
+    assert ("strength" in calls[0]) is (strength is not None)
+    embed = ctx.followup.send.await_args.kwargs["embed"]
+    fields = {field.name: field.value for field in embed.fields}
+    assert fields["Model"] == "`execution-model`"
+    assert ("Strength" in fields) is (strength is not None)
+    if strength is not None:
+        assert fields["Strength"] == "0.75"
+    else:
+        assert "img2img" not in embed.title
 
 
 class TestQueueStatus:
