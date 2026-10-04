@@ -12,7 +12,7 @@ from diffusers.modular_pipelines.components_manager import ComponentsManager
 from PIL import Image
 
 from oneiro.device import DevicePolicy, OffloadType
-from oneiro.pipelines.base import BasePipeline, GenerationResult
+from oneiro.pipelines.base import BasePipeline, GenerationResult, validate_request_inputs
 from oneiro.pipelines.embedding import EmbeddingConfig, EmbeddingLoaderMixin
 from oneiro.pipelines.lora import LoraConfig, LoraLoaderMixin
 
@@ -112,15 +112,27 @@ class ModularPipelineWrapper(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipeline
         has_mask: bool = False,
         has_reference: bool = False,
         strength: float | None = None,
+        negative_prompt: str | None = None,
+        steps: int | None = None,
+        guidance_scale: float | None = None,
+        width: int = 1024,
+        height: int = 1024,
+        **kwargs: Any,
     ) -> str:
         """Select a declared workflow and reject incompatible denoising controls."""
         if self.blocks is None:
             raise RuntimeError("Pipeline workflow declarations are not initialized")
         workflows = self.blocks.available_workflows
-        if has_mask and (not has_image or has_reference):
-            raise ValueError("Inpainting requires an image and mask, without reference images")
-        if has_reference and has_image:
-            raise ValueError("Reference and initial images cannot be combined")
+        validate_request_inputs(
+            has_image=has_image,
+            has_mask=has_mask,
+            has_reference=has_reference,
+            strength=strength,
+            steps=steps,
+            guidance_scale=guidance_scale,
+            width=width,
+            height=height,
+        )
         if has_mask:
             workflow = "inpainting"
         elif has_reference:
@@ -134,8 +146,29 @@ class ModularPipelineWrapper(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipeline
         if strength is not None:
             if workflow not in {"image2image", "inpainting"}:
                 raise ValueError(f"Denoising strength is not supported for {workflow}")
-            if not math.isfinite(strength) or not 0.0 < strength <= 1.0:
-                raise ValueError("Strength must be finite, greater than 0, and at most 1")
+        allowed = self.workflow_inputs(workflow)
+        native = self.pipe if self.pipe is not None else self.blocks.init_pipeline()
+        guider = native.components.get("guider")
+        if "true_cfg_scale" in kwargs:
+            if guider is None:
+                raise ValueError("This recipe does not support classifier-free guidance")
+            guidance_scale = kwargs.pop("true_cfg_scale")
+            if not math.isfinite(guidance_scale):
+                raise ValueError("Guidance must be finite")
+        unknown = kwargs.keys() - allowed - self._resource_controls
+        if unknown:
+            raise ValueError(f"Unsupported generation controls: {sorted(unknown)}")
+        if negative_prompt is not None and (
+            "negative_prompt" not in allowed
+            or (self.family == "zimage" and guider is not None and not guider.config.enabled)
+        ):
+            raise ValueError(f"Negative prompts are not supported for {workflow}")
+        if guidance_scale is not None:
+            self.validate_guidance(guidance_scale, allowed, guider)
+        if kwargs.get("output_type", "pil") != "pil":
+            raise ValueError("Image generation requires output_type='pil'")
+        if kwargs.get("loras") and not callable(getattr(native, "load_lora_weights", None)):
+            raise ValueError(f"{self.family} does not support LoRA adapters")
         return workflow
 
     def generate(
@@ -153,38 +186,23 @@ class ModularPipelineWrapper(LoraLoaderMixin, EmbeddingLoaderMixin, BasePipeline
         self.validate_pipeline()
         steps = self.default_steps if steps is None else steps
         guidance_scale = self.default_guidance_scale if guidance_scale is None else guidance_scale
-        workflow = self.validate_request(
+        self.validate_request(
             has_image=kwargs.get("init_image") is not None,
             has_mask=kwargs.get("mask_image") is not None,
             has_reference=kwargs.get("reference_image") is not None,
             strength=kwargs.get("strength"),
+            negative_prompt=negative_prompt,
+            steps=steps,
+            guidance_scale=guidance_scale,
+            width=width,
+            height=height,
+            **{
+                key: value
+                for key, value in kwargs.items()
+                if key not in {"init_image", "mask_image", "reference_image", "strength"}
+            },
         )
-        allowed = self.workflow_inputs(workflow)
-        guider = self.pipe.components.get("guider")
-        if "true_cfg_scale" in kwargs:
-            if guider is None:
-                raise ValueError("This recipe does not support classifier-free guidance")
-            guidance_scale = kwargs.pop("true_cfg_scale")
-        unknown = (
-            kwargs.keys()
-            - allowed
-            - {"init_image", "mask_image", "reference_image", "strength"}
-            - self._resource_controls
-        )
-        if unknown:
-            raise ValueError(f"Unsupported generation controls: {sorted(unknown)}")
-        if negative_prompt is not None and (
-            "negative_prompt" not in allowed
-            or (self.family == "zimage" and guider is not None and not guider.config.enabled)
-        ):
-            raise ValueError(f"Negative prompts are not supported for {workflow}")
-        self.validate_guidance(guidance_scale, allowed, guider)
-        if kwargs.get("output_type", "pil") != "pil":
-            raise ValueError("Image generation requires output_type='pil'")
-        if kwargs.get("loras") and not callable(getattr(self.pipe, "load_lora_weights", None)):
-            raise ValueError(f"{self.family} does not support LoRA adapters")
-        if width <= 0 or height <= 0 or steps <= 0 or not math.isfinite(guidance_scale):
-            raise ValueError("Dimensions and steps must be positive and guidance must be finite")
+        guidance_scale = kwargs.pop("true_cfg_scale", guidance_scale)
         return super().generate(
             prompt, negative_prompt, width, height, seed, steps, guidance_scale, **kwargs
         )

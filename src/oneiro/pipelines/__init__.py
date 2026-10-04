@@ -7,7 +7,12 @@ from typing import TYPE_CHECKING, Any, cast
 
 from PIL import Image
 
-from oneiro.pipelines.base import BasePipeline, GenerationResult
+from oneiro.pipelines.base import (
+    BasePipeline,
+    GenerationResult,
+    get_generation_defaults,
+    validate_request_inputs,
+)
 from oneiro.pipelines.civitai_checkpoint import (
     CIVITAI_BASE_MODEL_PIPELINE_MAP,
     SCHEDULER_CHOICES,
@@ -97,13 +102,70 @@ class PipelineManager:
         has_mask: bool = False,
         has_reference: bool = False,
         strength: float | None = None,
+        **controls: Any,
     ) -> str:
         """Validate against the currently owned model; generation repeats this under lock."""
         if self.pipeline is None:
-            raise RuntimeError("No pipeline loaded")
+            raise RuntimeError("No pipeline loaded; use preflight_request for recovery")
         return self.pipeline.validate_request(
-            has_image=has_image, has_mask=has_mask, has_reference=has_reference, strength=strength
+            has_image=has_image,
+            has_mask=has_mask,
+            has_reference=has_reference,
+            strength=strength,
+            **controls,
         )
+
+    async def preflight_request(self, **controls: Any) -> tuple[str, str]:
+        """Admit controls and expose the recovery family without downloading components."""
+        validate_request_inputs(**controls)
+        pipeline, model_name = self.pipeline, self.current_model
+        if pipeline is None:
+            model_name = self.config.get("defaults", "model", default="zimage-turbo")
+            pipeline, _ = await self._resolve_model(model_name)
+        steps, guidance = self._sampling_values(
+            pipeline, model_name, controls.pop("steps", None), controls.pop("guidance_scale", None)
+        )
+        workflow = pipeline.validate_request(steps=steps, guidance_scale=guidance, **controls)
+        return workflow, pipeline.family
+
+    def _sampling_values(
+        self,
+        pipeline: BasePipeline,
+        model_name: str | None,
+        steps: int | None,
+        guidance_scale: float | None,
+    ) -> tuple[int, float]:
+        """Apply one precedence rule in admission, target preflight and owned execution."""
+        default_steps, default_guidance = get_generation_defaults(pipeline)
+        defaults = {"steps": default_steps, "guidance_scale": default_guidance}
+        if model_name is not None:
+            profile = self.config.get("models", model_name, default={})
+            overrides = self.config.get("model_overrides", model_name, default={})
+            if isinstance(profile, dict):
+                defaults.update({key: profile[key] for key in defaults if key in profile})
+                if profile.get("true_cfg_scale") is not None:
+                    defaults["guidance_scale"] = profile["true_cfg_scale"]
+            if isinstance(overrides, dict):
+                defaults.update({key: overrides[key] for key in defaults if key in overrides})
+        return (
+            defaults["steps"] if steps is None else steps,
+            defaults["guidance_scale"] if guidance_scale is None else guidance_scale,
+        )
+
+    async def _resolve_model(self, model_name: str) -> tuple[BasePipeline, dict[str, Any]]:
+        """Resolve the real target's recipe and config without loading resources or weights."""
+        model_config = self.config.get("models", model_name)
+        if not model_config:
+            raise ValueError(f"Unknown model: {model_name}")
+        pipeline_type = model_config.get("type")
+        if pipeline_type not in self.PIPELINE_TYPES:
+            raise ValueError(f"Unknown pipeline type: {pipeline_type}")
+        pipeline = self.PIPELINE_TYPES[pipeline_type]()
+        if isinstance(pipeline, CivitaiCheckpointPipeline):
+            model_config = await pipeline.resolve_config(model_config, self._civitai_client)
+        else:
+            pipeline.validate_config(model_config, self.config.data)
+        return pipeline, model_config
 
     @staticmethod
     async def _await_owned(operation: Coroutine[Any, Any, Any]) -> Any:
@@ -135,7 +197,12 @@ class PipelineManager:
         self._civitai_client = client
 
     async def load_model(
-        self, model_name: str | None = None, *, scheduler: str | None = None
+        self,
+        model_name: str | None = None,
+        *,
+        scheduler: str | None = None,
+        steps: int | None = None,
+        guidance_scale: float | None = None,
     ) -> None:
         """Load a model by name from config.
 
@@ -145,7 +212,9 @@ class PipelineManager:
         """
 
         async def load_owned() -> None:
-            await self._load_model(model_name, scheduler=scheduler)
+            await self._load_model(
+                model_name, scheduler=scheduler, steps=steps, guidance_scale=guidance_scale
+            )
             if scheduler is not None:
                 target = cast(CivitaiCheckpointPipeline, self.pipeline)
                 await asyncio.to_thread(target.configure_scheduler, scheduler)
@@ -162,36 +231,40 @@ class PipelineManager:
             pipeline._validate_scheduler(scheduler)
 
     async def _load_model(
-        self, model_name: str | None = None, *, scheduler: str | None = None
+        self,
+        model_name: str | None = None,
+        *,
+        scheduler: str | None = None,
+        steps: int | None = None,
+        guidance_scale: float | None = None,
+        request_controls: dict[str, Any] | None = None,
     ) -> None:
         """Load while already owning the lock, including lazy load during generation."""
         # Get model name from config if not specified
         if model_name is None:
             model_name = self.config.get("defaults", "model", default="zimage-turbo")
+        controls = dict(request_controls or {})
 
         # Already loaded this model
         if self.current_model == model_name and self.pipeline is not None:
             self._validate_scheduler_override(self.pipeline, scheduler)
+            steps, guidance_scale = self._sampling_values(
+                self.pipeline, model_name, steps, guidance_scale
+            )
+            controls.update(steps=steps, guidance_scale=guidance_scale)
+            self.pipeline.validate_request(**controls)
             return
 
         # Get model config - model_name is guaranteed to be str at this point
         assert model_name is not None
-        model_config = self.config.get("models", model_name)
-        if not model_config:
-            raise ValueError(f"Unknown model: {model_name}")
-
+        new_pipeline, model_config = await self._resolve_model(model_name)
         pipeline_type = model_config.get("type")
-        if pipeline_type not in self.PIPELINE_TYPES:
-            raise ValueError(f"Unknown pipeline type: {pipeline_type}")
-
-        wrapper_class = self.PIPELINE_TYPES[pipeline_type]
-        new_pipeline = wrapper_class()
-
-        if isinstance(new_pipeline, CivitaiCheckpointPipeline):
-            model_config = await new_pipeline.resolve_config(model_config, self._civitai_client)
-        else:
-            new_pipeline.validate_config(model_config, self.config.data)
         self._validate_scheduler_override(new_pipeline, scheduler)
+        steps, guidance_scale = self._sampling_values(
+            new_pipeline, model_name, steps, guidance_scale
+        )
+        controls.update(steps=steps, guidance_scale=guidance_scale)
+        new_pipeline.validate_request(**controls)
         family = new_pipeline.family
         full_config = self.config.data
         embeddings = parse_embeddings_from_config(full_config, model_config)
@@ -381,18 +454,36 @@ class PipelineManager:
         **kwargs: Any,
     ) -> GenerationResult:
         """Revalidate queued controls and stamp model identity while ownership is held."""
+        controls = {
+            "has_image": kwargs.get("init_image") is not None,
+            "has_mask": kwargs.get("mask_image") is not None,
+            "has_reference": kwargs.get("reference_image") is not None,
+            "strength": kwargs.get("strength"),
+            "negative_prompt": negative_prompt,
+            "steps": steps,
+            "guidance_scale": guidance_scale,
+            "width": width,
+            "height": height,
+            **{
+                key: value
+                for key, value in kwargs.items()
+                if key not in {"init_image", "mask_image", "reference_image", "strength"}
+            },
+        }
         if self.pipeline is None:
-            await self._load_model()
+            await self.preflight_request(**controls)
+            await self._load_model(
+                steps=steps, guidance_scale=guidance_scale, request_controls=controls
+            )
 
         if self.pipeline is None:
             raise RuntimeError("No pipeline loaded")
 
-        self.validate_request(
-            has_image=kwargs.get("init_image") is not None,
-            has_mask=kwargs.get("mask_image") is not None,
-            has_reference=kwargs.get("reference_image") is not None,
-            strength=kwargs.get("strength"),
+        steps, guidance_scale = self._sampling_values(
+            self.pipeline, self.current_model, steps, guidance_scale
         )
+        controls.update(steps=steps, guidance_scale=guidance_scale)
+        self.validate_request(**controls)
 
         loras: list[LoraConfig] | None = kwargs.pop("loras", None)
         if loras:

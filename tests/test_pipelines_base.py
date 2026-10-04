@@ -423,7 +423,10 @@ async def test_cancelled_load_retains_model_ownership(fail: bool) -> None:
 async def test_lazy_load_does_not_reacquire_lock() -> None:
     """Generation initializes the default via the private owned loader, without deadlock."""
     manager = PipelineManager(Mock(data={}))
-    manager.config.get.side_effect = ["qwen", {"type": "qwen"}]
+    manager.config.get.side_effect = lambda *keys, default=None: {
+        ("defaults", "model"): "qwen",
+        ("models", "qwen"): {"type": "qwen"},
+    }.get(keys, default)
     with (
         patch.object(QwenPipelineWrapper, "load"),
         patch.object(QwenPipelineWrapper, "validate_request", return_value="text2image"),

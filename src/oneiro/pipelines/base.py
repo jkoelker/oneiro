@@ -1,7 +1,9 @@
 """Base classes and types for pipeline implementations."""
 
 import gc
+import inspect
 import io
+import math
 import os
 import random
 from abc import ABC, abstractmethod
@@ -15,6 +17,69 @@ from oneiro.device import DevicePolicy, OffloadType
 
 MAX_INPUT_IMAGE_PIXELS = 4096 * 4096
 MAX_INPUT_IMAGE_BYTES = 25 * 1024 * 1024
+
+
+def get_generation_defaults(pipeline: Any) -> tuple[int, float]:
+    """Return configured or declared sampling defaults without loading model assets."""
+    if pipeline is None:
+        return 9, 0.0
+    pipeline_config = getattr(pipeline, "pipeline_config", None)
+    steps = getattr(pipeline_config, "default_steps", None)
+    guidance = getattr(pipeline_config, "default_guidance_scale", None)
+    if not isinstance(steps, int):
+        steps = getattr(pipeline, "default_steps", None)
+    if not isinstance(guidance, int | float):
+        guidance = getattr(pipeline, "default_guidance_scale", None)
+    try:
+        parameters = inspect.signature(pipeline.generate).parameters
+    except (TypeError, ValueError):
+        parameters = {}
+    if not isinstance(steps, int):
+        steps = getattr(parameters.get("steps"), "default", 9)
+    if not isinstance(guidance, int | float):
+        guidance = getattr(parameters.get("guidance_scale"), "default", 0.0)
+    return (
+        steps if isinstance(steps, int) else 9,
+        float(guidance) if isinstance(guidance, int | float) else 0.0,
+    )
+
+
+def validate_request_inputs(
+    *,
+    has_image: bool = False,
+    has_mask: bool = False,
+    has_reference: bool = False,
+    strength: float | None = None,
+    steps: int | None = None,
+    guidance_scale: float | None = None,
+    width: int = 1024,
+    height: int = 1024,
+    **kwargs: Any,
+) -> str:
+    """Validate model-independent controls even when lazy recovery has no loaded owner."""
+    if has_mask and (not has_image or has_reference):
+        raise ValueError("Inpainting requires an image and mask, without reference images")
+    if has_reference and has_image:
+        raise ValueError("Reference and initial images cannot be combined")
+    workflow = (
+        "inpainting"
+        if has_mask
+        else "reference"
+        if has_reference
+        else "image2image"
+        if has_image
+        else "text2image"
+    )
+    if strength is not None:
+        if workflow not in {"image2image", "inpainting"}:
+            raise ValueError(f"Denoising strength is not supported for {workflow}")
+        if not math.isfinite(strength) or not 0.0 < strength <= 1.0:
+            raise ValueError("Strength must be finite, greater than 0, and at most 1")
+    if width <= 0 or height <= 0 or (steps is not None and steps <= 0):
+        raise ValueError("Dimensions and steps must be positive")
+    if guidance_scale is not None and not math.isfinite(guidance_scale):
+        raise ValueError("Guidance must be finite")
+    return workflow
 
 
 @dataclass
@@ -149,6 +214,7 @@ class BasePipeline(ABC):
         has_mask: bool = False,
         has_reference: bool = False,
         strength: float | None = None,
+        **kwargs: Any,
     ) -> str:
         """Keep classic capabilities while allowing native wrappers to validate workflows."""
         if has_mask and not self.supports_inpaint:

@@ -734,15 +734,21 @@ class CivitaiCheckpointPipeline(ModularPipelineWrapper):
         has_mask: bool = False,
         has_reference: bool = False,
         strength: float | None = None,
+        **kwargs: Any,
     ) -> str:
         """Apply shared validation, plus only the existing native Z-Image mask exception."""
+        self._validate_scheduler(kwargs.get("scheduler"))
         if self.family == "zimage" and has_mask:
             if not has_image or has_reference:
                 raise ValueError("Inpainting requires an image and mask, without reference images")
-            super().validate_request(has_image=True, strength=strength)
+            super().validate_request(has_image=True, strength=strength, **kwargs)
             return "inpainting"
         return super().validate_request(
-            has_image=has_image, has_mask=has_mask, has_reference=has_reference, strength=strength
+            has_image=has_image,
+            has_mask=has_mask,
+            has_reference=has_reference,
+            strength=strength,
+            **kwargs,
         )
 
     def workflow_inputs(self, workflow: str) -> set[str]:

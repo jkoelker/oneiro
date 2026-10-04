@@ -468,12 +468,13 @@ async def test_dream_rejects_unsupported_inputs_before_io(
 )
 async def test_dream_parameter_precedence(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     settings: dict[str, Any],
     overrides: dict[str, Any],
     user: dict[str, Any],
     expected: tuple[int, float],
 ) -> None:
-    """Actual submission resolves user > persistent override > model/Qwen defaults."""
+    """Actual execution resolves user > persistent override > model/Qwen defaults."""
     ctx = await _dream_context("Qwen")
     base = tmp_path / "config.toml"
     base.write_text(
@@ -485,11 +486,17 @@ async def test_dream_parameter_precedence(
     for key, value in overrides.items():
         config.set("model_overrides", "submitted-model", key, value=value)
     ctx.bot.config = ctx.bot.pipeline_manager.config = config
+    from oneiro.pipelines.qwen import QwenPipelineWrapper
+    from tests.test_pipelines_modular import capture_generation, load_hosted
+
+    ctx.bot.pipeline_manager.pipeline, _ = load_hosted(QwenPipelineWrapper, monkeypatch)
+    capture_generation(ctx.bot.pipeline_manager.pipeline, monkeypatch)
 
     await _register_test_commands()["dream"](ctx, "prompt", **user)
 
     request = ctx.bot.generation_queue._pending_requests[0].request
-    assert (request["steps"], request["guidance_scale"]) == expected
+    result = await ctx.bot.pipeline_manager.generate(**request)
+    assert (result.steps, result.guidance_scale) == expected
 
 
 @pytest.mark.parametrize("target", ["pony", "new"])
@@ -527,7 +534,7 @@ async def test_model_persists_generation_overrides(
     "inputs", [{}, {"image": True}, {"image": True, "mask": True}, {"reference_image": True}]
 )
 async def test_dream_admits_krea_image_mask_reference_workflows(
-    variant: str, inputs: dict[str, bool]
+    variant: str, inputs: dict[str, bool], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The one-reference UI forwards bytes and leaves omitted strength omitted."""
     ctx = await _dream_context(
@@ -546,8 +553,14 @@ async def test_dream_admits_krea_image_mask_reference_workflows(
         if option in inputs:
             assert request[key] == _image_bytes()
             attachments[option].read.assert_awaited_once()
-    assert request["steps"] == (28 if variant == "raw" else 8)
-    assert request["guidance_scale"] == (4.5 if variant == "raw" else 0.0)
+    assert "steps" not in request and "guidance_scale" not in request
+    from tests.test_pipelines_modular import capture_generation
+
+    pipeline = ctx.bot.pipeline_manager.pipeline
+    pipeline.pipe = pipeline.blocks.init_pipeline()
+    capture_generation(pipeline, monkeypatch)
+    result = await ctx.bot.pipeline_manager.generate(**request)
+    assert (result.steps, result.guidance_scale) == ((28, 4.5) if variant == "raw" else (8, 0.0))
 
 
 @pytest.mark.parametrize("variant", ["raw", "turbo"])
@@ -618,19 +631,20 @@ async def test_dream_loras_use_resolved_checkpoint_family() -> None:
     assert ctx.bot.generation_queue._pending_requests[0].request["loras"] == [lora]
 
 
-async def test_dream_unloaded_manager_failure_is_private() -> None:
-    """Unavailable declarations fail privately before any attachment or queue work."""
+async def test_dream_unloaded_manager_rejects_malformed_inputs_privately() -> None:
+    """Lazy recovery still rejects model-independent image conflicts before upload I/O."""
     ctx = await _dream_context()
     ctx.bot.pipeline_manager.pipeline = None
     reference = _attachment()
-    await _register_test_commands()["dream"](ctx, "prompt", reference_image=reference)
+    image = _attachment()
+    await _register_test_commands()["dream"](ctx, "prompt", image=image, reference_image=reference)
     ctx.defer.assert_awaited_once()
     reference.read.assert_not_awaited()
+    image.read.assert_not_awaited()
     ctx.bot.generation_queue.add.assert_not_called()
-    failure = ctx.followup.send.await_args.kwargs
-    assert failure["ephemeral"] is True
-    assert failure["content"].startswith("❌ Failed to validate request")
-    assert "RuntimeError: No pipeline loaded" in failure["content"]
+    failure = ctx.followup.send.await_args
+    assert failure.kwargs["ephemeral"] is True
+    assert "Reference and initial images cannot be combined" in failure.args[0]
 
 
 @pytest.mark.parametrize("model_name", ["execution-model", None])
@@ -1524,8 +1538,7 @@ async def test_fetch_krea2_validates_header_before_writing_config(
             await commands["dream"](ctx, "test prompt")
 
         request = ctx.bot.generation_queue.add.call_args.kwargs["request"]
-        assert request["steps"] == expected_steps
-        assert request["guidance_scale"] == expected_guidance
+        assert "steps" not in request and "guidance_scale" not in request
 
         operator_config = {
             key: value
@@ -1548,8 +1561,7 @@ async def test_fetch_krea2_validates_header_before_writing_config(
         ):
             await commands["dream"](ctx, "test prompt")
         operator_request = ctx.bot.generation_queue.add.call_args.kwargs["request"]
-        assert operator_request["steps"] == expected_steps
-        assert operator_request["guidance_scale"] == expected_guidance
+        assert "steps" not in operator_request and "guidance_scale" not in operator_request
     elif checkpoint_kind == "cached_io_error":
         ctx.bot.civitai_client.download_model_version.assert_not_awaited()
         ctx.bot.civitai_client.get_safetensor_header.assert_not_awaited()

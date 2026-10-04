@@ -1,6 +1,5 @@
 """Slash command definitions for Oneiro Discord bot."""
 
-import inspect
 import math
 import re
 from contextlib import suppress
@@ -25,6 +24,7 @@ from oneiro.discord.handlers import (
     format_exception_response,
 )
 from oneiro.pipelines import SCHEDULER_CHOICES
+from oneiro.pipelines.base import get_generation_defaults
 from oneiro.pipelines.civitai_checkpoint import (
     DEFAULT_KREA2_COMPONENT_REPO,
     DEFAULT_KREA2_RAW_COMPONENT_REPO,
@@ -117,31 +117,6 @@ def _discard_invalid_civitai_download(
             client.cache.remove(model_file.sha256)
     with suppress(OSError):
         path.unlink(missing_ok=True)
-
-
-def get_generation_defaults(pipeline: Any) -> tuple[int, float]:
-    """Return configured or declared generation defaults for a loaded pipeline."""
-    if pipeline is None:
-        return 9, 0.0
-    pipeline_config = getattr(pipeline, "pipeline_config", None)
-    steps = getattr(pipeline_config, "default_steps", None)
-    guidance = getattr(pipeline_config, "default_guidance_scale", None)
-    if not isinstance(steps, int):
-        steps = getattr(pipeline, "default_steps", None)
-    if not isinstance(guidance, int | float):
-        guidance = getattr(pipeline, "default_guidance_scale", None)
-    try:
-        parameters = inspect.signature(pipeline.generate).parameters
-    except (TypeError, ValueError):
-        parameters = {}
-    if not isinstance(steps, int):
-        steps = getattr(parameters.get("steps"), "default", 9)
-    if not isinstance(guidance, int | float):
-        guidance = getattr(parameters.get("guidance_scale"), "default", 0.0)
-    return (
-        steps if isinstance(steps, int) else 9,
-        float(guidance) if isinstance(guidance, int | float) else 0.0,
-    )
 
 
 def validate_image_attachment(attachment: discord.Attachment, label: str) -> str | None:
@@ -342,11 +317,17 @@ def register_commands(bot: "OneiroBot") -> None:
 
         # Capability checks precede attachment reads and all resource/queue work.
         try:
-            workflow = ctx.bot.pipeline_manager.validate_request(
+            workflow, family = await ctx.bot.pipeline_manager.preflight_request(
                 has_image=image is not None,
                 has_mask=mask is not None,
                 has_reference=reference_image is not None,
                 strength=strength,
+                negative_prompt=negative_prompt,
+                steps=steps,
+                guidance_scale=guidance_scale,
+                width=width,
+                height=height,
+                **({"scheduler": scheduler} if scheduler is not None else {}),
             )
         except ValueError as e:
             await ctx.followup.send(f"❌ {e}", ephemeral=True)
@@ -357,12 +338,7 @@ def register_commands(bot: "OneiroBot") -> None:
             )
             return
 
-        # Get model-specific defaults from config
-        current_model = ctx.bot.pipeline_manager.current_model or "zimage-turbo"
-        model_config = (
-            ctx.bot.config.get("models", current_model, default={}) if ctx.bot.config else {}
-        )
-        family = ctx.bot.pipeline_manager.family
+        current_model = ctx.bot.pipeline_manager.current_model or "pending"
 
         # Validate image attachments before reading them into memory
         attachments = (("image", image), ("mask image", mask), ("reference image", reference_image))
@@ -389,33 +365,6 @@ def register_commands(bot: "OneiroBot") -> None:
                     ephemeral=True,
                 )
                 return
-
-        # Get model config defaults
-        pipeline_steps, pipeline_guidance = get_generation_defaults(
-            ctx.bot.pipeline_manager.pipeline
-        )
-        model_steps = model_config.get("steps", pipeline_steps)
-        model_guidance = model_config.get("guidance_scale", pipeline_guidance)
-
-        # Handle Qwen's true_cfg_scale
-        if model_config.get("true_cfg_scale"):
-            model_guidance = model_config["true_cfg_scale"]
-
-        # Check for model-specific overrides set via /model command
-        model_overrides = (
-            ctx.bot.config.get("model_overrides", current_model, default={})
-            if ctx.bot.config
-            else {}
-        )
-        if model_overrides:
-            if "steps" in model_overrides:
-                model_steps = model_overrides["steps"]
-            if "guidance_scale" in model_overrides:
-                model_guidance = model_overrides["guidance_scale"]
-
-        # User-provided values take priority over model defaults
-        actual_steps = steps if steps is not None else model_steps
-        actual_guidance = guidance_scale if guidance_scale is not None else model_guidance
 
         # Resolve LoRAs: explicit param OR auto-detect (not both)
         try:
@@ -447,9 +396,12 @@ def register_commands(bot: "OneiroBot") -> None:
             "width": width,
             "height": height,
             "seed": seed,
-            "steps": actual_steps,
-            "guidance_scale": actual_guidance,
         }
+        # Omitted controls are resolved from the executing owner, not an admission snapshot.
+        if steps is not None:
+            request["steps"] = steps
+        if guidance_scale is not None:
+            request["guidance_scale"] = guidance_scale
 
         if scheduler:
             request["scheduler"] = scheduler
@@ -586,18 +538,17 @@ def register_commands(bot: "OneiroBot") -> None:
             # Model is already active - handle overrides only
             overrides_applied = []
 
+            await ctx.defer()
+            try:
+                await ctx.bot.pipeline_manager.load_model(
+                    model, scheduler=scheduler, steps=steps, guidance_scale=guidance_scale
+                )
+            except ValueError as error:
+                await ctx.followup.send(f"❌ Failed to configure model: {error}", ephemeral=True)
+                return
             if scheduler:
-                # Waiting for inference ownership can exceed Discord's response window.
-                await ctx.defer()
-                try:
-                    await ctx.bot.pipeline_manager.load_model(model, scheduler=scheduler)
-                except ValueError as error:
-                    await ctx.followup.send(
-                        f"❌ Failed to configure model: {error}", ephemeral=True
-                    )
-                    return
                 overrides_applied.append(f"scheduler=`{scheduler}`")
-            send = ctx.followup.send if scheduler else ctx.respond
+            send = ctx.followup.send
 
             # Save steps/guidance_scale overrides to state
             if ctx.bot.config.state_path:
@@ -628,7 +579,9 @@ def register_commands(bot: "OneiroBot") -> None:
         try:
             loading_msg = await ctx.followup.send(f"⏳ Loading model `{model}`...")
             try:
-                await ctx.bot.pipeline_manager.load_model(model, scheduler=scheduler)
+                await ctx.bot.pipeline_manager.load_model(
+                    model, scheduler=scheduler, steps=steps, guidance_scale=guidance_scale
+                )
             except CivitaiError as e:
                 await ctx.followup.send(
                     **format_exception_response("❌ Failed to load model", e), ephemeral=True

@@ -70,15 +70,16 @@ class ZImagePipelineWrapper(ModularPipelineWrapper):
         has_mask: bool = False,
         has_reference: bool = False,
         strength: float | None = None,
+        **kwargs: Any,
     ) -> str:
         """Add only the retained native mask workflow to shared capability validation."""
         if has_mask:
             if not has_image or has_reference:
                 raise ValueError("Inpainting requires an image and mask, without reference images")
-            super().validate_request(has_image=True, strength=strength)
+            super().validate_request(has_image=True, strength=strength, **kwargs)
             return "inpainting"
         return super().validate_request(
-            has_image=has_image, has_reference=has_reference, strength=strength
+            has_image=has_image, has_reference=has_reference, strength=strength, **kwargs
         )
 
     def run_inference(self, gen_kwargs: dict[str, Any], is_img2img: bool) -> Any:

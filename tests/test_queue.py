@@ -39,7 +39,6 @@ async def test_queue_preserves_omission_through_model_switch(
     await _register_test_commands()["dream"](
         ctx,
         "prompt",
-        guidance_scale=1.0 if "Klein" in base_model else None,
         **attachments,
     )
     queue = ctx.bot.generation_queue
