@@ -159,6 +159,9 @@ is preserved; multi-image files use the HEIF primary image or the first TIFF/AVI
 JPEG phone photos with MPF/MPO secondary images use their primary (first) image.
 Generated results and input thumbnails are PNG. Completion metadata reports the actual
 execution model/workflow and shows strength only for denoising workflows.
+Results use Components V2 cards: generated images and optional input thumbnails have
+independent spoiler overlays while metadata stays visible. Spoilers follow the viewer's
+Discord settings; they are not access control. React ❌ to delete a result.
 
 ### LoRA Usage
 

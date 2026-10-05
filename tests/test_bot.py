@@ -7,7 +7,7 @@ import socket
 import struct
 import threading
 import zlib
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -36,6 +36,7 @@ from oneiro.discord.handlers import (
     DreamContext,
     create_dream_callbacks,
     format_exception_response,
+    handle_reaction_delete,
 )
 from oneiro.lora_detector import AutoLoraDetector
 from oneiro.pipelines import GenerationResult, LoraConfig, LoraSource, PipelineManager
@@ -127,6 +128,15 @@ def _image_bytes(format: str = "PNG", *, image: Image.Image | None = None, **opt
     else:
         image.save(buffer, format=format, **options)
     return buffer.getvalue()
+
+
+def _walk_components(components: list[dict[str, Any]]) -> Iterator[dict[str, Any]]:
+    """Inspect nested Discord components without depending on card item ordering."""
+    for component in components:
+        yield component
+        yield from _walk_components(component.get("components", []))
+        if "accessory" in component:
+            yield component["accessory"]
 
 
 def _model_context(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
@@ -697,13 +707,18 @@ async def test_completion_uses_actual_workflow_and_model(
         model_name=model_name,
     )
     await create_dream_callbacks(context)[2](result)
-    embed = ctx.followup.send.await_args.kwargs["embed"]
-    assert embed.title == "🎨 Dream Generated" + mode
-    fields = {field.name: field.value for field in embed.fields}
-    assert fields["Model"] == ("`execution-model`" if model_name else "`submitted-model`")
-    assert ("Strength" in fields) is (strength is not None)
+    response = ctx.followup.send.await_args.kwargs
+    assert "view" in response and "embed" not in response
+    text = "\n".join(
+        item["content"]
+        for item in _walk_components(response["view"].to_components())
+        if item["type"] == 10
+    )
+    assert "🎨 Dream Generated" + mode in text
+    assert f"**Model:** `{model_name or 'submitted-model'}`" in text
+    assert ("**Strength:**" in text) is (strength is not None)
     if strength is not None:
-        assert fields["Strength"] == f"{strength:.2f}"
+        assert f"**Strength:** {strength:.2f}" in text
 
 
 @pytest.mark.parametrize("delivery", ["send", "edit", "missing"])
@@ -737,7 +752,7 @@ async def test_dream_completion_attaches_input_thumbnail(source: str | None, del
     message = SimpleNamespace(edit=edit, add_reaction=AsyncMock())
 
     async def send(content: str | None = None, **kwargs: Any) -> Any:
-        if "embed" in kwargs:
+        if "view" in kwargs or "embed" in kwargs:
             delivered.append(consume_upload(kwargs))
         return message
 
@@ -805,14 +820,23 @@ async def test_dream_completion_attaches_input_thumbnail(source: str | None, del
 
     assert len(delivered) == 1
     payload, contents = delivered[0]
-    embed = payload["embeds"][0]
-    generated = embed["image"]["url"].removeprefix("attachment://")
+    assert payload["flags"] & (1 << 15)
+    assert not payload.get("embeds") and not payload.get("content")
+    assert payload["allowed_mentions"]["parse"] == []
+    components = list(_walk_components(payload["components"]))
+    gallery = next(item for item in components if item["type"] == 12)
+    assert len(gallery["items"]) == 1 and gallery["items"][0]["spoiler"] is True
+    generated = gallery["items"][0]["media"]["url"].removeprefix("attachment://")
+    assert generated.startswith("SPOILER_")
     with Image.open(io.BytesIO(contents[generated])) as output:
         assert output.size == (32, 32) and output.getpixel((0, 0)) == (255, 0, 0)
     if source is None:
-        assert "thumbnail" not in embed and len(contents) == 1
+        assert not any(item["type"] == 11 for item in components) and len(contents) == 1
     else:
-        thumbnail = embed["thumbnail"]["url"].removeprefix("attachment://")
+        accessory = next(item for item in components if item["type"] == 11)
+        assert accessory["spoiler"] is True
+        thumbnail = accessory["media"]["url"].removeprefix("attachment://")
+        assert thumbnail.startswith("SPOILER_")
         assert thumbnail != generated and len(contents) == 2
         assert len(contents[thumbnail]) < 256 * 1024
         with Image.open(io.BytesIO(contents[thumbnail])) as preview:
@@ -871,12 +895,115 @@ async def test_thumbnail_failure_preserves_successful_queue_result(
     ctx.followup.send.reset_mock()
     await queue._process_request(queue._pending_requests[-1])
     response = (status_message.edit if delivery == "edit" else ctx.followup.send).await_args.kwargs
-    assert "thumbnail" not in response["embed"].to_dict()
+    assert not any(
+        item["type"] == 11 for item in _walk_components(response["view"].to_components())
+    )
     assert len(response["files"]) == 1
-    assert response["files"][0].filename == "dream.png"
+    assert response["files"][0].filename == "SPOILER_dream.png"
     with Image.open(response["files"][0].fp) as generated:
         assert generated.size == (32, 32) and generated.getpixel((0, 0)) == (255, 0, 0)
     assert "preview failed" in capsys.readouterr().out
+
+
+async def test_completion_card_bounds_text_without_losing_metadata() -> None:
+    """Verbose prompts/LoRAs cannot invalidate the card or make prompt mentions ping."""
+    ctx = await _dream_context()
+    ctx.author.name = "requester"
+    context = DreamContext(
+        ctx=ctx,
+        prompt="@everyone " + "p" * 5000,
+        negative_prompt="@here " + "n" * 5000,
+        current_model="submitted-model",
+        scheduler="euler" + "s" * 5000,
+        lora_configs=[LoraConfig("portrait" + "l" * 5000, LoraSource.LOCAL, path="unused")],
+        auto_detected_loras=[("style" + "a" * 5000, "trigger" + "t" * 5000)],
+        is_img2img=True,
+        is_inpaint=False,
+        strength=0.9,
+        pipeline_manager=ctx.bot.pipeline_manager,
+        input_image=_image_bytes(),
+    )
+    result = GenerationResult(
+        Image.new("RGB", (32, 32)),
+        7,
+        "prompt",
+        None,
+        32,
+        32,
+        8,
+        0.0,
+        workflow="image2image",
+        strength=0.75,
+        model_name="execution-model" + "m" * 5000,
+    )
+    await create_dream_callbacks(context)[2](result)
+    params = handle_message_parameters(**ctx.followup.send.await_args.kwargs)
+    payload = json.loads(params.multipart[0]["value"])
+    for file in params.files or []:
+        file.close()
+    assert payload["flags"] & (1 << 15)
+    texts = [
+        item["content"] for item in _walk_components(payload["components"]) if item["type"] == 10
+    ]
+    assert sum(map(len, texts)) <= 4000
+    text = "\n".join(texts)
+    assert "🎨 Dream Generated (img2img)" in text
+    for label in (
+        "Prompt",
+        "Negative Prompt",
+        "Size",
+        "Seed",
+        "Time",
+        "Model",
+        "Steps",
+        "CFG",
+        "Strength",
+        "LoRA",
+        "Auto LoRAs",
+        "Scheduler",
+    ):
+        assert f"**{label}" in text
+    assert "execution-model" in text and "portrait" in text and "style" in text and "euler" in text
+    assert "Requested by requester" in text and "React ❌ to delete" in text
+    assert payload["allowed_mentions"]["parse"] == []
+    assert payload["allowed_mentions"].get("replied_user", False) is False
+    assert not payload["components"][0].get("spoiler", False)
+
+
+@pytest.mark.parametrize(
+    ("kind", "author", "reaction_user", "emoji", "deleted"),
+    [
+        ("card", "bot", 2, "❌", True),
+        ("legacy", "bot", 2, "❌", True),
+        ("text", "bot", 2, "❌", False),
+        ("other-card", "bot", 2, "❌", False),
+        ("card", "user", 2, "❌", False),
+        ("card", "bot", 1, "❌", False),
+        ("card", "bot", 2, "✅", False),
+    ],
+)
+async def test_reaction_delete_recognizes_only_bot_image_results(
+    kind: str, author: str, reaction_user: int, emoji: str, deleted: bool
+) -> None:
+    """Cards remain deletable without allowing reactions to delete unrelated messages."""
+    bot_user = SimpleNamespace(id=1)
+    removed: list[str] = []
+
+    async def delete() -> None:
+        removed.append(kind)
+
+    message = SimpleNamespace(
+        author=bot_user if author == "bot" else SimpleNamespace(id=3),
+        embeds=[object()] if kind == "legacy" else [],
+        flags=discord.MessageFlags(is_components_v2=kind in {"card", "other-card"}),
+        attachments=[SimpleNamespace(filename="SPOILER_dream.png")] if kind == "card" else [],
+        delete=delete,
+    )
+    channel = SimpleNamespace(fetch_message=AsyncMock(return_value=message))
+    bot = SimpleNamespace(user=bot_user, get_channel=lambda _: channel)
+    payload = SimpleNamespace(emoji=emoji, user_id=reaction_user, channel_id=10, message_id=20)
+    await handle_reaction_delete(bot, payload)
+    assert removed == ([kind] if deleted else [])
 
 
 @pytest.mark.parametrize(
@@ -965,10 +1092,12 @@ async def test_dream_new_image_formats_reach_inference_and_preview(
     uploads = {part["filename"]: part["value"].read() for part in params.multipart[1:]}
     for file in params.files or []:
         file.close()
-    assert payload["embeds"][0]["thumbnail"]["url"] == "attachment://input.png"
-    with Image.open(io.BytesIO(uploads["dream.png"])) as generated:
+    thumbnail = next(item for item in _walk_components(payload["components"]) if item["type"] == 11)
+    assert thumbnail["media"]["url"] == "attachment://SPOILER_input.png"
+    assert thumbnail["spoiler"] is True
+    with Image.open(io.BytesIO(uploads["SPOILER_dream.png"])) as generated:
         assert generated.format == "PNG" and generated.getpixel((0, 0)) == (0, 128, 0)
-    with Image.open(io.BytesIO(uploads["input.png"])) as preview:
+    with Image.open(io.BytesIO(uploads["SPOILER_input.png"])) as preview:
         assert_oriented(preview)
         if format != "BMP":
             assert preview.mode == "RGBA" and preview.getpixel((8, 8))[3] == 128
@@ -1022,13 +1151,17 @@ async def test_malformed_exif_keeps_valid_pixels_and_thumbnail(
     await queue._process_request(queue._pending_requests[0])
     assert len(inferred) == 1
     response = ctx.followup.send.await_args.kwargs
-    assert response["embed"].thumbnail.url == "attachment://input.png"
+    thumbnail = next(
+        item for item in _walk_components(response["view"].to_components()) if item["type"] == 11
+    )
+    assert thumbnail["media"]["url"] == "attachment://SPOILER_input.png"
+    assert thumbnail["spoiler"] is True
     uploads = {file.filename: file.fp.read() for file in response["files"]}
-    with Image.open(io.BytesIO(uploads["input.png"])) as preview:
+    with Image.open(io.BytesIO(uploads["SPOILER_input.png"])) as preview:
         assert preview.size == (8, 8)
         r, g, b = preview.convert("RGB").getpixel((0, 0))
         assert r < 10 and g < 10 and b > 245
-    with Image.open(io.BytesIO(uploads["dream.png"])) as generated:
+    with Image.open(io.BytesIO(uploads["SPOILER_dream.png"])) as generated:
         assert generated.size == (32, 32) and generated.getpixel((0, 0)) == (255, 0, 0)
 
 
@@ -1088,8 +1221,12 @@ async def test_multiframe_upload_selects_primary_or_first_still(format: str) -> 
     await queue._process_request(queue._pending_requests[0])
     assert len(inferred) == 1
     response = ctx.followup.send.await_args.kwargs
-    assert response["embed"].thumbnail.url == "attachment://input.png"
-    preview_file = next(file for file in response["files"] if file.filename == "input.png")
+    thumbnail = next(
+        item for item in _walk_components(response["view"].to_components()) if item["type"] == 11
+    )
+    assert thumbnail["media"]["url"] == "attachment://SPOILER_input.png"
+    assert thumbnail["spoiler"] is True
+    preview_file = next(file for file in response["files"] if file.filename == "SPOILER_input.png")
     with Image.open(preview_file.fp) as preview:
         for image in (inferred[0], preview):
             assert image.size == (64, 32)
