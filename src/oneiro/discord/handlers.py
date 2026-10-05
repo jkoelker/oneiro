@@ -1,5 +1,6 @@
 """Event handlers and callback factories for Discord bot."""
 
+import asyncio
 import io
 import re
 import time
@@ -9,6 +10,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import discord
+from PIL import Image
 
 from oneiro.pipelines import GenerationResult, LoraConfig
 
@@ -37,6 +39,16 @@ def format_exception_response(prefix: str, error: BaseException) -> dict[str, An
     return response
 
 
+def _input_thumbnail(image_data: bytes) -> bytes:
+    """Encode a small preview of the input already validated during generation."""
+    with Image.open(io.BytesIO(image_data)) as image:
+        image = image.convert("RGBA")
+        image.thumbnail((256, 256))
+        buffer = io.BytesIO()
+        image.save(buffer, format="PNG")
+        return buffer.getvalue()
+
+
 @dataclass
 class DreamContext:
     """Context for dream command callbacks.
@@ -56,6 +68,7 @@ class DreamContext:
     is_inpaint: bool
     strength: float | None
     pipeline_manager: "PipelineManager"
+    input_image: bytes | None = None
     start_time: float = field(default_factory=time.time)
     status_message: discord.Message | None = None
 
@@ -119,7 +132,24 @@ def create_dream_callbacks(
 
         elapsed = time.time() - context.start_time
         image_buffer = context.pipeline_manager.image_to_bytes(result.image)
-        file = discord.File(image_buffer, filename="dream.png")
+        attachments = [("dream.png", image_buffer.getvalue(), "Generated image")]
+        thumbnail: bytes | None = None
+        if context.input_image is not None:
+            try:
+                thumbnail = await asyncio.to_thread(_input_thumbnail, context.input_image)
+            except Exception as error:
+                print(
+                    f"Warning: Failed to create input thumbnail: {_sanitize_error_text(str(error))}"
+                )
+            else:
+                attachments.append(("input.png", thumbnail, "Input image used for generation"))
+
+        def create_files() -> list[discord.File]:
+            """Discord upload streams are single-use, including failed message edits."""
+            return [
+                discord.File(io.BytesIO(data), filename=name, description=description)
+                for name, data, description in attachments
+            ]
 
         mode = {
             "image2image": " (img2img)",
@@ -160,6 +190,8 @@ def create_dream_callbacks(
         if context.scheduler:
             embed.add_field(name="Scheduler", value=f"`{context.scheduler}`", inline=True)
         embed.set_image(url="attachment://dream.png")
+        if thumbnail is not None:
+            embed.set_thumbnail(url="attachment://input.png")
         embed.set_footer(
             text=f"Requested by {context.ctx.author.name} • React ❌ to delete",
             icon_url=context.ctx.author.avatar.url if context.ctx.author.avatar else None,
@@ -167,16 +199,16 @@ def create_dream_callbacks(
 
         if context.status_message:
             try:
-                await context.status_message.edit(content=None, embed=embed, file=file)
+                await context.status_message.edit(content=None, embed=embed, files=create_files())
                 await context.status_message.add_reaction("❌")
             except discord.errors.NotFound:
-                msg = await context.ctx.followup.send(embed=embed, file=file)
+                msg = await context.ctx.followup.send(embed=embed, files=create_files())
                 try:
                     await msg.add_reaction("❌")  # type: ignore[union-attr]
                 except discord.errors.Forbidden:
                     pass
         else:
-            msg = await context.ctx.followup.send(embed=embed, file=file)
+            msg = await context.ctx.followup.send(embed=embed, files=create_files())
             try:
                 await msg.add_reaction("❌")  # type: ignore[union-attr]
             except discord.errors.Forbidden:

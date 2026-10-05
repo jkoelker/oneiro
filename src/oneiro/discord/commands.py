@@ -426,6 +426,7 @@ def register_commands(bot: "OneiroBot") -> None:
             is_inpaint=workflow == "inpainting",
             strength=strength,
             pipeline_manager=ctx.bot.pipeline_manager,  # type: ignore[arg-type]
+            input_image=image_inputs.get("init_image", image_inputs.get("reference_image")),
         )
         on_start, on_position_update, on_complete = create_dream_callbacks(dream_context)
 
