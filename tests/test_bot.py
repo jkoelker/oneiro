@@ -699,6 +699,179 @@ async def test_completion_uses_actual_workflow_and_model(
         assert fields["Strength"] == f"{strength:.2f}"
 
 
+@pytest.mark.parametrize("delivery", ["send", "edit", "missing"])
+@pytest.mark.parametrize(
+    "source", [None, "image", "cmyk", "transparent", "gray16", "reference_image", "inpainting"]
+)
+async def test_dream_completion_attaches_input_thumbnail(source: str | None, delivery: str) -> None:
+    """Dropping either input handoff or thumbnail uploads breaks the actual completion payload."""
+    ctx = await _dream_context()
+    delivered: list[tuple[dict[str, Any], dict[str, bytes]]] = []
+
+    def consume_upload(kwargs: dict[str, Any]) -> tuple[dict[str, Any], dict[str, bytes]]:
+        """Serialize the real Discord payload and consume streams like an HTTP upload."""
+        params = handle_message_parameters(**kwargs)
+        assert params.multipart is not None
+        payload = json.loads(params.multipart[0]["value"])
+        contents = {part["filename"]: part["value"].read() for part in params.multipart[1:]}
+        for file in params.files or []:
+            file.close()
+        return payload, contents
+
+    async def edit(**kwargs: Any) -> None:
+        upload = consume_upload(kwargs)
+        if delivery == "missing":
+            raise discord.errors.NotFound(
+                SimpleNamespace(status=404, reason="Not Found"),
+                {"message": "Unknown Message", "code": 10008},
+            )
+        delivered.append(upload)
+
+    message = SimpleNamespace(edit=edit, add_reaction=AsyncMock())
+
+    async def send(content: str | None = None, **kwargs: Any) -> Any:
+        if "embed" in kwargs:
+            delivered.append(consume_upload(kwargs))
+        return message
+
+    ctx.followup.send = send
+    if delivery != "send":
+        ctx.bot.generation_queue.add(user_id=0, request={}, callback=AsyncMock())
+
+    inputs: dict[str, Any] = {}
+    workflow = "text2image"
+    if source is not None:
+        buffer = io.BytesIO()
+        format = {
+            "image": "JPEG",
+            "cmyk": "JPEG",
+            "transparent": "PNG",
+            "gray16": "PNG",
+            "reference_image": "WEBP",
+            "inpainting": "PNG",
+        }[source]
+        image = Image.new("RGB", (1024, 512), "blue")
+        if source == "cmyk":
+            image = image.convert("CMYK")
+        elif source == "transparent":
+            image = image.convert("RGBA")
+            image.putalpha(128)
+        elif source == "gray16":
+            image = Image.new("I;16", (1024, 512), 65535)
+        image.save(buffer, format=format)
+        option = "image" if source in {"inpainting", "cmyk", "transparent", "gray16"} else source
+        inputs[option] = _attachment(
+            buffer.getvalue(),
+            filename=f"source.{format.lower()}",
+            content_type=f"image/{format.lower()}",
+        )
+        workflow = {
+            "image": "image2image",
+            "cmyk": "image2image",
+            "transparent": "image2image",
+            "gray16": "image2image",
+            "reference_image": "reference",
+            "inpainting": "inpainting",
+        }[source]
+        if source == "gray16":
+            accepted = ctx.bot.pipeline_manager.pipeline._load_init_image(buffer.getvalue())
+            assert accepted.mode == "RGB" and accepted.size == (1024, 512)
+        if source == "inpainting":
+            mask_buffer = io.BytesIO()
+            Image.new("RGB", (1024, 512), "red").save(mask_buffer, format="PNG")
+            inputs["mask"] = _attachment(mask_buffer.getvalue())
+
+    await _register_test_commands()["dream"](ctx, "prompt", **inputs)
+    pending = ctx.bot.generation_queue._pending_requests[-1]
+    result = GenerationResult(
+        Image.new("RGB", (32, 32), "red"),
+        7,
+        "prompt",
+        None,
+        32,
+        32,
+        8,
+        0.0,
+        workflow=workflow,
+    )
+    await pending.callback(result)
+
+    assert len(delivered) == 1
+    payload, contents = delivered[0]
+    embed = payload["embeds"][0]
+    generated = embed["image"]["url"].removeprefix("attachment://")
+    with Image.open(io.BytesIO(contents[generated])) as output:
+        assert output.size == (32, 32) and output.getpixel((0, 0)) == (255, 0, 0)
+    if source is None:
+        assert "thumbnail" not in embed and len(contents) == 1
+    else:
+        thumbnail = embed["thumbnail"]["url"].removeprefix("attachment://")
+        assert thumbnail != generated and len(contents) == 2
+        assert len(contents[thumbnail]) < 256 * 1024
+        with Image.open(io.BytesIO(contents[thumbnail])) as preview:
+            assert max(preview.size) <= 256 and preview.width == 2 * preview.height
+            red, green, blue = preview.convert("RGB").getpixel((0, 0))
+            if source == "gray16":
+                assert (red, green, blue) == (255, 255, 255)
+            else:
+                assert red < 5 and green < 5 and blue > 250
+            if source == "transparent":
+                assert preview.getpixel((0, 0)) == (0, 0, 255, 128)
+
+
+@pytest.mark.parametrize("delivery", ["send", "edit", "missing"])
+@pytest.mark.parametrize(
+    "error",
+    [ValueError("preview failed"), OSError("preview failed"), RuntimeError("preview failed")],
+)
+async def test_thumbnail_failure_preserves_successful_queue_result(
+    delivery: str,
+    error: Exception,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """An optional preview must not send a successful generation through the queue error path."""
+    ctx = await _dream_context()
+    pipeline = ctx.bot.pipeline_manager.pipeline
+    pipeline.pipe = pipeline.blocks.init_pipeline()
+    monkeypatch.setattr(
+        pipeline,
+        "run_inference",
+        lambda *args: {"images": [Image.new("RGB", (32, 32), "red")]},
+    )
+
+    def fail_preview(data: bytes) -> bytes:
+        raise error
+
+    monkeypatch.setattr("oneiro.discord.handlers._input_thumbnail", fail_preview)
+    queue = ctx.bot.generation_queue
+    queue._pipeline = ctx.bot.pipeline_manager
+    if delivery != "send":
+        queue.add(user_id=0, request={}, callback=AsyncMock())
+    await _register_test_commands()["dream"](
+        ctx,
+        "prompt",
+        image=_attachment(_image_bytes()),
+        width=32,
+        height=32,
+    )
+    status_message = ctx.followup.send.return_value
+    if delivery == "missing":
+        status_message.edit.side_effect = discord.errors.NotFound(
+            SimpleNamespace(status=404, reason="Not Found"),
+            {"message": "Unknown Message", "code": 10008},
+        )
+    ctx.followup.send.reset_mock()
+    await queue._process_request(queue._pending_requests[-1])
+    response = (status_message.edit if delivery == "edit" else ctx.followup.send).await_args.kwargs
+    assert "thumbnail" not in response["embed"].to_dict()
+    assert len(response["files"]) == 1
+    assert response["files"][0].filename == "dream.png"
+    with Image.open(response["files"][0].fp) as generated:
+        assert generated.size == (32, 32) and generated.getpixel((0, 0)) == (255, 0, 0)
+    assert "preview failed" in capsys.readouterr().out
+
+
 @pytest.mark.parametrize("failure", ["size", "type", "read", "decode", "format", "pixels"])
 async def test_reference_attachment_trust_boundaries(
     failure: str, monkeypatch: pytest.MonkeyPatch
