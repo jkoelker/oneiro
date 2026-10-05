@@ -2,6 +2,9 @@
 
 import asyncio
 import io
+import os
+import subprocess
+import sys
 import threading
 from pathlib import Path
 from typing import Any
@@ -10,6 +13,7 @@ from unittest.mock import AsyncMock, MagicMock, Mock, patch
 import pytest
 import torch
 from PIL import Image
+from pillow_heif import from_pillow
 
 from oneiro.device import DevicePolicy, OffloadMode, OffloadType
 from oneiro.pipelines import PipelineManager
@@ -1171,8 +1175,96 @@ class TestBasePipelineLoadInitImage:
         """Pillow support alone does not make GIF an accepted attachment."""
         buffer = io.BytesIO()
         Image.new("RGB", (8, 8)).save(buffer, format="GIF")
-        with pytest.raises(ValueError, match="PNG, JPEG, or WebP"):
+        with pytest.raises(ValueError, match="Image attachment must be"):
             ConcretePipeline()._load_init_image(buffer.getvalue())
+
+    @pytest.mark.parametrize("brand", [b"heic", b"mif1"])
+    def test_heif_with_non_utf8_metadata_type_does_not_crash(self, brand: bytes) -> None:
+        """A crafted metadata type cannot kill decoding, including generic HEIF brands."""
+        exif = Image.Exif()
+        exif[274] = 6
+        exif[271] = "Apple"
+        buffer = io.BytesIO()
+        from_pillow(Image.new("RGB", (64, 32), "blue")).save(
+            buffer, quality=90, exif=exif.tobytes()
+        )
+        data = bytearray(buffer.getvalue())
+        data[8:12] = brand
+        data[data.index(b"Exif\x00", data.index(b"iinf"))] = 0x80
+        _assert_image_decodes_in_subprocess(bytes(data), (32, 64))
+
+    @pytest.mark.parametrize("brand", [b"avif", b"mif1"])
+    def test_avif_brands_reach_native_decoder(self, brand: bytes) -> None:
+        """Generic mif1 AVIF must not be claimed by a HEIF plugin lacking AV1 support."""
+        buffer = io.BytesIO()
+        Image.new("RGB", (64, 32), "blue").save(
+            buffer, format="AVIF", quality=100, speed=10, max_threads=1
+        )
+        data = bytearray(buffer.getvalue())
+        data[8:12] = brand
+        _assert_image_decodes_in_subprocess(bytes(data), (64, 32))
+
+    @pytest.mark.parametrize("stage", ["open", "load"])
+    @pytest.mark.parametrize("error_type", [SyntaxError, RuntimeError, EOFError, ValueError])
+    def test_codec_errors_are_normalized_without_leaking_details(
+        self, stage: str, error_type: type[Exception], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Known codec exceptions from open or lazy decode share the invalid-image contract."""
+        buffer = io.BytesIO()
+        Image.new("RGB", (8, 8)).save(buffer, format="PNG")
+        original_open = Image.open
+
+        def fail_decode(*args: Any, **kwargs: Any) -> Any:
+            raise error_type("native decoder implementation details")
+
+        def open_with_broken_load(*args: Any, **kwargs: Any) -> Image.Image:
+            image = original_open(*args, **kwargs)
+            image.load = fail_decode
+            return image
+
+        monkeypatch.setattr(
+            Image, "open", fail_decode if stage == "open" else open_with_broken_load
+        )
+        with pytest.raises(ValueError, match="Invalid image attachment") as caught:
+            ConcretePipeline()._load_init_image(buffer.getvalue())
+        assert "native decoder" not in str(caught.value)
+
+
+def _assert_image_decodes_in_subprocess(contents: bytes, size: tuple[int, int]) -> None:
+    """Exercise fresh plugin registration and contain native crashes outside pytest."""
+    script = """
+import io, os, sys
+if os.name == "posix":
+    import resource
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+from PIL import Image
+from tests.test_pipelines_base import ConcretePipeline
+from oneiro.discord.handlers import _input_thumbnail
+contents = sys.stdin.buffer.read()
+expected_size = tuple(map(int, sys.argv[1:]))
+decoded = ConcretePipeline()._load_init_image(contents)
+assert decoded.mode == "RGB" and decoded.size == expected_size
+with Image.open(io.BytesIO(_input_thumbnail(contents))) as preview:
+    assert preview.format == "PNG" and preview.mode == "RGBA"
+    assert preview.size == expected_size
+    for image in (decoded, preview):
+        r, g, b = image.convert("RGB").getpixel((8, 8))
+        assert r < 10 and g < 10 and b > 245
+"""
+    result = subprocess.run(
+        [sys.executable, "-X", "faulthandler", "-c", script, *map(str, size)],
+        input=contents,
+        capture_output=True,
+        timeout=30,
+        cwd=Path(__file__).resolve().parents[1],
+        env={
+            **os.environ,
+            "HF_HUB_OFFLINE": "1",
+            "TRANSFORMERS_OFFLINE": "1",
+            "CUDA_VISIBLE_DEVICES": "-1",
+        },
+    )
+    assert result.returncode == 0, (result.returncode, result.stderr.decode(errors="replace"))
 
 
 class TestBasePipelineLifecycle:

@@ -153,9 +153,12 @@ Masks require `image`; reference and initial/mask images cannot be combined. Ref
 `image_conditioned` workflows reject denoising strength rather than treating it as conditioning
 weight. Explicit zero strength is invalid, including before attachment reads or resource work.
 Discord exposes one `reference_image`; the backend accepts multiple ordered references for
-native workflows that support them. Attachments must be PNG/JPEG/WebP, at most 25 MiB each,
-and at most `4096 * 4096` decoded pixels. Completion metadata reports the actual execution
-model/workflow and shows strength only for denoising workflows.
+native workflows that support them. Attachments can be PNG, JPEG, WebP, HEIC/HEIF, AVIF,
+TIFF, or BMP, at most 25 MiB each and at most `4096 * 4096` decoded pixels. Image orientation
+is preserved; multi-image files use the HEIF primary image or the first TIFF/AVIF frame.
+JPEG phone photos with MPF/MPO secondary images use their primary (first) image.
+Generated results and input thumbnails are PNG. Completion metadata reports the actual
+execution model/workflow and shows strength only for denoising workflows.
 
 ### LoRA Usage
 
@@ -232,6 +235,7 @@ podman run --rm -i --network=none \
 
 The smoke check imports the **installed** package, native blocks, backport and quantization
 modules, verifies one unchanged CUDA-enabled Torch distribution and packaged license/provenance,
+checks native AVIF support and the maintained HEIF codec,
 and runs `uv pip check --system`. It loads no model assets, connects no bot, mounts no production
 config, and allocates no GPU. The wheel gate builds offline using installed Setuptools:
 
@@ -259,3 +263,8 @@ the native replacements; then switch the local imports and remove its modules/pa
 
 Oneiro: MIT - see [LICENSE](LICENSE). The local Krea-derived code retains Apache-2.0 notices
 and provenance as linked above. Model repository licenses are separate.
+
+HEIF decoding uses maintained `pillow-heif` (BSD-3-Clause Python code). Its binary wheels
+are distributed under GPLv2 because they bundle the x265 encoder; bundled libheif and
+libde265 are LGPLv3. The runtime image includes this dependency. Bundled codec licenses
+and source references ship in its installed distribution.

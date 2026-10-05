@@ -52,8 +52,29 @@ if TYPE_CHECKING:
 
 
 MAX_DREAM_ATTACHMENT_BYTES = 25 * 1024 * 1024
-IMAGE_ATTACHMENT_CONTENT_TYPES = ("image/png", "image/jpeg", "image/webp")
-IMAGE_ATTACHMENT_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp")
+IMAGE_ATTACHMENT_CONTENT_TYPES = (
+    "image/png",
+    "image/jpeg",
+    "image/webp",
+    "image/heic",
+    "image/heif",
+    "image/avif",
+    "image/tiff",
+    "image/bmp",
+    "image/x-ms-bmp",
+)
+IMAGE_ATTACHMENT_EXTENSIONS = (
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".webp",
+    ".heic",
+    ".heif",
+    ".avif",
+    ".tif",
+    ".tiff",
+    ".bmp",
+)
 
 
 def slugify(text: str) -> str:
@@ -133,7 +154,7 @@ def validate_image_attachment(attachment: discord.Attachment, label: str) -> str
     )
     has_image_extension = filename.endswith(IMAGE_ATTACHMENT_EXTENSIONS)
     if not has_image_type and not has_image_extension:
-        return f"❌ {label} must be a PNG, JPEG, or WebP image."
+        return f"❌ {label} must be a PNG, JPEG, WebP, HEIC/HEIF, AVIF, TIFF, or BMP image."
 
     return None
 
