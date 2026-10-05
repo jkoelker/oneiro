@@ -65,7 +65,7 @@ class TestDreamAttachmentValidation:
         error = validate_image_attachment(attachment, "mask")
 
         assert error is not None
-        assert "PNG, JPEG, or WebP" in error
+        assert "HEIC/HEIF" in error
 
 
 @pytest.mark.parametrize("steps,guidance", [(28, 4.5), (4, 1.0), (8, 0.0)])

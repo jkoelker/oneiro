@@ -11,12 +11,25 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
-from PIL import Image, UnidentifiedImageError
+from PIL import Image, ImageOps, UnidentifiedImageError
+from pillow_heif import register_heif_opener
 
 from oneiro.device import DevicePolicy, OffloadType
 
+Image.init()  # Native AVIF must see mif1-branded files before the HEIF opener.
+register_heif_opener(thumbnails=False)
+
 MAX_INPUT_IMAGE_PIXELS = 4096 * 4096
 MAX_INPUT_IMAGE_BYTES = 25 * 1024 * 1024
+_IMAGE_DECODE_ERRORS = (
+    Image.DecompressionBombError,
+    UnidentifiedImageError,
+    OSError,
+    SyntaxError,
+    RuntimeError,
+    EOFError,
+    ValueError,
+)
 
 
 def get_generation_defaults(pipeline: Any) -> tuple[int, float]:
@@ -363,18 +376,29 @@ class BasePipeline(ABC):
         if len(init_image) > MAX_INPUT_IMAGE_BYTES:
             raise ValueError("Image attachment exceeds the 25 MiB limit")
         try:
-            with Image.open(io.BytesIO(init_image)) as image:
-                if image.format not in {"PNG", "JPEG", "WEBP"}:
-                    raise ValueError("Image attachment must be PNG, JPEG, or WebP")
-                width, height = image.size
-                if width * height > MAX_INPUT_IMAGE_PIXELS:
-                    raise ValueError(
-                        f"Input image is too large ({width}×{height}); "
-                        "maximum supported size is 4096×4096"
-                    )
-                return image.convert("RGB")
-        except (Image.DecompressionBombError, UnidentifiedImageError, OSError) as e:
+            image = Image.open(io.BytesIO(init_image))
+        except _IMAGE_DECODE_ERRORS as e:
             raise ValueError("Invalid image attachment; upload a valid image file") from e
+        with image:
+            if image.format not in {"PNG", "JPEG", "MPO", "WEBP", "HEIF", "AVIF", "TIFF", "BMP"}:
+                raise ValueError(
+                    "Image attachment must be PNG, JPEG, WebP, HEIC/HEIF, AVIF, TIFF, or BMP"
+                )
+            width, height = image.size
+            if width * height > MAX_INPUT_IMAGE_PIXELS:
+                raise ValueError(
+                    f"Input image is too large ({width}×{height}); "
+                    "maximum supported size is 4096×4096"
+                )
+            try:
+                image.load()
+                try:
+                    image = ImageOps.exif_transpose(image)
+                except Exception:
+                    pass  # Malformed optional metadata must not discard valid pixels.
+                return image.convert("RGB")
+            except _IMAGE_DECODE_ERRORS as e:
+                raise ValueError("Invalid image attachment; upload a valid image file") from e
 
     def _configure_cpu_threads(self, utilization: float = 0.75) -> int:
         """Configure PyTorch CPU threading for optimal performance.

@@ -4,6 +4,7 @@ import asyncio
 import io
 import json
 import socket
+import struct
 import threading
 import zlib
 from collections.abc import Callable
@@ -19,6 +20,7 @@ import respx
 import torch
 from discord.webhook.async_ import handle_message_parameters
 from PIL import Image
+from pillow_heif import from_pillow
 
 from oneiro.civitai import CivitaiClient, CivitaiError, ModelVersion
 from oneiro.config import Config
@@ -115,10 +117,15 @@ def _attachment(contents: bytes = b"image", **metadata: Any) -> Any:
     return attachment
 
 
-def _image_bytes(format: str = "PNG") -> bytes:
+def _image_bytes(format: str = "PNG", *, image: Image.Image | None = None, **options: Any) -> bytes:
     """Encode a bounded local upload fixture."""
     buffer = io.BytesIO()
-    Image.new("RGB", (8, 8), "blue").save(buffer, format=format)
+    image = image if image is not None else Image.new("RGB", (8, 8), "blue")
+    if format == "HEIF":
+        # Direct encoding must not register the Pillow opener for the application.
+        from_pillow(image).save(buffer, quality=100, **options)
+    else:
+        image.save(buffer, format=format, **options)
     return buffer.getvalue()
 
 
@@ -872,7 +879,227 @@ async def test_thumbnail_failure_preserves_successful_queue_result(
     assert "preview failed" in capsys.readouterr().out
 
 
-@pytest.mark.parametrize("failure", ["size", "type", "read", "decode", "format", "pixels"])
+@pytest.mark.parametrize(
+    ("format", "extension", "content_type"),
+    [
+        ("HEIF", "heic", "image/heic"),
+        ("HEIF", "heif", "image/heif"),
+        ("AVIF", "avif", "image/avif"),
+        ("TIFF", "tif", "image/tiff"),
+        ("TIFF", "tiff", "image/tiff"),
+        ("BMP", "bmp", "image/bmp"),
+    ],
+)
+@pytest.mark.parametrize("option", ["image", "reference_image", "mask"])
+@pytest.mark.parametrize("metadata", ["extension", "mime"])
+async def test_dream_new_image_formats_reach_inference_and_preview(
+    format: str,
+    extension: str,
+    content_type: str,
+    option: str,
+    metadata: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Real codecs and the queue preserve orientation, alpha and RGB model inputs."""
+    ctx = await _dream_context()
+    pipeline = ctx.bot.pipeline_manager.pipeline
+    pipeline.pipe = pipeline.blocks.init_pipeline()
+    image = Image.new("RGB" if format == "BMP" else "RGBA", (64, 32), "blue")
+    image.paste("red", (0, 0, 32, 32))
+    options: dict[str, Any] = {}
+    if format != "BMP":
+        image.putalpha(128)
+        exif = Image.Exif()
+        exif[274] = 6  # The left red half becomes the top half after a clockwise rotation.
+        options["exif"] = exif.tobytes()
+    if format == "AVIF":
+        options.update(quality=100, max_threads=1, speed=10)
+    contents = _image_bytes(format, image=image, **options)
+    attachment = _attachment(
+        contents,
+        filename=f"phone.{extension.upper()}" if metadata == "extension" else "upload.bin",
+        content_type=None if metadata == "extension" else content_type,
+    )
+    expected_size = (64, 32) if format == "BMP" else (32, 64)
+
+    def assert_oriented(decoded: Image.Image) -> None:
+        assert decoded.size == expected_size
+        first = decoded.convert("RGB").getpixel((8, 8))
+        last = decoded.convert("RGB").getpixel((expected_size[0] - 8, expected_size[1] - 8))
+        assert first[0] > 245 and first[1] < 10 and first[2] < 10
+        assert last[0] < 10 and last[1] < 10 and last[2] > 245
+        assert decoded.getexif().get(274, 1) == 1
+
+    inferred: list[Image.Image] = []
+
+    def infer(values: dict[str, Any], is_img2img: bool) -> dict[str, Any]:
+        key = {"image": "image", "reference_image": "reference_image", "mask": "mask_image"}[option]
+        decoded = values[key]
+        assert decoded.mode == "RGB"
+        assert_oriented(decoded)
+        if option == "mask":
+            assert_oriented(values["image"])
+        inferred.append(decoded)
+        return {"images": [Image.new("RGB", (32, 32), "green")]}
+
+    monkeypatch.setattr(pipeline, "run_inference", infer)
+    inputs = {option: attachment}
+    if option == "mask":
+        inputs["image"] = _attachment(
+            _image_bytes(
+                "PNG",
+                image=image,
+                **{key: value for key, value in options.items() if key == "exif"},
+            )
+        )
+    await _register_test_commands()["dream"](ctx, "prompt", width=32, height=32, **inputs)
+    queue = ctx.bot.generation_queue
+    assert len(queue._pending_requests) == 1
+    queue._pipeline = ctx.bot.pipeline_manager
+    ctx.followup.send.reset_mock()
+    await queue._process_request(queue._pending_requests[0])
+    assert len(inferred) == 1
+    response = ctx.followup.send.await_args.kwargs
+    params = handle_message_parameters(**response)
+    payload = json.loads(params.multipart[0]["value"])
+    uploads = {part["filename"]: part["value"].read() for part in params.multipart[1:]}
+    for file in params.files or []:
+        file.close()
+    assert payload["embeds"][0]["thumbnail"]["url"] == "attachment://input.png"
+    with Image.open(io.BytesIO(uploads["dream.png"])) as generated:
+        assert generated.format == "PNG" and generated.getpixel((0, 0)) == (0, 128, 0)
+    with Image.open(io.BytesIO(uploads["input.png"])) as preview:
+        assert_oriented(preview)
+        if format != "BMP":
+            assert preview.mode == "RGBA" and preview.getpixel((8, 8))[3] == 128
+
+
+@pytest.mark.parametrize("format", ["PNG", "JPEG", "WEBP"])
+@pytest.mark.parametrize("option", ["image", "reference_image"])
+@pytest.mark.parametrize("metadata_error", [None, struct.error, AttributeError])
+async def test_malformed_exif_keeps_valid_pixels_and_thumbnail(
+    format: str,
+    option: str,
+    metadata_error: type[Exception] | None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Optional EXIF cannot reject pixels or suppress the input preview."""
+    ctx = await _dream_context()
+    pipeline = ctx.bot.pipeline_manager.pipeline
+    pipeline.pipe = pipeline.blocks.init_pipeline()
+    contents = _image_bytes(format, exif=b"Exif\x00\x00\x00\x01\x02\x03garbage", dpi=(72, 72))
+    inferred: list[Image.Image] = []
+
+    def infer(values: dict[str, Any], is_img2img: bool) -> dict[str, Any]:
+        decoded = values["image" if option == "image" else "reference_image"]
+        assert decoded.mode == "RGB" and decoded.size == (8, 8)
+        r, g, b = decoded.getpixel((0, 0))
+        assert r < 10 and g < 10 and b > 245
+        inferred.append(decoded)
+        return {"images": [Image.new("RGB", (32, 32), "red")]}
+
+    if metadata_error is not None:
+
+        def fail_orientation(image: Image.Image) -> Image.Image:
+            raise metadata_error("corrupt EXIF")
+
+        monkeypatch.setattr("PIL.ImageOps.exif_transpose", fail_orientation)
+    monkeypatch.setattr(pipeline, "run_inference", infer)
+    await _register_test_commands()["dream"](
+        ctx,
+        "prompt",
+        width=32,
+        height=32,
+        **{
+            option: _attachment(
+                contents, filename=f"phone.{format.lower()}", content_type=f"image/{format.lower()}"
+            )
+        },
+    )
+    queue = ctx.bot.generation_queue
+    queue._pipeline = ctx.bot.pipeline_manager
+    ctx.followup.send.reset_mock()
+    await queue._process_request(queue._pending_requests[0])
+    assert len(inferred) == 1
+    response = ctx.followup.send.await_args.kwargs
+    assert response["embed"].thumbnail.url == "attachment://input.png"
+    uploads = {file.filename: file.fp.read() for file in response["files"]}
+    with Image.open(io.BytesIO(uploads["input.png"])) as preview:
+        assert preview.size == (8, 8)
+        r, g, b = preview.convert("RGB").getpixel((0, 0))
+        assert r < 10 and g < 10 and b > 245
+    with Image.open(io.BytesIO(uploads["dream.png"])) as generated:
+        assert generated.size == (32, 32) and generated.getpixel((0, 0)) == (255, 0, 0)
+
+
+@pytest.mark.parametrize("format", ["HEIF", "AVIF", "TIFF", "BMP"])
+@pytest.mark.parametrize("limit", ["bytes", "pixels"])
+async def test_new_image_formats_retain_decode_limits(
+    format: str, limit: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """New codecs cannot bypass the existing attachment byte or decoded-pixel boundary."""
+    ctx = await _dream_context()
+    contents = _image_bytes(format)
+    constant, maximum, message = (
+        ("MAX_INPUT_IMAGE_BYTES", len(contents) - 1, "25 MiB")
+        if limit == "bytes"
+        else ("MAX_INPUT_IMAGE_PIXELS", 63, "Input image is too large")
+    )
+    monkeypatch.setattr(f"oneiro.pipelines.base.{constant}", maximum)
+    with pytest.raises(ValueError, match=message):
+        ctx.bot.pipeline_manager.pipeline._load_init_image(contents)
+
+
+@pytest.mark.parametrize("format", ["HEIF", "TIFF", "AVIF", "MPO"])
+async def test_multiframe_upload_selects_primary_or_first_still(format: str) -> None:
+    """A phone JPG with an MPF secondary image uses its first still, like TIFF/AVIF."""
+    blue = Image.new("RGB", (64, 32), "blue")
+    red = Image.new("RGB", (64, 32), "red")
+    if format == "HEIF":
+        container = from_pillow(red)
+        container.add_from_pillow(blue)
+        buffer = io.BytesIO()
+        container.save(buffer, save_all=True, primary_index=1, quality=100)
+        contents = buffer.getvalue()
+    else:
+        contents = _image_bytes(format, image=blue, save_all=True, append_images=[red])
+    ctx = await _dream_context()
+    pipeline = ctx.bot.pipeline_manager.pipeline
+    pipeline.pipe = pipeline.blocks.init_pipeline()
+    inferred: list[Image.Image] = []
+
+    def infer(values: dict[str, Any], is_img2img: bool) -> dict[str, Any]:
+        inferred.append(values["image"])
+        return {"images": [Image.new("RGB", (32, 32), "red")]}
+
+    pipeline.run_inference = infer
+    extension = "jpg" if format == "MPO" else format.lower()
+    content_type = "image/jpeg" if format == "MPO" else f"image/{format.lower()}"
+    await _register_test_commands()["dream"](
+        ctx,
+        "prompt",
+        image=_attachment(contents, filename=f"phone.{extension}", content_type=content_type),
+        width=32,
+        height=32,
+    )
+    queue = ctx.bot.generation_queue
+    queue._pipeline = ctx.bot.pipeline_manager
+    ctx.followup.send.reset_mock()
+    await queue._process_request(queue._pending_requests[0])
+    assert len(inferred) == 1
+    response = ctx.followup.send.await_args.kwargs
+    assert response["embed"].thumbnail.url == "attachment://input.png"
+    preview_file = next(file for file in response["files"] if file.filename == "input.png")
+    with Image.open(preview_file.fp) as preview:
+        for image in (inferred[0], preview):
+            assert image.size == (64, 32)
+            r, g, b = image.convert("RGB").getpixel((8, 8))
+            assert r < 10 and g < 10 and b > 245
+
+
+@pytest.mark.parametrize(
+    "failure", ["size", "type", "read", "decode", "format", "pixels", "avif", "heif"]
+)
 async def test_reference_attachment_trust_boundaries(
     failure: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -883,6 +1110,8 @@ async def test_reference_attachment_trust_boundaries(
         if failure == "decode"
         else _image_bytes("GIF" if failure == "format" else "PNG")
     )
+    if failure in {"avif", "heif"}:
+        contents = _image_bytes(failure.upper())[:-1]
     if failure == "pixels":
         # Give Pillow a real oversized IHDR without allocating a 16-megapixel fixture.
         header = bytearray(contents)
@@ -890,7 +1119,7 @@ async def test_reference_attachment_trust_boundaries(
         header[20:24] = (4096).to_bytes(4, "big")
         header[29:33] = zlib.crc32(header[12:29]).to_bytes(4, "big")
         contents = bytes(header)
-    reference = _attachment(contents)
+    reference = _attachment(contents, filename="phone.heic", content_type="image/heic")
     if failure == "size":
         reference.size = MAX_DREAM_ATTACHMENT_BYTES + 1
     elif failure == "type":
@@ -906,7 +1135,7 @@ async def test_reference_attachment_trust_boundaries(
         ctx.bot.generation_queue.add.assert_not_called()
         if failure != "read":
             reference.read.assert_not_awaited()
-            reason = "25 MiB or smaller" if failure == "size" else "PNG, JPEG, or WebP"
+            reason = "25 MiB or smaller" if failure == "size" else "HEIC/HEIF"
             assert reason in ctx.followup.send.await_args.args[0]
         else:
             response = ctx.followup.send.await_args.kwargs
@@ -931,8 +1160,10 @@ async def test_reference_attachment_trust_boundaries(
         assert "Traceback" not in public and "SUPER_SECRET" not in public
         reason = {
             "decode": "Invalid image attachment",
-            "format": "PNG, JPEG, or WebP",
+            "format": "Image attachment must be",
             "pixels": "maximum supported size is 4096×4096",
+            "avif": "Invalid image attachment",
+            "heif": "Invalid image attachment",
         }[failure]
         assert reason in public
 

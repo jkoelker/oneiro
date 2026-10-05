@@ -19,6 +19,7 @@ from diffusers import (
     StableDiffusionXLAutoBlocks,
     ZImageAutoBlocks,
 )
+from PIL import features
 
 import oneiro
 from oneiro.pipelines.backports import krea2
@@ -67,9 +68,12 @@ def main() -> None:
         "gguf",
         "kernels",
         "peft",
+        "pillow_heif",
     ):
         importlib.import_module(name)
         print("Import:", name, "OK")
+    assert features.check("avif"), "Runtime Pillow must support AVIF decoding"
+    print("Image codecs: native AVIF enabled, maintained HEIF codec installed")
     for graph in (
         FluxAutoBlocks,
         Flux2AutoBlocks,

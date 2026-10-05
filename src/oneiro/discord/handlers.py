@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import discord
-from PIL import Image
+from PIL import Image, ImageOps
 
 from oneiro.pipelines import GenerationResult, LoraConfig
 
@@ -42,6 +42,11 @@ def format_exception_response(prefix: str, error: BaseException) -> dict[str, An
 def _input_thumbnail(image_data: bytes) -> bytes:
     """Encode a small preview of the input already validated during generation."""
     with Image.open(io.BytesIO(image_data)) as image:
+        image.load()
+        try:
+            image = ImageOps.exif_transpose(image)
+        except Exception:
+            pass  # Keep the same best-effort orientation as the model input.
         image = image.convert("RGBA")
         image.thumbnail((256, 256))
         buffer = io.BytesIO()
