@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import discord
+from discord.components import Thumbnail as ThumbnailComponent
 from PIL import Image, ImageOps
 
 from oneiro.pipelines import GenerationResult, LoraConfig
@@ -20,6 +21,18 @@ if TYPE_CHECKING:
 
 
 _TOKEN_PATTERN = re.compile(r"([?&]token=)[^&\s'\"`]+", re.IGNORECASE)
+
+
+class _SpoilerThumbnail(discord.ui.Thumbnail):
+    """Preserve the spoiler setting when Pycord serializes a nested thumbnail."""
+
+    def _generate_underlying(self, **kwargs: Any) -> ThumbnailComponent:
+        """Keep Pycord's saved state rather than its default False override."""
+        # Source: https://github.com/Pycord-Development/pycord/blob/v2.8.1/discord/ui/thumbnail.py#L92
+        # Local tracking: https://github.com/jkoelker/oneiro/pull/154 (upstream filing deferred).
+        # ponytail: private Pycord hook; remove when upstream preserves the spoiler flag.
+        kwargs.setdefault("spoiler", None)
+        return super()._generate_underlying(**kwargs)
 
 
 def _sanitize_error_text(text: str) -> str:
@@ -137,7 +150,7 @@ def create_dream_callbacks(
 
         elapsed = time.time() - context.start_time
         image_buffer = context.pipeline_manager.image_to_bytes(result.image)
-        attachments = [("dream.png", image_buffer.getvalue(), "Generated image")]
+        attachments = [("SPOILER_dream.png", image_buffer.getvalue(), "Generated image")]
         thumbnail: bytes | None = None
         if context.input_image is not None:
             try:
@@ -147,12 +160,14 @@ def create_dream_callbacks(
                     f"Warning: Failed to create input thumbnail: {_sanitize_error_text(str(error))}"
                 )
             else:
-                attachments.append(("input.png", thumbnail, "Input image used for generation"))
+                attachments.append(
+                    ("SPOILER_input.png", thumbnail, "Input image used for generation")
+                )
 
         def create_files() -> list[discord.File]:
             """Discord upload streams are single-use, including failed message edits."""
             return [
-                discord.File(io.BytesIO(data), filename=name, description=description)
+                discord.File(io.BytesIO(data), filename=name, description=description, spoiler=True)
                 for name, data, description in attachments
             ]
 
@@ -162,58 +177,83 @@ def create_dream_callbacks(
             "reference": " (reference)",
             "image_conditioned": " (image conditioned)",
         }.get(result.workflow, "")
-        embed = discord.Embed(title="🎨 Dream Generated" + mode, color=discord.Color.purple())
-        embed.add_field(name="Prompt", value=context.prompt[:1024], inline=False)
+        heading = f"## 🎨 Dream Generated{mode}\n**Prompt:**\n{context.prompt[:1024]}"
         if context.negative_prompt:
-            embed.add_field(
-                name="Negative Prompt",
-                value=context.negative_prompt[:1024],
-                inline=False,
-            )
-        embed.add_field(name="Size", value=f"{result.width}×{result.height}", inline=True)
-        embed.add_field(name="Seed", value=str(result.seed), inline=True)
-        embed.add_field(name="Time", value=f"{elapsed:.1f}s", inline=True)
-        embed.add_field(
-            name="Model", value=f"`{result.model_name or context.current_model}`", inline=True
-        )
-        embed.add_field(name="Steps", value=str(result.steps), inline=True)
-        embed.add_field(name="CFG", value=f"{result.guidance_scale:.1f}", inline=True)
+            heading += f"\n**Negative Prompt:**\n{context.negative_prompt[:1024]}"
+        details = [
+            f"**Size:** {result.width}×{result.height} · **Seed:** {result.seed} · **Time:** {elapsed:.1f}s",
+            f"**Model:** `{(result.model_name or context.current_model)[:128]}`",
+            f"**Steps:** {result.steps} · **CFG:** {result.guidance_scale:.1f}",
+        ]
         if result.workflow in {"image2image", "inpainting"} and result.strength is not None:
-            embed.add_field(name="Strength", value=f"{result.strength:.2f}", inline=True)
+            details.append(f"**Strength:** {result.strength:.2f}")
         if context.lora_configs:
             lora_display = ", ".join(f"`{lc.name}`:{lc.weight}" for lc in context.lora_configs)
-            if len(lora_display) > 1024:
-                lora_display = lora_display[:1021] + "..."
-            embed.add_field(name="LoRA", value=lora_display, inline=True)
+            if len(lora_display) > 512:
+                lora_display = lora_display[:509] + "..."
+            details.append(f"**LoRA:** {lora_display}")
         if context.auto_detected_loras:
             auto_display = ", ".join(
                 f'`{name}` (matched "{trigger}")' for name, trigger in context.auto_detected_loras
             )
-            if len(auto_display) > 1024:
-                auto_display = auto_display[:1021] + "..."
-            embed.add_field(name="Auto LoRAs", value=auto_display, inline=False)
+            if len(auto_display) > 512:
+                auto_display = auto_display[:509] + "..."
+            details.append(f"**Auto LoRAs:** {auto_display}")
         if context.scheduler:
-            embed.add_field(name="Scheduler", value=f"`{context.scheduler}`", inline=True)
-        embed.set_image(url="attachment://dream.png")
+            details.append(f"**Scheduler:** `{context.scheduler[:128]}`")
+        footer = f"-# Requested by {context.ctx.author.name[:128]} • React ❌ to delete"
+        header = discord.ui.TextDisplay(heading)
+        card = discord.ui.Container(colour=discord.Colour.purple())
         if thumbnail is not None:
-            embed.set_thumbnail(url="attachment://input.png")
-        embed.set_footer(
-            text=f"Requested by {context.ctx.author.name} • React ❌ to delete",
-            icon_url=context.ctx.author.avatar.url if context.ctx.author.avatar else None,
+            card.add_item(
+                discord.ui.Section(
+                    header,
+                    accessory=_SpoilerThumbnail(
+                        "attachment://SPOILER_input.png",
+                        description="Input image used for generation",
+                        spoiler=True,
+                    ),
+                )
+            )
+        else:
+            card.add_item(header)
+        # Discord permits 4000 characters across all TextDisplay components combined.
+        card.add_item(
+            discord.ui.TextDisplay("\n".join(details)[: 4000 - len(heading) - len(footer)])
         )
+        card.add_item(
+            discord.ui.MediaGallery(
+                discord.MediaGalleryItem(
+                    "attachment://SPOILER_dream.png", description="Generated image", spoiler=True
+                )
+            )
+        )
+        card.add_item(discord.ui.TextDisplay(footer))
+        view = discord.ui.DesignerView(card, timeout=None, store=False)
+        allowed_mentions = discord.AllowedMentions.none()
 
         if context.status_message:
             try:
-                await context.status_message.edit(content=None, embed=embed, files=create_files())
+                await context.status_message.edit(
+                    content=None,
+                    embeds=[],
+                    view=view,
+                    files=create_files(),
+                    allowed_mentions=allowed_mentions,
+                )
                 await context.status_message.add_reaction("❌")
             except discord.errors.NotFound:
-                msg = await context.ctx.followup.send(embed=embed, files=create_files())
+                msg = await context.ctx.followup.send(
+                    view=view, files=create_files(), allowed_mentions=allowed_mentions
+                )
                 try:
                     await msg.add_reaction("❌")  # type: ignore[union-attr]
                 except discord.errors.Forbidden:
                     pass
         else:
-            msg = await context.ctx.followup.send(embed=embed, files=create_files())
+            msg = await context.ctx.followup.send(
+                view=view, files=create_files(), allowed_mentions=allowed_mentions
+            )
             try:
                 await msg.add_reaction("❌")  # type: ignore[union-attr]
             except discord.errors.Forbidden:
@@ -282,7 +322,15 @@ async def handle_reaction_delete(
     except discord.errors.NotFound:
         return
 
-    if message.author != bot.user or not message.embeds:
+    if message.author != bot.user or not (
+        message.embeds
+        or (
+            message.flags.is_components_v2
+            and any(
+                attachment.filename == "SPOILER_dream.png" for attachment in message.attachments
+            )
+        )
+    ):
         return
 
     try:

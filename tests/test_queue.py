@@ -10,7 +10,13 @@ from PIL import Image
 
 from oneiro.pipelines.civitai_checkpoint import CivitaiCheckpointPipeline
 from oneiro.queue import GenerationQueue, QueueRequest, QueueResult, QueueStatus
-from tests.test_bot import _attachment, _dream_context, _image_bytes, _register_test_commands
+from tests.test_bot import (
+    _attachment,
+    _dream_context,
+    _image_bytes,
+    _register_test_commands,
+    _walk_components,
+)
 
 
 @pytest.mark.parametrize(
@@ -70,14 +76,19 @@ async def test_queue_preserves_omission_through_model_switch(
     )
     assert calls[0].get("strength") == strength
     assert ("strength" in calls[0]) is (strength is not None)
-    embed = ctx.followup.send.await_args.kwargs["embed"]
-    fields = {field.name: field.value for field in embed.fields}
-    assert fields["Model"] == "`execution-model`"
-    assert ("Strength" in fields) is (strength is not None)
+    response = ctx.followup.send.await_args.kwargs
+    assert "view" in response and "embed" not in response
+    text = "\n".join(
+        item["content"]
+        for item in _walk_components(response["view"].to_components())
+        if item["type"] == 10
+    )
+    assert "**Model:** `execution-model`" in text
+    assert ("**Strength:**" in text) is (strength is not None)
     if strength is not None:
-        assert fields["Strength"] == "0.75"
+        assert "**Strength:** 0.75" in text
     else:
-        assert "img2img" not in embed.title
+        assert "(img2img)" not in text
 
 
 class TestQueueStatus:
