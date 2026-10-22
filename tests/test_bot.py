@@ -18,6 +18,7 @@ import httpx
 import pytest
 import respx
 import torch
+from discord.state import ConnectionState
 from discord.webhook.async_ import handle_message_parameters
 from PIL import Image
 from pillow_heif import from_pillow
@@ -970,10 +971,36 @@ async def test_completion_card_bounds_text_without_losing_metadata() -> None:
     assert not payload["components"][0].get("spoiler", False)
 
 
+async def _sent_result_card(input_image: bytes | None) -> dict[str, Any]:
+    """Serialize the card request a successful generation sends to Discord."""
+    ctx = await _dream_context()
+    context = DreamContext(
+        ctx=ctx,
+        prompt="prompt",
+        negative_prompt=None,
+        current_model="submitted-model",
+        scheduler=None,
+        lora_configs=[],
+        auto_detected_loras=[],
+        is_img2img=input_image is not None,
+        is_inpaint=False,
+        strength=None,
+        pipeline_manager=ctx.bot.pipeline_manager,
+        input_image=input_image,
+    )
+    result = GenerationResult(Image.new("RGB", (8, 8)), 7, "prompt", None, 8, 8, 4, 1.0)
+    await create_dream_callbacks(context)[2](result)
+    params = handle_message_parameters(**ctx.followup.send.await_args.kwargs)
+    for file in params.files or []:
+        file.close()
+    return json.loads(params.multipart[0]["value"])
+
+
 @pytest.mark.parametrize(
     ("kind", "author", "reaction_user", "emoji", "deleted"),
     [
         ("card", "bot", 2, "❌", True),
+        ("img2img-card", "bot", 2, "❌", True),
         ("legacy", "bot", 2, "❌", True),
         ("text", "bot", 2, "❌", False),
         ("other-card", "bot", 2, "❌", False),
@@ -986,24 +1013,59 @@ async def test_reaction_delete_recognizes_only_bot_image_results(
     kind: str, author: str, reaction_user: int, emoji: str, deleted: bool
 ) -> None:
     """Cards remain deletable without allowing reactions to delete unrelated messages."""
-    bot_user = SimpleNamespace(id=1)
-    removed: list[str] = []
-
-    async def delete() -> None:
-        removed.append(kind)
-
-    message = SimpleNamespace(
-        author=bot_user if author == "bot" else SimpleNamespace(id=3),
-        embeds=[object()] if kind == "legacy" else [],
-        flags=discord.MessageFlags(is_components_v2=kind in {"card", "other-card"}),
-        attachments=[SimpleNamespace(filename="SPOILER_dream.png")] if kind == "card" else [],
-        delete=delete,
+    sent: dict[str, Any] = {"flags": 0, "components": []}
+    if kind in {"card", "img2img-card"}:
+        sent = await _sent_result_card(_image_bytes() if kind == "img2img-card" else None)
+    elif kind == "other-card":
+        status = [{"type": 17, "components": [{"type": 10, "content": "Queued"}]}]
+        sent = {"flags": 1 << 15, "components": status}
+    # Fetched as Discord returns it: files referenced by components are not attachments.
+    data = {
+        "id": "20",
+        "channel_id": "10",
+        "author": {
+            "id": "1" if author == "bot" else "3",
+            "username": author,
+            "discriminator": "0",
+            "avatar": None,
+        },
+        "content": "❌ Generation failed" if kind == "text" else "",
+        "timestamp": "2026-10-22T00:00:00+00:00",
+        "edited_timestamp": None,
+        "tts": False,
+        "mention_everyone": False,
+        "mentions": [],
+        "mention_roles": [],
+        "attachments": [],
+        "embeds": [{"type": "rich", "title": "🎨 Dream Generated"}] if kind == "legacy" else [],
+        "pinned": False,
+        "type": 0,
+        "flags": sent["flags"],
+        "components": sent["components"],
+    }
+    http = SimpleNamespace(get_message=AsyncMock(return_value=data), delete_message=AsyncMock())
+    state = ConnectionState(
+        dispatch=lambda *args: None,
+        handlers={},
+        hooks={},
+        http=http,
+        loop=asyncio.get_running_loop(),
     )
-    channel = SimpleNamespace(fetch_message=AsyncMock(return_value=message))
-    bot = SimpleNamespace(user=bot_user, get_channel=lambda _: channel)
-    payload = SimpleNamespace(emoji=emoji, user_id=reaction_user, channel_id=10, message_id=20)
+    state.user = discord.ClientUser(
+        state=state, data={"id": "1", "username": "bot", "discriminator": "0", "avatar": None}
+    )
+    channel = discord.PartialMessageable(state=state, id=10)
+    bot = SimpleNamespace(user=state.user, get_channel=lambda _: channel)
+    payload = discord.RawReactionActionEvent(
+        {"message_id": "20", "channel_id": "10", "user_id": str(reaction_user)},
+        discord.PartialEmoji(name=emoji),
+        "REACTION_ADD",
+    )
     await handle_reaction_delete(bot, payload)
-    assert removed == ([kind] if deleted else [])
+    if deleted:
+        http.delete_message.assert_awaited_once_with(10, 20, reason=None)
+    else:
+        http.delete_message.assert_not_awaited()
 
 
 @pytest.mark.parametrize(

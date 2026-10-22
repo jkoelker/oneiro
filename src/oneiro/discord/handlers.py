@@ -10,6 +10,8 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import discord
+from discord.components import Container as ContainerComponent
+from discord.components import MediaGallery as MediaGalleryComponent
 from discord.components import Thumbnail as ThumbnailComponent
 from PIL import Image, ImageOps
 
@@ -322,12 +324,17 @@ async def handle_reaction_delete(
     except discord.errors.NotFound:
         return
 
+    # Discord omits files referenced by components from attachments, so cards are
+    # recognized by their image gallery rather than the uploaded filename.
     if message.author != bot.user or not (
         message.embeds
         or (
             message.flags.is_components_v2
             and any(
-                attachment.filename == "SPOILER_dream.png" for attachment in message.attachments
+                isinstance(component, MediaGalleryComponent)
+                for container in message.components
+                if isinstance(container, ContainerComponent)
+                for component in container.walk_components()
             )
         )
     ):
