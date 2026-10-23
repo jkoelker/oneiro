@@ -193,6 +193,8 @@ def test_dynamic_lora_rollback(
                 torch.accelerator, "current_accelerator", lambda: torch.device("cuda")
             )
             monkeypatch.setattr("diffusers.hooks.apply_group_offloading", cpu_group)
+        # Native auto-offload queries free accelerator memory before installing hooks.
+        monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device=None: (1 << 30, 1 << 30))
         wrapper.policy = DevicePolicy(
             device="cuda",
             dtype=torch.float32,
@@ -428,6 +430,7 @@ def place_embedding_wrapper(
     monkeypatch.setattr("accelerate.cpu_offload", cpu_sequential)
     monkeypatch.setattr(torch.accelerator, "current_accelerator", lambda: torch.device("cuda"))
     monkeypatch.setattr("diffusers.hooks.apply_group_offloading", cpu_group)
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device=None: (1 << 30, 1 << 30))
     wrapper.policy = DevicePolicy(
         device="cuda",
         dtype=torch.float32,
