@@ -378,6 +378,8 @@ class TestModularDevicePolicy:
 
         monkeypatch.setattr("diffusers.hooks.apply_group_offloading", group)
         monkeypatch.setattr("accelerate.cpu_offload", sequential)
+        # Native auto-offload queries free accelerator memory before installing hooks.
+        monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device=None: (1 << 30, 1 << 30))
         policy = DevicePolicy(device="cuda", dtype=torch.float16, offload_type=offload_type)
         policy.apply_to_modular_pipeline(pipe, manager)
         assert pipe.components["transformer"] is pipe.components["text_encoder"]
